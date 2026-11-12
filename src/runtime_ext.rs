@@ -1084,6 +1084,8 @@ struct QueryCache {
     terrain_material: Option<u8>,
     /// Terrain triangles per chunk for rays (dropped with `terrain`).
     terrain_tris: HashMap<[i32; 3], std::rc::Rc<Vec<([Vec3; 3], [u8; 3])>>>,
+    /// Water surface triangles per chunk for rays (dropped with `terrain`).
+    terrain_water: HashMap<[i32; 3], std::rc::Rc<Vec<[Vec3; 3]>>>,
 }
 
 /// A uniform grid over the query parts (by bounding box) so rays and box
@@ -1453,6 +1455,9 @@ struct Filter {
     /// Collision groups that don't collide with the query's CollisionGroup
     /// (PhysicsService:CollisionGroupSetCollidable): their parts are passed.
     skip_groups: HashSet<String>,
+    /// RaycastParams.IgnoreWater (and the legacy ignoreWater argument):
+    /// rays and shapecasts pass through water terrain.
+    ignore_water: bool,
 }
 
 impl Filter {
@@ -1462,6 +1467,7 @@ impl Filter {
             include: false,
             respect_collide: false,
             skip_groups: HashSet::new(),
+            ignore_water: false,
         }
     }
 
@@ -1517,11 +1523,13 @@ fn params_filter(v: &Value) -> Filter {
     let include = opt_ud::<LEnumItem>(&ud_value(v, "FilterType"))
         .is_some_and(|e| matches!(e.name.as_str(), "Include" | "Whitelist"));
     let respect_collide = matches!(ud_value(v, "RespectCanCollide"), Value::Boolean(true));
+    let ignore_water = matches!(ud_value(v, "IgnoreWater"), Value::Boolean(true));
     Filter {
         list,
         include,
         respect_collide,
         skip_groups: HashSet::new(),
+        ignore_water,
     }
 }
 
@@ -1702,11 +1710,14 @@ fn cast_swept(
         }
         t0 = t1;
     }
-    // Terrain (rays only; sweeps still see parts alone).
-    if !swept {
+    // Terrain: rays meet its surface, sweeps its surface with the shape.
+    {
         drop(parts_scope);
         let _t = crate::bench::scope("ray_terrain");
-        let terrain = terrain_hit(lua, ray.origin, ray.dir, len)?;
+        let terrain = match probe {
+            Some(pr) if swept => terrain_sweep(lua, pr, ray.origin, grow, ray.dir, len, filter.ignore_water)?,
+            _ => terrain_hit(lua, ray.origin, ray.dir, len, filter.ignore_water)?,
+        };
         let passes = terrain.as_ref().is_some_and(|(r, ..)| {
             world(lua).is_ok_and(|w| filter.passes(w.d(), *r))
         });
@@ -1845,18 +1856,9 @@ fn overlap(
     Ok(out)
 }
 
-/// Terrain under a ray (WorldRoot:Raycast and the legacy FindPartOnRay
-/// family): the surface where the voxels' occupancy, blended between voxel
-/// centres, crosses one half (the mesher's surface), found in half-stud
-/// steps and refined. Water isn't hit. Returns (terrain, point, normal,
-/// distance, SmoothGrid material). Round 19: rays never saw terrain.
-fn terrain_hit(
-    lua: &Lua,
-    origin: Vec3,
-    dir: Vec3,
-    len: f32,
-) -> mlua::Result<Option<(Ref, Vec3, Vec3, f32, u8)>> {
-    use crate::terrain::VOXEL;
+/// Workspace.Terrain with its voxels and their world bounds (studs), read
+/// once per terrain change.
+fn terrain_state(lua: &Lua) -> mlua::Result<Option<(Ref, std::rc::Rc<crate::terrain::Voxels>, (Vec3, Vec3))>> {
     let cached = {
         let c = lua.app_data_ref::<QueryCache>();
         c.and_then(|c| c.terrain.clone())
@@ -1879,64 +1881,87 @@ fn terrain_hit(
             if let Some(mut c) = lua.app_data_mut::<QueryCache>() {
                 c.terrain = Some(t.clone());
                 c.terrain_tris.clear();
+                c.terrain_water.clear();
             }
             t
         }
     };
-    let Some((r, v, bounds)) = terrain else {
+    Ok(terrain.and_then(|(r, v, b)| b.map(|(lo, hi)| (r, v, (Vec3::from(lo), Vec3::from(hi))))))
+}
+
+/// The chunk keys a world box touches (a chunk's surface reaches one voxel
+/// past its corner; water's lies half a voxel lower still).
+fn terrain_chunk_keys(lo: Vec3, hi: Vec3) -> impl Iterator<Item = [i32; 3]> {
+    use crate::terrain::VOXEL;
+    let chunk = VOXEL * 32.0;
+    let a = ((lo - VOXEL) / chunk).floor().as_ivec3();
+    let b = ((hi + VOXEL + Vec3::Y * crate::terrain::WATER_RAY_DROP) / chunk).floor().as_ivec3();
+    (a.x..=b.x).flat_map(move |x| (a.y..=b.y).flat_map(move |y| (a.z..=b.z).map(move |z| [x, y, z])))
+}
+
+/// Terrain under a ray (WorldRoot:Raycast, the legacy FindPartOnRay family
+/// and the play mouse): the smooth surface as drawn (each chunk's
+/// triangles, material shapes included), front faces only, nearest along
+/// the ray. Water is hit too (Studio's IgnoreWater defaults to false), on
+/// its own surface half a voxel below the drawn one, unless `ignore_water`.
+/// Returns (terrain, point, normal, distance, SmoothGrid material).
+/// Round 19: rays never saw terrain; 2026-11-11: water.
+fn terrain_hit(
+    lua: &Lua,
+    origin: Vec3,
+    dir: Vec3,
+    len: f32,
+    ignore_water: bool,
+) -> mlua::Result<Option<(Ref, Vec3, Vec3, f32, u8)>> {
+    use crate::terrain::VOXEL;
+    let Some((r, v, (lo, hi))) = terrain_state(lua)? else {
         return Ok(None);
     };
-    let Some((lo, hi)) = bounds else {
-        return Ok(None);
-    };
-    let (lo, hi) = (Vec3::from(lo) - VOXEL, Vec3::from(hi) + VOXEL);
+    let (lo, hi) = (lo - VOXEL - Vec3::Y * crate::terrain::WATER_RAY_DROP, hi + VOXEL);
+    let dir_n = dir.normalize_or_zero();
     // The stretch of the ray inside the terrain's bounds.
     let (mut t0, mut t1) = (0.0f32, len);
     for k in 0..3 {
-        if dir[k].abs() < 1e-9 {
+        if dir_n[k].abs() < 1e-9 {
             if origin[k] < lo[k] || origin[k] > hi[k] {
                 return Ok(None);
             }
             continue;
         }
-        let (a, b) = ((lo[k] - origin[k]) / dir[k], (hi[k] - origin[k]) / dir[k]);
+        let (a, b) = ((lo[k] - origin[k]) / dir_n[k], (hi[k] - origin[k]) / dir_n[k]);
         t0 = t0.max(a.min(b));
         t1 = t1.min(a.max(b));
     }
     if t0 > t1 {
         return Ok(None);
     }
-    // The drawn (and collided) surface itself: each chunk's triangles, made
-    // once per terrain change, nearest front face along the ray (round 21;
-    // before, rays marched a separate trilinear field).
-    let dir_n = dir.normalize_or_zero();
     let mut best: Option<(f32, Vec3, u8)> = None;
-    let chunk = crate::terrain::VOXEL * 32.0;
+    let chunk = VOXEL * 32.0;
     let mut seen: HashSet<[i32; 3]> = HashSet::new();
     let mut t = t0;
     let step = chunk * 0.5;
     loop {
         let seg_end = (t + step).min(t1);
         let (a, b) = (origin + dir_n * t, origin + dir_n * seg_end);
-        // A chunk's surface reaches one voxel past its corner.
-        let lo = ((a.min(b) - VOXEL) / chunk).floor().as_ivec3();
-        let hi = ((a.max(b) + VOXEL) / chunk).floor().as_ivec3();
-        for x in lo.x..=hi.x {
-            for y in lo.y..=hi.y {
-                for z in lo.z..=hi.z {
-                    let key = [x, y, z];
-                    if !seen.insert(key) {
-                        continue;
+        for key in terrain_chunk_keys(a.min(b), a.max(b)) {
+            if !seen.insert(key) {
+                continue;
+            }
+            let (tris, water) = terrain_chunk_tris(lua, &v, key, !ignore_water);
+            for tri in tris.iter() {
+                if let Some((d, w)) = ray_triangle(origin, dir_n, &tri.0) {
+                    if d >= t0 && d <= t1 && best.is_none_or(|(bt, _, _)| d < bt) {
+                        let n = (tri.0[1] - tri.0[0]).cross(tri.0[2] - tri.0[0]).normalize_or_zero();
+                        let k = if w.x >= w.y && w.x >= w.z { 0 } else if w.y >= w.z { 1 } else { 2 };
+                        best = Some((d, n, tri.1[k]));
                     }
-                    let tris = terrain_chunk_tris(lua, &v, key);
-                    for tri in tris.iter() {
-                        if let Some((d, w)) = ray_triangle(origin, dir_n, &tri.0) {
-                            if d >= t0 && d <= t1 && best.is_none_or(|(bt, _, _)| d < bt) {
-                                let n = (tri.0[1] - tri.0[0]).cross(tri.0[2] - tri.0[0]).normalize_or_zero();
-                                let k = if w.x >= w.y && w.x >= w.z { 0 } else if w.y >= w.z { 1 } else { 2 };
-                                best = Some((d, n, tri.1[k]));
-                            }
-                        }
+                }
+            }
+            for tri in water.iter().flat_map(|w| w.iter()) {
+                if let Some((d, _)) = ray_triangle(origin, dir_n, tri) {
+                    if d >= t0 && d <= t1 && best.is_none_or(|(bt, _, _)| d < bt) {
+                        let n = (tri[1] - tri[0]).cross(tri[2] - tri[0]).normalize_or_zero();
+                        best = Some((d, n, crate::terrain::WATER));
                     }
                 }
             }
@@ -1949,29 +1974,147 @@ fn terrain_hit(
     Ok(best.map(|(d, n, m)| (r, origin + dir_n * d, n, d, m)))
 }
 
-/// One chunk's terrain triangles (positions, corner materials) for rays,
-/// cached until the terrain changes.
+/// Terrain against a swept shape (Spherecast / Blockcast / Shapecast):
+/// `probe` is the query_shapes kind, size and turn, starting at `origin`,
+/// with world half extents `ext`, moving along unit `dir` for `len`. The
+/// same surfaces as `terrain_hit`; a shape that starts touching terrain
+/// doesn't hit it (Studio). Returns (terrain, touching point, normal,
+/// distance, material).
+fn terrain_sweep(
+    lua: &Lua,
+    probe: (u8, Vec3, glam::Mat3),
+    origin: Vec3,
+    ext: Vec3,
+    dir: Vec3,
+    len: f32,
+    ignore_water: bool,
+) -> mlua::Result<Option<(Ref, Vec3, Vec3, f32, u8)>> {
+    use crate::terrain::VOXEL;
+    let Some((r, v, (lo, hi))) = terrain_state(lua)? else {
+        return Ok(None);
+    };
+    let (lo, hi) = (lo - VOXEL - Vec3::Y * crate::terrain::WATER_RAY_DROP, hi + VOXEL);
+    let end = origin + dir * len;
+    let (plo, phi) = (origin.min(end) - ext, origin.max(end) + ext);
+    if plo.cmpgt(hi).any() || phi.cmplt(lo).any() {
+        return Ok(None);
+    }
+    let start = crate::math::Xform { pos: origin, rot: probe.2 };
+    let chunk = VOXEL * 32.0;
+    let step = chunk * 0.5;
+    let mut seen: HashSet<[i32; 3]> = HashSet::new();
+    // (distance, point, normal, material)
+    let mut best: Option<(f32, Vec3, Vec3, u8)> = None;
+    let mut t = 0.0f32;
+    let mut cand: Vec<(usize, [Vec3; 3])> = Vec::new();
+    let mut mats: Vec<[u8; 3]> = Vec::new();
+    loop {
+        let seg_end = (t + step).min(len);
+        let (a, b) = (origin + dir * t, origin + dir * seg_end);
+        let (slo, shi) = (a.min(b) - ext, a.max(b) + ext);
+        cand.clear();
+        mats.clear();
+        for key in terrain_chunk_keys(slo, shi) {
+            if !seen.insert(key) {
+                continue;
+            }
+            let (tris, water) = terrain_chunk_tris(lua, &v, key, !ignore_water);
+            let near = |p: &[Vec3; 3]| {
+                let (tl, th) = (p[0].min(p[1]).min(p[2]), p[0].max(p[1]).max(p[2]));
+                tl.cmple(phi).all() && th.cmpge(plo).all()
+            };
+            for (p, m) in tris.iter() {
+                if near(p) {
+                    cand.push((mats.len(), *p));
+                    mats.push(*m);
+                }
+            }
+            for p in water.iter().flat_map(|w| w.iter()) {
+                if near(p) {
+                    cand.push((mats.len(), *p));
+                    mats.push([crate::terrain::WATER; 3]);
+                }
+            }
+        }
+        let hit = crate::query_shapes::sweep_triangles(&start, probe.1, probe.0, dir, len, &cand);
+        match hit {
+            Err(()) => return Ok(None),
+            Ok(Some((i, d, at, n))) if best.is_none_or(|(bt, ..)| d < bt) => {
+                let tri = cand.iter().find(|(k, _)| *k == i).map(|c| c.1).unwrap_or([at; 3]);
+                // The material of the triangle corner nearest the contact.
+                let k = (0..3)
+                    .min_by(|x, y| at.distance_squared(tri[*x]).total_cmp(&at.distance_squared(tri[*y])))
+                    .unwrap_or(0);
+                best = Some((d, at, n, mats[i][k]));
+            }
+            _ => {}
+        }
+        if best.is_some_and(|(bt, ..)| bt <= seg_end) || seg_end >= len {
+            break;
+        }
+        t = seg_end;
+    }
+    Ok(best.map(|(d, at, n, m)| (r, at, n, d, m)))
+}
+
+/// One chunk's terrain triangles (positions, corner materials) and, when
+/// `water`, its water surface for rays; cached until the terrain changes.
+#[allow(clippy::type_complexity)]
 fn terrain_chunk_tris(
     lua: &Lua,
     v: &crate::terrain::Voxels,
     key: [i32; 3],
-) -> std::rc::Rc<Vec<([Vec3; 3], [u8; 3])>> {
-    if let Some(t) = lua.app_data_ref::<QueryCache>().and_then(|c| c.terrain_tris.get(&key).cloned()) {
-        return t;
+    water: bool,
+) -> (std::rc::Rc<Vec<([Vec3; 3], [u8; 3])>>, Option<std::rc::Rc<Vec<[Vec3; 3]>>>) {
+    thread_local! {
+        static NONE: (std::rc::Rc<Vec<([Vec3; 3], [u8; 3])>>, std::rc::Rc<Vec<[Vec3; 3]>>) = Default::default();
     }
-    let verts = crate::terrain::chunk_triangles(v, key, &|_| false);
-    let tris: Vec<([Vec3; 3], [u8; 3])> = verts
-        .chunks_exact(3)
-        .map(|t| {
-            let mats = [0, 1, 2].map(|i| t[0].palette[i] / 3);
-            ([Vec3::from(t[0].pos), Vec3::from(t[1].pos), Vec3::from(t[2].pos)], mats)
-        })
-        .collect();
-    let tris = std::rc::Rc::new(tris);
-    if let Some(mut c) = lua.app_data_mut::<QueryCache>() {
-        c.terrain_tris.insert(key, tris.clone());
+    // Empty space (most of a long ray over a big map): nothing to mesh.
+    if !v.chunk_near(key) {
+        return NONE.with(|(s, w)| (s.clone(), water.then(|| w.clone())));
     }
-    tris
+    let solid = match lua.app_data_ref::<QueryCache>().and_then(|c| c.terrain_tris.get(&key).cloned()) {
+        Some(t) => t,
+        None => {
+            let verts = crate::terrain::chunk_triangles(v, key, &|_| false);
+            let tris: Vec<([Vec3; 3], [u8; 3])> = verts
+                .chunks_exact(3)
+                .map(|t| {
+                    let mats = [0, 1, 2].map(|i| t[0].palette[i] / 3);
+                    ([Vec3::from(t[0].pos), Vec3::from(t[1].pos), Vec3::from(t[2].pos)], mats)
+                })
+                .collect();
+            let tris = std::rc::Rc::new(tris);
+            if let Some(mut c) = lua.app_data_mut::<QueryCache>() {
+                c.terrain_tris.insert(key, tris.clone());
+            }
+            tris
+        }
+    };
+    if !water {
+        return (solid, None);
+    }
+    let wet = match lua.app_data_ref::<QueryCache>().and_then(|c| c.terrain_water.get(&key).cloned()) {
+        Some(t) => t,
+        None => {
+            let tris: Vec<[Vec3; 3]> = crate::terrain::chunk_water_triangles(v, key)
+                .into_iter()
+                .map(|t| t.map(Vec3::from))
+                .collect();
+            let tris = std::rc::Rc::new(tris);
+            if let Some(mut c) = lua.app_data_mut::<QueryCache>() {
+                c.terrain_water.insert(key, tris.clone());
+            }
+            tris
+        }
+    };
+    (solid, Some(wet))
+}
+
+/// Terrain under a ray for the play mouse (Mouse.Hit / Mouse.Target):
+/// (terrain, distance). Water counts, as for Raycast.
+pub fn mouse_terrain_hit(lua: &Lua, origin: Vec3, dir: Vec3, len: f32) -> Option<(Ref, f32)> {
+    terrain_hit(lua, origin, dir, len, false).ok().flatten().map(|(r, _, _, t, _)| (r, t))
 }
 
 /// Ray / triangle (Möller–Trumbore), front faces only (a ray starting
@@ -3692,11 +3835,16 @@ fn call_inner(lua: &Lua, name: &str, this: Ref, args: &MultiValue, domains: u16)
                 .map(|v| v.0)
                 .unwrap_or(Vec3::ZERO);
             let list: HashSet<Ref> = refs_in(&arg(args, 2)).into_iter().collect();
+            // FindPartOnRay(ray, ignore, terrainCellsAreCubes, ignoreWater),
+            // ...WithIgnoreList(ray, list, terrainCellsAreCubes, ignoreWater),
+            // ...WithWhitelist(ray, list, ignoreWater).
+            let water_arg = if name == "FindPartOnRayWithWhitelist" { 3 } else { 4 };
             let filter = Filter {
                 list,
                 include: name == "FindPartOnRayWithWhitelist",
                 respect_collide: false,
                 skip_groups: HashSet::new(),
+                ignore_water: matches!(arg(args, water_arg), Value::Boolean(true)),
             };
             match cast(lua, origin, dir, &filter)? {
                 Some((r, p, n, _)) => {
@@ -3720,10 +3868,15 @@ fn call_inner(lua: &Lua, name: &str, this: Ref, args: &MultiValue, domains: u16)
                         mat,
                     ]))
                 }
+                // A miss: the ray's end, a zero normal and Material Air (Studio).
                 None => Ok(MultiValue::from_iter([
                     Value::Nil,
                     vec3_value(lua, origin + dir)?,
                     vec3_value(lua, Vec3::ZERO)?,
+                    match LEnumItem::from_name("Material", "Air") {
+                        Some(m) => crate::ltypes::enum_value(lua, m)?,
+                        None => Value::Nil,
+                    },
                 ])),
             }
         }
@@ -3738,6 +3891,7 @@ fn call_inner(lua: &Lua, name: &str, this: Ref, args: &MultiValue, domains: u16)
                 include: name.ends_with("WhiteList"),
                 respect_collide: false,
                 skip_groups: HashSet::new(),
+                ignore_water: false,
             };
             let max = num(&arg(args, 3)).map(|n| n as usize).unwrap_or(20);
             let parts = overlap(lua, lo, hi, None, &filter, max)?;
@@ -4547,5 +4701,271 @@ print("max", tostring(all.SizeInCells))
         assert_eq!(v.get(11, 1, 1).0, rock);
         assert_eq!(v.get(0, 10, 0).0, crate::terrain::WATER);
         assert!((v.water(1, 10, 0) - 0.5).abs() < 0.01, "shoreline water {}", v.water(1, 10, 0));
+    }
+
+    /// Runs `src` as a Script for `steps` frames on an empty place (no
+    /// Baseplate / SpawnLocation, as Studio's blank place) and returns its
+    /// printed lines and the number of terrain chunks rays meshed.
+    fn run_terrain_rays(src: &str, steps: usize) -> (Vec<String>, usize) {
+        let mut d = Document::new_place();
+        if let Some(ws) = d.workspace() {
+            let parts: Vec<Ref> = d
+                .dom
+                .get_by_ref(ws)
+                .map(|i| i.children().to_vec())
+                .unwrap_or_default()
+                .into_iter()
+                .filter(|r| d.class_of(*r).is_some_and(|c| c != "Terrain" && c != "Camera"))
+                .collect();
+            for r in parts {
+                d.dom.destroy(r);
+            }
+        }
+        let sss = d.find_child(d.dom.root_ref(), "ServerScriptService").unwrap();
+        let s = d.dom.insert(sss, InstanceBuilder::new("Script").with_name("T").with_property("Source", src.to_string()));
+        let rt = Runtime::new().unwrap();
+        rt.enter(World::new(d, RunMode::Run));
+        rt.bind_globals().unwrap();
+        rt.run_script(s);
+        for _ in 0..steps {
+            rt.step(1.0 / 60.0);
+        }
+        let meshed = rt.lua.app_data_ref::<QueryCache>().map(|c| c.terrain_tris.len()).unwrap_or(0);
+        let w = rt.leave();
+        let out = w
+            .output
+            .into_iter()
+            .map(|(_, t)| t.split("  —  ").next().unwrap_or_default().to_string())
+            .collect();
+        (out, meshed)
+    }
+
+    const RAY_FMT: &str = r#"
+local function f(n) return string.format("%.3f", n) end
+local function v(x) return f(x.X)..","..f(x.Y)..","..f(x.Z) end
+local function show(name, r)
+    print(name.." "..(r and ((r.Instance and r.Instance.Name or "nil").." "..v(r.Position).." n="..v(r.Normal).." "..r.Material.Name.." d="..f(r.Distance)) or "nil"))
+end
+local T = workspace.Terrain
+"#;
+
+    fn has(out: &[String], line: &str) {
+        assert!(out.iter().any(|l| l == line), "missing {line:?} in:\n{}", out.join("\n"));
+    }
+
+    /// Water terrain: Studio's rays hit it unless IgnoreWater, on the water
+    /// mesh moved half a voxel down; from inside water they pass through.
+    /// Numbers from an offline Studio (water_probe, 2026-11-11). Before, every
+    /// ray went through water to the ground under it.
+    #[test]
+    fn terrain_rays_hit_water() {
+        let src = format!(
+            "{RAY_FMT}{}",
+            r#"
+T:FillBlock(CFrame.new(0, -8, 0), Vector3.new(32, 16, 32), Enum.Material.Water)
+T:FillBlock(CFrame.new(200, -5, 0), Vector3.new(32, 10, 32), Enum.Material.Water)
+T:FillBlock(CFrame.new(200, -20, 0), Vector3.new(32, 20, 32), Enum.Material.Sand)
+task.wait() task.wait()
+show("top", workspace:Raycast(Vector3.new(0, 50, 0.5), Vector3.new(0, -100, 0)))
+show("edge", workspace:Raycast(Vector3.new(15, 50, 0.5), Vector3.new(0, -100, 0)))
+show("side", workspace:Raycast(Vector3.new(50, -8, 0.5), Vector3.new(-100, 0, 0)))
+show("below", workspace:Raycast(Vector3.new(0.5, -40, 0.5), Vector3.new(0, 100, 0)))
+show("inside_up", workspace:Raycast(Vector3.new(0.5, -4, 0.5), Vector3.new(0, 100, 0)))
+show("lake", workspace:Raycast(Vector3.new(200.5, 50, 1), Vector3.new(0, -100, 0)))
+local p = RaycastParams.new() p.IgnoreWater = true
+show("lake_ignore", workspace:Raycast(Vector3.new(200.5, 50, 1), Vector3.new(0, -100, 0), p))
+show("lake_inside", workspace:Raycast(Vector3.new(200.5, -3, 1), Vector3.new(0, -100, 0)))
+local h, pos, n, m = workspace:FindPartOnRay(Ray.new(Vector3.new(200.5, 50, 1), Vector3.new(0, -100, 0)))
+print("fpor "..tostring(h).." "..v(pos).." "..m.Name)
+h, pos, n, m = workspace:FindPartOnRay(Ray.new(Vector3.new(200.5, 50, 1), Vector3.new(0, -100, 0)), nil, false, true)
+print("fpor_ign "..tostring(h).." "..v(pos).." "..m.Name)
+h, pos, n, m = workspace:FindPartOnRayWithWhitelist(Ray.new(Vector3.new(200.5, 50, 1), Vector3.new(0, -100, 0)), {T}, true)
+print("white_ign "..tostring(h).." "..v(pos).." "..m.Name)
+h, pos, n, m = workspace:FindPartOnRayWithIgnoreList(Ray.new(Vector3.new(200.5, 50, 1), Vector3.new(0, -100, 0)), {T})
+print("miss "..tostring(h).." "..v(pos).." "..v(n).." "..tostring(m and m.Name))
+"#
+        );
+        let (out, _) = run_terrain_rays(&src, 6);
+        has(&out, "top Terrain 0.000,0.000,0.500 n=0.000,1.000,0.000 Water d=50.000");
+        has(&out, "edge Terrain 15.000,-1.500,0.500 n=0.447,0.894,0.000 Water d=51.500");
+        has(&out, "side Terrain 18.000,-8.000,0.500 n=1.000,0.000,0.000 Water d=32.000");
+        has(&out, "below Terrain 0.500,-20.000,0.500 n=0.000,-1.000,0.000 Water d=20.000");
+        has(&out, "inside_up nil");
+        has(&out, "lake Terrain 200.500,0.000,1.000 n=0.000,1.000,0.000 Water d=50.000");
+        has(&out, "lake_ignore Terrain 200.500,-7.984,1.000 n=0.000,1.000,0.000 Sand d=57.984");
+        has(&out, "lake_inside Terrain 200.500,-7.984,1.000 n=0.000,1.000,0.000 Sand d=4.984");
+        has(&out, "fpor Terrain 200.500,0.000,1.000 Water");
+        has(&out, "fpor_ign Terrain 200.500,-7.984,1.000 Sand");
+        has(&out, "white_ign Terrain 200.500,-7.984,1.000 Sand");
+        // A miss gives Material Air (it was nil).
+        has(&out, "miss nil 200.500,-50.000,1.000 0.000,0.000,0.000 Air");
+    }
+
+    /// Spherecast / Blockcast / Shapecast meet terrain (they only saw parts):
+    /// Studio's distances, materials and contact normals.
+    #[test]
+    fn shapecasts_hit_terrain() {
+        let src = format!(
+            "{RAY_FMT}{}",
+            r#"
+T:FillBlock(CFrame.new(0, -10, 0), Vector3.new(64, 20, 64), Enum.Material.Brick)
+T:FillBall(Vector3.new(100, 0, 0), 10, Enum.Material.Rock)
+T:FillBlock(CFrame.new(200, -5, 0), Vector3.new(32, 10, 32), Enum.Material.Water)
+task.wait() task.wait()
+local function d(name, r)
+    print(name.." "..(r and (r.Instance.Name.." "..r.Material.Name.." d="..f(r.Distance).." y="..f(r.Position.Y).." n="..(string.format("%.2f,%.2f,%.2f", r.Normal.X, r.Normal.Y, r.Normal.Z):gsub("%-0%.00", "0.00"))) or "nil"))
+end
+d("sphere", workspace:Spherecast(Vector3.new(0.3, 20, 0.7), 2, Vector3.new(0, -100, 0)))
+d("sphere_ball", workspace:Spherecast(Vector3.new(103, 30, 0.7), 2, Vector3.new(0, -100, 0)))
+d("sphere_water", workspace:Spherecast(Vector3.new(200.5, 20, 1), 2, Vector3.new(0, -100, 0)))
+d("block", workspace:Blockcast(CFrame.new(0.3, 20, 0.7), Vector3.new(4, 2, 4), Vector3.new(0, -100, 0)))
+d("block_rot", workspace:Blockcast(CFrame.new(0.3, 20, 0.7) * CFrame.Angles(0.3, 0.2, 0.5), Vector3.new(4, 2, 4), Vector3.new(0, -100, 0)))
+d("block_side", workspace:Blockcast(CFrame.new(60, -10, 0), Vector3.new(2, 2, 2), Vector3.new(-100, 0, 0)))
+local b = Instance.new("Part") b.Shape = Enum.PartType.Ball b.Size = Vector3.new(3, 3, 3) b.Anchored = true b.CFrame = CFrame.new(0.3, 20, 0.7) b.Parent = workspace
+d("shape", workspace:Shapecast(b, Vector3.new(0, -100, 0)))
+b:Destroy()
+d("sphere_inside", workspace:Spherecast(Vector3.new(0.3, -5, 0.7), 2, Vector3.new(0, -100, 0)))
+d("sphere_touching", workspace:Spherecast(Vector3.new(0.3, 1, 0.7), 2, Vector3.new(0, -100, 0)))
+local ex = RaycastParams.new() ex.FilterDescendantsInstances = {T}
+d("sphere_excluded", workspace:Spherecast(Vector3.new(0.3, 20, 0.7), 2, Vector3.new(0, -100, 0), ex))
+"#
+        );
+        let (out, _) = run_terrain_rays(&src, 6);
+        has(&out, "sphere Terrain Brick d=18.000 y=0.000 n=0.00,1.00,0.00");
+        has(&out, "sphere_ball Terrain Rock d=16.629 y=11.710 n=0.50,0.83,0.25");
+        has(&out, "sphere_water Terrain Water d=18.000 y=0.000 n=0.00,1.00,0.00");
+        has(&out, "block Terrain Brick d=19.000 y=0.000 n=0.00,1.00,0.00");
+        has(&out, "block_rot Terrain Brick d=17.591 y=0.000 n=0.00,1.00,0.00");
+        assert!(out.iter().any(|l| l.starts_with("block_side Terrain Brick d=27.000")), "{out:?}");
+        has(&out, "shape Terrain Brick d=18.500 y=0.000 n=0.00,1.00,0.00");
+        has(&out, "sphere_inside nil");
+        has(&out, "sphere_touching nil");
+        has(&out, "sphere_excluded nil");
+    }
+
+    /// Solid terrain against Studio: FillBlock / FillBall / WriteVoxels
+    /// surfaces, include / exclude, rays from inside, long rays, far
+    /// terrain, edits seen the frame after (not the same frame), and
+    /// Mouse.Hit's terrain ray.
+    #[test]
+    fn terrain_rays_match_studio() {
+        let src = format!(
+            "{RAY_FMT}{}",
+            r#"
+T:FillBlock(CFrame.new(0, -10, 0), Vector3.new(64, 20, 64), Enum.Material.Grass)
+T:FillBall(Vector3.new(100, 0, 0), 10, Enum.Material.Rock)
+T:FillBlock(CFrame.new(20000, -10, 20000), Vector3.new(16, 20, 16), Enum.Material.Mud)
+task.wait() task.wait()
+show("center", workspace:Raycast(Vector3.new(0.3, 50, 0.7), Vector3.new(0, -100, 0)))
+show("edge", workspace:Raycast(Vector3.new(31.5, 50, 5), Vector3.new(0, -100, 0)))
+show("side", workspace:Raycast(Vector3.new(60, -10, 5.3), Vector3.new(-100, 0, 0)))
+show("ball", workspace:Raycast(Vector3.new(105.3, 50, 2.1), Vector3.new(0, -100, 0)))
+show("far", workspace:Raycast(Vector3.new(20001.3, 50, 20001.7), Vector3.new(0, -100, 0)))
+show("long", workspace:Raycast(Vector3.new(0.3, 9000, 0.7), Vector3.new(0, -10000, 0)))
+show("inside", workspace:Raycast(Vector3.new(0.3, -5, 0.7), Vector3.new(0, -100, 0)))
+local inc = RaycastParams.new() inc.FilterType = Enum.RaycastFilterType.Include inc.FilterDescendantsInstances = {T}
+show("include", workspace:Raycast(Vector3.new(0.3, 50, 0.7), Vector3.new(0, -100, 0), inc))
+local exc = RaycastParams.new() exc.FilterDescendantsInstances = {T}
+show("exclude", workspace:Raycast(Vector3.new(0.3, 50, 0.7), Vector3.new(0, -100, 0), exc))
+show("edit_before", workspace:Raycast(Vector3.new(500.5, 50, 0.5), Vector3.new(0, -100, 0)))
+T:FillBlock(CFrame.new(500, 0, 0), Vector3.new(8, 8, 8), Enum.Material.Ice)
+show("edit_now", workspace:Raycast(Vector3.new(500.5, 50, 0.5), Vector3.new(0, -100, 0)))
+task.wait()
+show("edit_after", workspace:Raycast(Vector3.new(500.5, 50, 0.5), Vector3.new(0, -100, 0)))
+"#
+        );
+        let (out, _) = run_terrain_rays(&src, 8);
+        has(&out, "center Terrain 0.300,2.000,0.700 n=0.000,1.000,0.000 Grass d=48.000");
+        has(&out, "edge Terrain 31.500,0.250,5.000 n=0.447,0.894,0.000 Grass d=49.750");
+        has(&out, "side Terrain 34.000,-10.000,5.300 n=1.000,0.000,0.000 Grass d=26.000");
+        has(&out, "ball Terrain 105.300,10.247,2.100 n=-0.097,0.995,0.037 Rock d=39.753");
+        has(&out, "far Terrain 20001.301,2.000,20001.699 n=0.000,1.000,0.000 Mud d=48.000");
+        has(&out, "long Terrain 0.300,2.000,0.700 n=0.000,1.000,0.000 Grass d=8998.000");
+        has(&out, "inside nil");
+        has(&out, "include Terrain 0.300,2.000,0.700 n=0.000,1.000,0.000 Grass d=48.000");
+        has(&out, "exclude nil");
+        has(&out, "edit_before nil");
+        has(&out, "edit_now nil");
+        assert!(out.iter().any(|l| l.starts_with("edit_after Terrain 500.500,5.13")), "{out:?}");
+    }
+
+    /// A long ray over sparse terrain meshes only the chunks next to stored
+    /// voxels: on a big generated map every empty chunk along a 12000-stud
+    /// ray was meshed (4.5 ms a ray on a 2.78M-voxel place, 1600 rays 7 s; Studio 17 ms).
+    #[test]
+    fn long_terrain_rays_skip_empty_chunks() {
+        let src = format!(
+            "{RAY_FMT}{}",
+            r#"
+T:FillBlock(CFrame.new(0, -10, 0), Vector3.new(16, 20, 16), Enum.Material.Grass)
+T:FillBlock(CFrame.new(6000, 4000, 6000), Vector3.new(16, 20, 16), Enum.Material.Grass)
+T:FillBlock(CFrame.new(-6000, -4000, -6000), Vector3.new(16, 20, 16), Enum.Material.Grass)
+task.wait() task.wait()
+for i = 0, 9 do
+    show("r"..i, workspace:Raycast(Vector3.new(0.5 + i, 5000, 0.5), Vector3.new(0, -12000, 0)))
+end
+"#
+        );
+        let (out, meshed) = run_terrain_rays(&src, 6);
+        has(&out, "r0 Terrain 0.500,2.000,0.500 n=0.000,1.000,0.000 Grass d=4998.000");
+        assert!(meshed < 12, "{meshed} chunks meshed for one column");
+    }
+
+    /// The play mouse's terrain ray (Mouse.Hit / Mouse.Target), which only
+    /// saw parts: Studio's Mouse.Hit lies on the surface Raycast meets,
+    /// water included.
+    #[test]
+    fn mouse_ray_sees_terrain() {
+        let mut d = Document::new_place();
+        let rt = Runtime::new().unwrap();
+        let sss = d.find_child(d.dom.root_ref(), "ServerScriptService").unwrap();
+        let s = d.dom.insert(
+            sss,
+            InstanceBuilder::new("Script").with_name("T").with_property(
+                "Source",
+                "workspace.Terrain:FillBlock(CFrame.new(400, -8, 300), Vector3.new(32, 16, 32), Enum.Material.Water)".to_string(),
+            ),
+        );
+        rt.enter(World::new(d, RunMode::Run));
+        rt.bind_globals().unwrap();
+        rt.run_script(s);
+        for _ in 0..3 {
+            rt.step(1.0 / 60.0);
+        }
+        let hit = mouse_terrain_hit(&rt.lua, Vec3::new(400.3, 60.0, 330.7), Vec3::new(0.0, -60.0, -30.0).normalize(), 10000.0);
+        let w = rt.leave();
+        let (r, t) = hit.expect("mouse over the lake hits terrain");
+        assert_eq!(w.d().class_of(r).map(|c| c.to_string()).as_deref(), Some("Terrain"));
+        let p = Vec3::new(400.3, 60.0, 330.7) + Vec3::new(0.0, -60.0, -30.0).normalize() * t;
+        assert!(p.y.abs() < 1e-3, "water surface at {p}");
+    }
+
+    /// Dev probe (ignored): runs the Luau file in $RUSTUDIO_PROBE as a
+    /// Script and prints its output.
+    #[test]
+    #[ignore]
+    fn probe_file() {
+        let Ok(path) = std::env::var("RUSTUDIO_PROBE") else { return };
+        let src = std::fs::read_to_string(path).unwrap();
+        let mut d = match std::env::var("RUSTUDIO_PROBE_PLACE") {
+            Ok(p) => Document::open(std::path::Path::new(&p)).unwrap(),
+            Err(_) => Document::new_place(),
+        };
+        let sss = d.find_child(d.dom.root_ref(), "ServerScriptService").unwrap();
+        if let Some(Ok(v)) = crate::terrain::Voxels::from_dom(&d.dom) {
+            println!("probe: terrain {} voxels, bounds {:?}", v.count(), v.world_bounds());
+        }
+        let s = d.dom.insert(sss, InstanceBuilder::new("Script").with_name("T").with_property("Source", src));
+        let rt = Runtime::new().unwrap();
+        rt.enter(World::new(d, RunMode::Run));
+        rt.bind_globals().unwrap();
+        rt.run_script(s);
+        for _ in 0..600 {
+            rt.step(1.0 / 60.0);
+        }
+        let w = rt.leave();
+        for (_, t) in w.output {
+            println!("{t}");
+        }
     }
 }

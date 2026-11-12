@@ -288,6 +288,59 @@ pub fn sweep_part(
     Some((hit.time_of_impact, point, n))
 }
 
+/// A shape (as for `sweep_part`) swept against terrain triangles (world,
+/// counter-clockwise seen from outside). Only front faces count: a shape
+/// inside terrain doesn't hit it on the way out. Returns the first contact
+/// as (index into `tris`, distance, touching point, contact normal), or
+/// `Err(())` when the shape starts touching a front face (Studio then
+/// reports no terrain hit at all).
+pub fn sweep_triangles(
+    probe: &Xform,
+    probe_size: Vec3,
+    probe_kind: u8,
+    dir: Vec3,
+    len: f32,
+    tris: &[(usize, [Vec3; 3])],
+) -> Result<Option<(usize, f32, Vec3, Vec3)>, ()> {
+    let (sp, op) = parry_shape(probe_kind, probe_size);
+    let pose = parry_pose(probe, op);
+    let opts = parry::query::ShapeCastOptions {
+        max_time_of_impact: len,
+        target_distance: 0.0,
+        stop_at_penetration: true,
+        compute_impact_geometry_on_penetration: false,
+    };
+    let mut best: Option<(usize, f32, Vec3, Vec3)> = None;
+    for (i, t) in tris {
+        let n = (t[1] - t[0]).cross(t[2] - t[0]).normalize_or_zero();
+        if n == Vec3::ZERO || n.dot(dir) > 1e-6 {
+            continue;
+        }
+        let tri = parry::shape::Triangle::new(rv(t[0]), rv(t[1]), rv(t[2]));
+        let Ok(Some(hit)) = parry::query::cast_shapes(
+            &rp::Pose::IDENTITY,
+            rp::Vector::ZERO,
+            &tri,
+            &pose,
+            rv(dir),
+            &*sp,
+            opts,
+        ) else {
+            continue;
+        };
+        if hit.time_of_impact <= 1e-5 {
+            return Err(());
+        }
+        if best.is_none_or(|(_, bt, ..)| hit.time_of_impact < bt) {
+            // The contact normal (a sphere on a corner: from the corner to
+            // its centre), as Studio reports it.
+            let cn = gv(hit.normal1).normalize_or_zero();
+            best = Some((*i, hit.time_of_impact, gv(hit.witness1), if cn == Vec3::ZERO { n } else { cn }));
+        }
+    }
+    Ok(best)
+}
+
 /// Separating-axis test between two oriented boxes (centre, rotation, size).
 pub fn obb_obb(a: &Xform, a_size: Vec3, b: &Xform, b_size: Vec3) -> bool {
     let ha = a_size * 0.5;

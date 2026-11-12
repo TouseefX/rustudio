@@ -48,6 +48,26 @@ fn pose(xf: &Xform) -> rp::Pose {
     rp::Pose::from_parts(rv(xf.pos), rp::Rotation::from_xyzw(q.x, q.y, q.z, q.w))
 }
 
+/// The Humanoid's body box (HumShape's box, root frame) with its vertical
+/// edges cut off (round 26): at a wall's end Studio's box pivots round the
+/// edge and gets free ~0.3 studs before a square box would (movement-wall
+/// wall_jump_diag); the cut edge slides round it the same way and its
+/// slanted normal turns the body as the pivot does. Running and Climbing
+/// both move it.
+fn hum_body_shape(sh: &HumShape) -> rp::SharedShape {
+    let half = (sh.box_hi - sh.box_lo) * 0.5;
+    let cut = mech::HUMANOID_BOX_CHAMFER.min(half.x.min(half.z) * 0.6);
+    let mut hull = Vec::with_capacity(16);
+    for sy in [-1.0f32, 1.0] {
+        for (sx, sz) in [(1.0f32, 1.0f32), (1.0, -1.0), (-1.0, 1.0), (-1.0, -1.0)] {
+            let y = sy * half.y;
+            hull.push(rp::Vector::new(sx * half.x, y, sz * (half.z - cut)));
+            hull.push(rp::Vector::new(sx * (half.x - cut), y, sz * half.z));
+        }
+    }
+    rp::SharedShape::convex_hull(&hull).unwrap_or_else(|| rp::SharedShape::cuboid(half.x, half.y, half.z))
+}
+
 fn yaw_rot(yaw: f32) -> rp::Rotation {
     let q = Quat::from_rotation_y(yaw);
     rp::Rotation::from_xyzw(q.x, q.y, q.z, q.w)
@@ -841,6 +861,15 @@ pub struct CharBody {
     /// Seconds since the floor last held it (coyote time: a jump still
     /// takes off this soon after walking off a ledge).
     pub air_time: f32,
+    /// It has come down onto its floor (root within HUMANOID_LAND_GAP of
+    /// floor + hip): the floor rays reach well below the feet, but a jump
+    /// only takes off once it has landed, not while falling into range.
+    pub standing: bool,
+    /// The next jump takes off whatever the floor (leaving a truss or a
+    /// seat); cleared each move_humanoid.
+    pub free_jump: bool,
+    /// Diagonal impulse on leaving a ladder, consumed by move_humanoid.
+    pub climb_jump: Option<Vec3>,
     /// The wall its body box last pushed against (outward normal).
     pub wall: Option<Vec3>,
     /// That wall's friction against the character's Plastic (Roblox's mix).
@@ -2676,21 +2705,149 @@ impl Physics {
         Some((y as f32) * terrain::VOXEL)
     }
 
-    /// The first part a horizontal ray from `from` along `dir` hits within
-    /// `dist` (the character's own parts and sensors left out).
-    pub fn part_ahead(&self, from: Vec3, dir: Vec3, dist: f32, own: &HashSet<Ref>) -> Option<Ref> {
+    /// Classic FindLadder (Studio): upward horizontal samples,
+    /// a hit followed by a gap, then another hit or a sufficiently high first rung.
+    #[cfg(test)]
+    pub fn ladder_ahead(&self, doc: &Document, root: Vec3, dir: Vec3, own: &HashSet<Ref>) -> bool {
+        self.ladder_ahead_scaled(doc, root, dir, mech::CLIMB_SCAN_HEIGHT, mech::CLIMB_REACH, own)
+    }
+
+    #[cfg(test)]
+    pub fn ladder_ahead_scaled(&self, doc: &Document, root: Vec3, dir: Vec3, height: f32, reach: f32, own: &HashSet<Ref>) -> bool {
+        self.ladder_normal_scaled(doc, root, dir, height, reach, own).is_some()
+    }
+
+    /// FindLadder's contact normal is retained for the climbing velocity basis.
+    pub fn ladder_normal_scaled(&self, doc: &Document, root: Vec3, dir: Vec3, height: f32, reach: f32, own: &HashSet<Ref>) -> Option<Vec3> {
+        if height <= mech::CLIMB_BOTTOM_MARGIN || reach <= 0.0 { return None; }
+        let max_drop = height - mech::CLIMB_BOTTOM_MARGIN;
         let by_collider = &self.by_collider;
-        let not_own = |h: rp::ColliderHandle, _: &rp::Collider| {
-            by_collider.get(&h).is_none_or(|r| !own.contains(r))
+        let look = dir.normalize_or_zero();
+        // Studio broad query: a world box reach × 0.75 (Studio)
+        // ahead of the root, as wide and deep, from root.y − (height − 0.3)
+        // up to root.y + 1 (Studio). Its parts form the include list
+        // of the floor ray and every sample ray (FUN_140adf070's list), so
+        // a part reaching above root + 1 only, or a floor outside the box,
+        // is never seen. Studio, own hidden pid 6184: a 2-stud truss whose
+        // bottom is 0.9 above the root climbs, 1.1 above does not.
+        let r = reach * mech::CLIMB_QUERY_DEPTH_FACTOR;
+        let centre = root + look * r;
+        let lo = Vec3::new(centre.x - r, root.y - max_drop, centre.z - r);
+        let hi = Vec3::new(centre.x + r, root.y + mech::CLIMB_QUERY_TOP, centre.z + r);
+        let candidates: HashSet<rp::ColliderHandle> = {
+            let not_own = |h: rp::ColliderHandle, _: &rp::Collider| by_collider.get(&h).is_none_or(|r| !own.contains(r));
+            let qp = self.world.query_pipeline_with_filter(rp::QueryFilter::default().exclude_sensors().predicate(&not_own));
+            qp.intersect_aabb_conservative(rp::Aabb::new(rv(lo), rv(hi)))
+                .filter(|(_, co)| {
+                    let b = co.compute_aabb();
+                    b.mins.x < hi.x && b.maxs.x > lo.x && b.mins.y < hi.y && b.maxs.y > lo.y
+                        && b.mins.z < hi.z && b.maxs.z > lo.z
+                })
+                .map(|(h, _)| h)
+                .collect()
         };
-        let qp = self.world.query_pipeline_with_filter(
-            rp::QueryFilter::default()
-                .exclude_sensors()
-                .predicate(&not_own),
-        );
-        let ray = rp::Ray::new(rv(from), rv(dir.normalize_or_zero()));
-        qp.cast_ray(&ray, dist, true)
-            .and_then(|(h, _)| self.by_collider.get(&h).copied())
+        if candidates.is_empty() { return None; }
+        let listed = |h: rp::ColliderHandle, _: &rp::Collider| candidates.contains(&h);
+        let qp = self.world.query_pipeline_with_filter(rp::QueryFilter::default().exclude_sensors().predicate(&listed));
+        // Studio: clamp the downward offset to the floor hit distance.
+        let drop = qp.cast_ray(&rp::Ray::new(rv(root), rv(-Vec3::Y)), max_drop, true)
+            .map_or(max_drop, |(_, toi)| toi);
+
+        let step = height / mech::CLIMB_SCAN_DIVISOR * mech::CLIMB_SCAN_STEP_FACTOR;
+        let limit = height / mech::CLIMB_SCAN_DIVISOR * mech::CLIMB_GAP_FACTOR;
+        let mut first = None;
+        let mut normal = -dir.normalize_or_zero();
+        let mut gap = None;
+        let mut gap_size = 0.0;
+        let mut second = false;
+        let samples = (max_drop / step) as usize + mech::CLIMB_SCAN_EXTRA_SAMPLES;
+        for sample in 1..samples {
+            let y = sample as f32 * step;
+            let ray = rp::Ray::new(rv(root + Vec3::Y * (y - drop)), rv(look));
+            let contact = qp.cast_ray_and_get_normal(&ray, reach * 2.0 * mech::CLIMB_QUERY_DEPTH_FACTOR, true);
+            let hit = contact.and_then(|(h, _)| self.by_collider.get(&h).copied());
+            if let Some((_, h)) = contact { normal = gv(h.normal); }
+            if hit.is_some_and(|r| doc.class_of(r).is_some_and(|c| c == "TrussPart")) { return Some(normal); }
+            if hit.is_some() {
+                if first.is_none() { first = Some(y); }
+                if gap.is_some() { second = true; }
+            } else if first.is_some() && gap.is_none() {
+                gap = Some(y);
+                gap_size = y - first.unwrap();
+            }
+        }
+        first.filter(|f| *f < limit && gap_size > 0.0 && gap_size < limit
+            && (second || *f > limit / mech::CLIMB_SINGLE_RUNG_DIVISOR)).map(|_| normal)
+    }
+
+    /// One frame of Climbing (update Studio, then the shared
+    /// Running/Climbing controller Studio). `walk` is the move vector
+    /// (direction × WalkSpeed), `look` the root's flat look, `normal` the
+    /// ladder sensor's hit normal. Climbing down (move · look < −0.2,
+    /// Studio) with a floor under it, the target is the move vector
+    /// itself (the branch that keeps  when FUN_14529d540 finds a
+    /// floor), so it walks off the foot of the ladder; otherwise it is
+    /// ±|move| × 0.7 (0.01 under 0.1 of input) up the ladder.
+    #[allow(clippy::too_many_arguments)]
+    pub fn climb_step(&mut self, c: &mut CharBody, sh: &HumShape, yaw: f32, walk: Vec3, look: Vec3,
+        normal: Vec3, dt: f32, own: &HashSet<Ref>) -> Vec<Ref> {
+        let input = walk.length();
+        let away = input > 1e-4 && (walk / input).dot(look) < mech::CLIMB_DOWN_DOT;
+        let root = c.pos + Vec3::Y * sh.root_lift;
+        let floor = away && self.find_floor(root, Quat::from_rotation_y(yaw), sh, false, own).is_some();
+        let target = if floor {
+            Vec3::new(walk.x, 0.0, walk.z)
+        } else {
+            let up = if input < mech::CLIMB_MIN_INPUT { mech::CLIMB_CREEP } else { input * mech::CLIMB_SPEED_FACTOR };
+            mech::climb_velocity(normal, if away { -up } else { up })
+        };
+        // The body is the Humanoid's box, as in Running (not the old 1-stud
+        // capsule, which held the root a stud off the face and rode out
+        // over each rung's edge). Nothing pulls it toward the ladder: the
+        // controller only stops the walk-in, so the root rests where that
+        // ran out or where the box met the ladder. Studio (own hidden
+        // Studio, walking in at 16): R6 truss 0.770 from the face, rungs
+        // 0.519 (torso flush); R15 truss 1.435, rungs 1.035.
+        let steps = mech::humanoid_steps(dt);
+        let h = dt / steps as f32;
+        let shape = hum_body_shape(sh);
+        let mid = (sh.box_hi + sh.box_lo) * 0.5;
+        let rot = Quat::from_rotation_y(yaw);
+        let groups = self.interaction(&self.char_group);
+        let mut v = Vec3::new(c.vel.x, c.vel_y, c.vel.z);
+        let mut grounded = false;
+        for _ in 0..steps {
+            v = mech::climb_controller(v, target, 1);
+            let desired = v * h;
+            let root = c.pos + Vec3::Y * sh.root_lift;
+            let at = rp::Pose::from_parts(rv(root + rot * mid), yaw_rot(yaw));
+            let by_collider = &self.by_collider;
+            let not_own = |hd: rp::ColliderHandle, _: &rp::Collider| by_collider.get(&hd).is_none_or(|r| !own.contains(r));
+            let qp = self.world.query_pipeline_with_filter(
+                rp::QueryFilter::default().exclude_sensors().groups(groups).predicate(&not_own),
+            );
+            let mv = self.hum_controller.move_shape(h, &qp, &*shape, &at, rv(desired), |_| {});
+            let moved = gv(mv.translation);
+            c.pos += moved;
+            grounded = mv.grounded;
+            // Blocked up or down (a ceiling, the floor): that speed is gone.
+            if desired.y.abs() > 1e-5 && (moved.y / desired.y) < 0.5 {
+                v.y = 0.0;
+            }
+        }
+        c.vel = v;
+        c.vel_y = v.y;
+        c.grounded = grounded;
+        // Touches as Running's: the box and the legs under it, sensors too.
+        let root = c.pos + Vec3::Y * sh.root_lift;
+        let lo = Vec3::new(sh.box_lo.x, sh.box_lo.y - sh.hip, sh.box_lo.z);
+        let probe = rp::Cuboid::new(rv((sh.box_hi - lo) * 0.5 + Vec3::splat(0.1)));
+        let at = rp::Pose::from_parts(rv(root + rot * ((sh.box_hi + lo) * 0.5)), yaw_rot(yaw));
+        let touched: HashSet<Ref> = self.world.query_pipeline()
+            .intersect_shape(at, &probe)
+            .filter_map(|(hd, _)| self.by_collider.get(&hd).copied())
+            .collect();
+        touched.into_iter().collect()
     }
 
     /// The part the character stands on (Humanoid.FloorMaterial comes from
@@ -2713,6 +2870,20 @@ impl Physics {
         qp.cast_ray(&ray, 0.6, true)
             .and_then(|(h, _)| self.by_collider.get(&h).copied())
     }
+}
+
+/// Whether a frame climbs, given the ladder sensor's result and Jump.
+/// Studio's state transition table (Studio, read by Studio: row
+/// = state + 1, 0x4c bytes = 19 columns; column 0 ladder found, 1 ladder
+/// lost, 12 Jump): Freefall's row has ladder → Climbing (12) and nothing on
+/// Jump, so a falling climber grabs the ladder whether Jump is held or not;
+/// Climbing's row has Jump → Jumping (3), the one-shot jump off. Running on
+/// a floor jumps first (own hidden Studio, R15 at a rung ladder 1.17 from
+/// its face, Jump held: Running → Jumping). With Jump held at a ladder
+/// Studio cycles Climbing → Jumping → Freefall → Climbing (R6 truss: grabs
+/// at 3.034, 3.500, 4.090, 4.590, 5.062 s after the first jump off).
+pub fn climbs(climbing: bool, on_floor: bool, ladder: bool, jump: bool) -> bool {
+    ladder && !(jump && (climbing || on_floor))
 }
 
 /// What Studio's Humanoid controller needs to know about its character
@@ -3195,23 +3366,8 @@ impl Physics {
     ) -> HumMove {
         let n = ((dt * mech::STUDIO_PHYSICS_HZ).ceil() as usize).clamp(1, 12);
         let h = dt / n as f32;
-        let half = (sh.box_hi - sh.box_lo) * 0.5;
         let mid = (sh.box_hi + sh.box_lo) * 0.5;
-        // The body box with its vertical edges cut off (round 26): at a wall's
-        // end Studio's box pivots round the edge and gets free ~0.3 studs
-        // before a square box would (movement-wall wall_jump_diag); the cut
-        // edge slides round it the same way and its slanted normal turns the
-        // body as the pivot does.
-        let cut = mech::HUMANOID_BOX_CHAMFER.min(half.x.min(half.z) * 0.6);
-        let mut hull = Vec::with_capacity(16);
-        for sy in [-1.0f32, 1.0] {
-            for (sx, sz) in [(1.0f32, 1.0f32), (1.0, -1.0), (-1.0, 1.0), (-1.0, -1.0)] {
-                let y = sy * half.y;
-                hull.push(rp::Vector::new(sx * half.x, y, sz * (half.z - cut)));
-                hull.push(rp::Vector::new(sx * (half.x - cut), y, sz * half.z));
-            }
-        }
-        let shape = rp::SharedShape::convex_hull(&hull).unwrap_or_else(|| rp::SharedShape::cuboid(half.x, half.y, half.z));
+        let shape = hum_body_shape(sh);
         let groups = self.interaction(&self.char_group);
         let mut out = HumMove::default();
         let start = c.pos;
@@ -3229,7 +3385,12 @@ impl Physics {
                 c.jump_rise = false;
             }
             let mut on_floor = target.is_some() && !c.jump_rise;
-            if on_floor {
+            if !on_floor {
+                c.standing = false;
+            } else if target.is_some_and(|t| root.y - t <= mech::HUMANOID_LAND_GAP) {
+                c.standing = true;
+            }
+            if on_floor && c.standing {
                 c.air_time = 0.0;
             } else {
                 c.air_time += h;
@@ -3240,9 +3401,14 @@ impl Physics {
                 && !c.jump_rise
                 && c.vel.y <= 0.0
                 && c.air_time <= mech::HUMANOID_COYOTE_S;
-            if let (Some(v), true, false) = (jump_velocity, on_floor || coyote, out.jumped) {
-                c.vel.y = v;
+            if let (Some(v), true, false) = (jump_velocity, (on_floor && c.standing) || coyote || c.free_jump, out.jumped) {
+                if let Some(direction) = c.climb_jump.take() {
+                    c.vel += direction * (v - c.vel.dot(direction)).max(0.0);
+                } else {
+                    c.vel.y = v;
+                }
                 c.jump_rise = true;
+                c.free_jump = false;
                 out.jumped = true;
                 on_floor = false;
                 // Against a wall (walking into it) the wall's friction keeps
@@ -3481,6 +3647,7 @@ impl Physics {
         // The last step decides.
         let root = c.pos + Vec3::Y * sh.root_lift;
         let floor = c.had_floor.then(|| self.find_floor(root, Quat::from_rotation_y(*yaw), sh, true, own)).flatten();
+        c.free_jump = false;
         out.grounded = c.had_floor || out.grounded && c.vel.y.abs() < 1e-3;
         out.floor = floor.and_then(|f| f.part).or(if out.grounded { out.floor } else { None });
         out.velocity = (c.pos - start) / dt.max(1e-6);
@@ -3565,6 +3732,581 @@ mod tests {
         assert_eq!(p.gravity, g);
     }
 
+    #[test]
+    fn climbing_tilt_velocity_uses_contact_plane() {
+        // Studio own hidden pid 6308: 10 degrees (0,10.720539,1.888623),
+        // 20 degrees (0,10.489427,3.816034); finite force/contact settling.
+        for (degrees, expected) in [(0.0_f32, Vec3::new(0.0,11.2,0.0)),
+            (10.0, Vec3::new(0.0,10.720539,1.888623)),
+            (20.0, Vec3::new(0.0,10.489427,3.816034))] {
+            let normal = Quat::from_rotation_x(degrees.to_radians()) * Vec3::Z;
+            let v = mech::climb_velocity(normal, 11.2);
+            assert!((v - expected).length() < 0.35, "{degrees}: {v:?}");
+            assert!(v.dot(normal).abs() < 1e-5);
+            assert!((v.length() - 11.2).abs() < 1e-5);
+        }
+    }
+
+    #[test]
+    fn humanoid_part_ladder_sensor() {
+        for spacing in [0.4, 0.7, 1.2] {
+            let rungs = (0..40).map(|i| part("Rung", Vec3::new(0.0, i as f32 * spacing, -1.0), true)
+                .with_property("Size", Vector3::new(4.0, 0.2, 0.5))).collect();
+            let (doc, p) = hum_world(rungs);
+            assert!(p.ladder_ahead(&doc, Vec3::new(0.0, 10.0, 0.0), -Vec3::Z, &HashSet::new()), "spacing {spacing}");
+        }
+        for spacing in [4.0, 6.0] {
+            let (doc, p) = hum_world((0..20).map(|i| part("Rung", Vec3::new(0.0, i as f32 * spacing, -1.0), true)
+                .with_property("Size", Vector3::new(4.0, 0.2, 0.5))).collect());
+            assert!(!p.ladder_ahead(&doc, Vec3::new(0.0, 10.6, 0.0), -Vec3::Z, &HashSet::new()));
+        }
+        let (doc, p) = hum_world(vec![part("Wall", Vec3::new(0.0, 10.0, -1.0), true)
+            .with_property("Size", Vector3::new(4.0, 30.0, 0.5))]);
+        assert!(!p.ladder_ahead(&doc, Vec3::new(0.0, 10.0, 0.0), -Vec3::Z, &HashSet::new()));
+    }
+
+    fn sensor_truss(y: f32) -> InstanceBuilder {
+        InstanceBuilder::new("TrussPart").with_name("SensorTruss")
+            .with_property("Anchored", true)
+            .with_property("Size", Vector3::new(2.0, 0.1, 0.2))
+            .with_property("CFrame", CFrame::new(Vector3::new(0.0, y, -0.8), CFrame::identity().orientation))
+    }
+
+    #[test]
+    fn ladder_scan_uses_rig_height() {
+        let (doc, p) = hum_world(vec![sensor_truss(6.0)]);
+        let own = HashSet::new();
+        assert!(!p.ladder_ahead_scaled(&doc, Vec3::Y * 10.0, -Vec3::Z, 3.0, 0.7, &own));
+        assert!(p.ladder_ahead_scaled(&doc, Vec3::Y * 10.0, -Vec3::Z, 6.0, 0.7, &own));
+    }
+
+    fn truss_box(centre: Vec3, size: Vec3, tilt_deg: f32) -> InstanceBuilder {
+        let (sn, cs) = tilt_deg.to_radians().sin_cos();
+        let rot = rbx_dom_weak::types::Matrix3::new(Vector3::new(1.0, 0.0, 0.0),
+            Vector3::new(0.0, cs, -sn), Vector3::new(0.0, sn, cs));
+        InstanceBuilder::new("TrussPart").with_name("T")
+            .with_property("Anchored", true)
+            .with_property("Size", Vector3::new(size.x, size.y, size.z))
+            .with_property("CFrame", CFrame::new(Vector3::new(centre.x, centre.y, centre.z), rot))
+    }
+
+    fn slab(z0: f32) -> InstanceBuilder {
+        part("Slab", Vec3::new(0.0, 8.5, (3.0 + z0) / 2.0), true)
+            .with_property("Size", Vector3::new(4.0, 1.0, 3.0 - z0))
+    }
+
+    /// Own hidden Studio pid 6184, R6, gravity 0, root near Y 10.3 walking
+    /// at a 2-stud truss spanning Y 6.9..8.9 (face 0.5 ahead): with no slab,
+    /// or a slab (top 9) under the root reaching only Z 0.1..3, it climbed
+    /// (Climbing at root 10.378); the same slab reaching Z −1..3 — into the
+    /// broad query box — stopped it: its floor hit lifted the samples above
+    /// the truss.
+    #[test]
+    fn ladder_floor_adjusts_scan_origin() {
+        let own = HashSet::new();
+        let root = Vec3::new(0.0, 10.3, 0.0);
+        let truss = || truss_box(Vec3::new(0.0, 7.9, -1.5), Vec3::splat(2.0), 0.0);
+        let (doc, p) = hum_world(vec![truss()]);
+        assert!(p.ladder_ahead_scaled(&doc, root, -Vec3::Z, 3.0, 0.7, &own), "no slab");
+        let (doc, p) = hum_world(vec![truss(), slab(0.1)]);
+        assert!(p.ladder_ahead_scaled(&doc, root, -Vec3::Z, 3.0, 0.7, &own), "slab outside the box");
+        let (doc, p) = hum_world(vec![truss(), slab(-1.0)]);
+        assert!(!p.ladder_ahead_scaled(&doc, root, -Vec3::Z, 3.0, 0.7, &own), "slab inside the box");
+    }
+
+    /// The broad query box ends at root.Y + 1 (Studio, Studio):
+    /// Studio pid 6184, root Y 10, 2-stud truss bottom at 10.9 climbed,
+    /// at 11.1 did not (the samples alone would reach root + 1.157).
+    #[test]
+    fn ladder_query_box_ends_above_root() {
+        let own = HashSet::new();
+        for (bottom, found) in [(10.5, true), (10.9, true), (11.1, false), (11.5, false)] {
+            let (doc, p) = hum_world(vec![truss_box(Vec3::new(0.0, bottom + 1.0, -1.5), Vec3::splat(2.0), 0.0)]);
+            assert_eq!(p.ladder_ahead_scaled(&doc, Vec3::Y * 10.0, -Vec3::Z, 3.0, 0.7, &own), found, "bottom {bottom}");
+        }
+    }
+
+    fn hum_shape_r6() -> HumShape {
+        HumShape {
+            hip: 2.0,
+            root_size: Vec3::new(2.0, 2.0, 1.0),
+            box_lo: Vec3::new(-1.0, -1.0, -0.5),
+            box_hi: Vec3::new(1.0, 2.0, 0.5),
+            root_lift: 0.0,
+            mass: 10.0,
+            parts: 6,
+            r6: true,
+        }
+    }
+
+    /// Climb frames the way play.rs does (sensor each frame along −Z, then
+    /// climb_step) until the sensor loses the ladder; returns every root
+    /// position and velocity, and whether it was still climbing.
+    fn climb_frames(doc: &Document, p: &mut Physics, c: &mut CharBody, walk: Vec3, dt: f32, frames: usize)
+        -> (Vec<(Vec3, Vec3)>, bool) {
+        let sh = hum_shape_r6();
+        let own = HashSet::new();
+        let mut out = Vec::new();
+        for _ in 0..frames {
+            let Some(n) = p.ladder_normal_scaled(doc, c.pos, -Vec3::Z, 3.0, mech::CLIMB_REACH, &own) else {
+                return (out, false);
+            };
+            p.climb_step(c, &sh, 0.0, walk, -Vec3::Z, n, dt, &own);
+            out.push((c.pos, c.vel));
+        }
+        (out, true)
+    }
+
+    /// Item 2, own hidden Studio pid 6184, R6 WalkSpeed 16, an 80-stud
+    /// truss centred (0,40,0) leaning over the climber about X: 1 s
+    /// averages 0° (0,11.2000,0), 10° (0,10.7205,1.8894), 20°
+    /// (0,10.4890,3.8164). Direction matches to 0.1°; the speed keeps
+    /// 11.2 where Studio's contact settles 0.03–0.3 lower.
+    #[test]
+    fn climbing_tilted_truss_matches_studio() {
+        for (deg, studio) in [(0.0_f32, Vec3::new(0.0, 11.2, 0.0)),
+            (10.0, Vec3::new(0.0, 10.7205, 1.8894)), (20.0, Vec3::new(0.0, 10.4890, 3.8164))] {
+            let (doc, mut p) = hum_world(vec![truss_box(Vec3::new(0.0, 40.0, 0.0), Vec3::new(2.0, 80.0, 2.0), deg)]);
+            let th = deg.to_radians();
+            // On the face at Y 8, 1 stud out (rustudio's capsule radius).
+            let face_z = (8.0 - 40.0) * th.tan() + 1.0 / th.cos();
+            let mut c = CharBody { pos: Vec3::new(0.0, 8.0, face_z + 1.0 / th.cos()), ..Default::default() };
+            let dt = 1.0 / 60.0;
+            let (trace, held) = climb_frames(&doc, &mut p, &mut c, -Vec3::Z * 16.0, dt, 150);
+            assert!(held, "{deg}: lost the ladder after {} frames", trace.len());
+            let v = (trace[149].0 - trace[89].0) / (60.0 * dt);
+            let angle = v.z.atan2(v.y).to_degrees();
+            let studio_angle = studio.z.atan2(studio.y).to_degrees();
+            eprintln!("tilt {deg}: rustudio {v:?} vs Studio {studio:?}");
+            assert!((angle - studio_angle).abs() < 0.1, "{deg}: angle {angle} vs Studio {studio_angle}");
+            assert!((v - studio).length() < 0.35, "{deg}: {v:?} vs Studio {studio:?}");
+        }
+    }
+
+    /// Item 3, own hidden Studio pid 6184 (R6, forced back to the rung on
+    /// Freefall): Climbing → Jumping with the root at (0,11.2,0); Jumping's
+    /// impulse holds (0,42.0197,32.4547); Freefall one step later reads
+    /// −0.8175 (one 1/240 s step of gravity from rest), then Climbing's
+    /// controller gives 6.6934 after one step, 10.5663 after two more and
+    /// 11.1109 after two more.
+    #[test]
+    fn climbing_regrab_steps_match_studio() {
+        assert_eq!(mech::humanoid_steps(1.0 / 240.0), 1);
+        assert_eq!(mech::humanoid_steps(1.0 / 60.0), 4);
+        let g = 196.2 / mech::HUMANOID_STEP_HZ;
+        assert!((g - 0.8175).abs() < 1e-4);
+        let mut v = Vec3::new(0.0, -g, 0.0);
+        for (steps, studio) in [(1, 6.6934), (2, 10.5663), (2, 11.1109)] {
+            v = mech::climb_controller(v, Vec3::Y * 11.2, steps);
+            assert!((v.y - studio).abs() < 2e-3, "{} vs Studio {studio}", v.y);
+        }
+    }
+
+    /// Item 4, top lip: Studio pid 6184, 20-stud truss (top Y 20), R6 —
+    /// Climbing at root.Y 22.4788, released (Climbing → Running) at
+    /// 22.5721: the lowest sample (root − 2.557) cleared the top. Velocity
+    /// at release (0,11.2,0); Running's first step (0,10.3825,−0.5958) is
+    /// gravity plus 143 studs/s² air steering (HUMANOID_AIR_ACCEL).
+    #[test]
+    fn climbing_top_release_matches_studio() {
+        let (doc, mut p) = hum_world(vec![truss_box(Vec3::new(0.0, 10.0, -1.5), Vec3::new(2.0, 20.0, 2.0), 0.0)]);
+        let mut c = CharBody { pos: Vec3::new(0.0, 15.0, 0.5), ..Default::default() };
+        let (trace, held) = climb_frames(&doc, &mut p, &mut c, -Vec3::Z * 16.0, 1.0 / 120.0, 400);
+        assert!(!held);
+        let (last, v) = *trace.last().unwrap();
+        let checked = trace[trace.len() - 2].0;
+        // The sensor held at the last check below the lip and let go after.
+        eprintln!("top: last check {checked:?}, released at {last:?}");
+        assert!(checked.y < 22.5721 && last.y > 22.4788, "last check {checked:?}, released at {last:?}");
+        let sensor = |y: f32| p.ladder_normal_scaled(&doc, Vec3::new(last.x, y, last.z), -Vec3::Z, 3.0, mech::CLIMB_REACH, &HashSet::new());
+        assert!(sensor(22.4788).is_some() && sensor(22.5721).is_none());
+        assert!((v - Vec3::Y * 11.2).length() < 1e-3, "{v:?}");
+        assert!((11.2_f32 - 196.2 / 240.0 - 10.3825).abs() < 1e-3);
+        assert!((mech::HUMANOID_AIR_ACCEL / 240.0 - 0.5958).abs() < 2e-3);
+    }
+
+    /// Item 4, descent: Studio pid 6184, same truss, moving away (+Z):
+    /// −11.2 down until the floor sensor finds the floor (root.Y between
+    /// 4.055 and 4.148), then the target is the move vector: vertical
+    /// −4.2000, −0.5906, −0.0831 and horizontal 3.0902, 9.2705, 14.6352
+    /// over 1 + 2 + 2 steps; Climbing → Running at root.Y 4.0269 once the
+    /// ladder leaves the sensor.
+    #[test]
+    fn climbing_descent_walks_off_like_studio() {
+        let walk = Vec3::Z * 16.0;
+        let mut v = Vec3::new(0.0, -11.2, 0.0);
+        for (steps, vy, vz) in [(1, -4.2_f32, 3.0902_f32), (2, -0.5906, 9.2705), (2, -0.0831, 14.6352)] {
+            v = mech::climb_controller(v, Vec3::new(walk.x, 0.0, walk.z), steps);
+            assert!((v.y - vy).abs() < 2e-3 && (v.z - vz).abs() < 2e-3, "{v:?} vs Studio ({vy},{vz})");
+        }
+        let (doc, mut p) = hum_world(vec![truss_box(Vec3::new(0.0, 10.0, -1.5), Vec3::new(2.0, 20.0, 2.0), 0.0)]);
+        let mut c = CharBody { pos: Vec3::new(0.0, 12.0, 0.5), ..Default::default() };
+        let (trace, held) = climb_frames(&doc, &mut p, &mut c, walk, 1.0 / 144.0, 400);
+        assert!(!held, "never let go");
+        let walk_off = trace.iter().position(|(_, v)| v.z > 1.0).expect("walked off");
+        let start = trace[walk_off - 1].0.y;
+        assert!(start > 4.0 && start < 4.25, "walk-off began at root {start}");
+        let (end, v) = *trace.last().unwrap();
+        eprintln!("descent: walk-off from root {start}, released at {end:?} with {v:?}");
+        assert!((end.y - 4.0269).abs() < 0.15, "released at {end:?}");
+        assert!(v.y.abs() < 2.0 && v.z > 3.0, "release velocity {v:?}");
+    }
+
+    /// Frames as play.rs runs them for a character walking −Z (yaw 0) at a
+    /// ladder: FindLadder on its schedule (`play::ladder_interval`), then
+    /// `climbs` picks Climbing (`climb_step`) or the Humanoid controller
+    /// (`move_humanoid`, with the jump off a ladder). `jump_from` is the
+    /// frame Jump starts being held. Returns per frame the state and root.
+    fn ladder_run(doc: &Document, p: &mut Physics, sh: &HumShape, start: Vec3, frames: usize,
+        jump_from: usize) -> Vec<(crate::rig::State, Vec3)> {
+        ladder_run_dt(doc, p, sh, start, frames, jump_from, 1.0 / 60.0)
+    }
+
+    fn ladder_run_dt(doc: &Document, p: &mut Physics, sh: &HumShape, start: Vec3, frames: usize,
+        jump_from: usize, dt: f32) -> Vec<(crate::rig::State, Vec3)> {
+        use crate::rig::State;
+        let own = HashSet::new();
+        let reach = if sh.r6 { mech::CLIMB_REACH } else { mech::CLIMB_REACH_R15 };
+        let height = sh.hip + sh.root_size.y * 0.5;
+        let walk = -Vec3::Z * 16.0;
+        let mut c = CharBody { pos: start, grounded: true, had_floor: true, standing: true, ..Default::default() };
+        let mut yaw = 0.0;
+        let (mut state, mut ladder, mut wait, mut floating) = (State::Running, None, 0u8, false);
+        let mut out = Vec::new();
+        for f in 0..frames {
+            let jump = f >= jump_from;
+            let ladder_state = matches!(state, State::Running | State::Freefall | State::Climbing);
+            if !ladder_state {
+                wait = 0;
+            } else if wait > 0 {
+                wait -= 1;
+            } else {
+                ladder = p.ladder_normal_scaled(doc, c.pos + Vec3::Y * sh.root_lift, -Vec3::Z, height, reach, &own);
+                wait = crate::play::ladder_interval(state);
+            }
+            let on = ladder_state && ladder.is_some();
+            let next = if climbs(state == State::Climbing, c.grounded, on, jump) {
+                p.climb_step(&mut c, sh, yaw, walk, -Vec3::Z, ladder.unwrap(), dt, &own);
+                floating = true;
+                State::Climbing
+            } else {
+                if state == State::Climbing && jump {
+                    c.grounded = true;
+                    c.free_jump = true;
+                    c.vel = Vec3::Y * c.vel_y;
+                    c.climb_jump = Some((Vec3::Y + Vec3::Z) * mech::CLIMB_JUMP_COMPONENT);
+                }
+                if std::mem::take(&mut floating) {
+                    c.vel.y = c.vel_y;
+                }
+                let m = p.move_humanoid(doc, &mut c, &mut yaw, sh, walk, jump.then_some(53.0), true, dt, &own);
+                c.vel_y = c.vel.y;
+                if state == State::Climbing && !m.jumped {
+                    State::Running
+                } else if !c.grounded {
+                    if m.jumped || m.jumping { State::Jumping } else { State::Freefall }
+                } else {
+                    State::Running
+                }
+            };
+            if next != state {
+                wait = 0;
+                state = next;
+            }
+            out.push((state, c.pos));
+        }
+        out
+    }
+
+    /// The ledge probe place's lanes (own hidden Studio, ledge-r6.rbxlx and
+    /// ledge-r15.rbxlx, 2026-11-11): the character starts at the origin
+    /// facing −Z and walks at 16; every face is at z = −6. `block<h>`: an
+    /// 8 × h × 6 block on the floor; `shelf<a>to<b>` / `table2to3`: the same
+    /// with nothing under it from the floor to a; `rung2.6`: one 2 × 0.4 × 1
+    /// bar at 2.6–3.0; `truss` a 2 × 12 × 2 TrussPart; `rungs` 12 bars
+    /// 2 × 0.4 × 1 every stud (top 12); `+platform`: a 10 × 12 × 10 block
+    /// right behind it.
+    fn ledge_lane(kind: &str) -> Vec<InstanceBuilder> {
+        let slab = |bottom: f32, top: f32| vec![part("S", Vec3::new(0.0, (bottom + top) / 2.0, -9.0), true)
+            .with_property("Size", Vector3::new(8.0, top - bottom, 6.0))];
+        let rungs = || (0..12).map(|i| part("R", Vec3::new(0.0, 0.8 + i as f32, -6.5), true)
+            .with_property("Size", Vector3::new(2.0, 0.4, 1.0))).collect::<Vec<_>>();
+        let platform = |z: f32| part("P", Vec3::new(0.0, 6.0, z - 5.0), true).with_property("Size", Vector3::new(10.0, 12.0, 10.0));
+        let truss = || truss_box(Vec3::new(0.0, 6.0, -7.0), Vec3::new(2.0, 12.0, 2.0), 0.0);
+        match kind {
+            "truss" => vec![truss()],
+            "truss+platform" => vec![truss(), platform(-8.0)],
+            "rungs" => rungs(),
+            "rungs+platform" => { let mut v = rungs(); v.push(platform(-7.0)); v }
+            "rung2.6" => vec![part("S", Vec3::new(0.0, 2.8, -6.5), true).with_property("Size", Vector3::new(2.0, 0.4, 1.0))],
+            "table2to3" => slab(2.0, 3.0),
+            "shelf1to3" => slab(1.0, 3.0),
+            "shelf1.5to3.5" => slab(1.5, 3.5),
+            k => slab(0.0, k.strip_prefix("block").and_then(|h| h.parse().ok()).expect("lane")),
+        }
+    }
+
+    /// Walks a lane like play.rs at `fps`: per frame the state and root.
+    fn ledge_walk(kind: &str, r6: bool, fps: f32, seconds: f32) -> (HumShape, Vec<(crate::rig::State, Vec3)>) {
+        let (doc, mut p) = hum_world(ledge_lane(kind));
+        let sh = if r6 { hum_shape_r6() } else { hum_shape_r15() };
+        let rest = sh.hip + sh.root_size.y * 0.5;
+        let trace = ladder_run_dt(&doc, &mut p, &sh, Vec3::new(0.0, rest, 0.0), (seconds * fps) as usize, usize::MAX, 1.0 / fps);
+        (sh, trace)
+    }
+
+    /// "No ledge climbs": walking at 16 into a block on the floor, Studio
+    /// never enters Climbing (own hidden Studio, R6 and R15, blocks 2.5, 3,
+    /// 3.5, 4, 4.5, 5, 6 and 8 studs: Running the whole time, root at rest
+    /// height, torso against the face; the 2-stud block is stepped onto).
+    /// FindLadder (Studio) is why: a wall from the floor hits the first
+    /// sample (height/3 × 1/7 up), and a single run of hits only counts when
+    /// it starts above 2.45 × height/3 / 5 (0.49 for a 3-stud scan) or a
+    /// second run follows a gap. Only an edge with room under it climbs.
+    #[test]
+    fn walking_into_a_block_never_climbs_like_studio() {
+        use crate::rig::State;
+        for r6 in [true, false] {
+            for fps in [60.0, 144.0] {
+                for h in ["2.5", "3", "3.5", "4", "5", "6", "8"] {
+                    let (sh, trace) = ledge_walk(&format!("block{h}"), r6, fps, 2.5);
+                    let rest = sh.hip + sh.root_size.y * 0.5;
+                    assert!(trace.iter().all(|(s, _)| *s == State::Running), "r6 {r6} {fps} block {h}: {:?}",
+                        trace.iter().find(|t| t.0 != State::Running));
+                    let end = trace.last().unwrap().1;
+                    assert!((end.y - rest).abs() < 0.05, "r6 {r6} {fps} block {h}: root at {end:?}");
+                    assert!((end.z - (-6.0 + sh.box_hi.z)).abs() < 0.1, "r6 {r6} {fps} block {h}: stopped at {end:?}");
+                }
+                let (sh, trace) = ledge_walk("block2", r6, fps, 2.5);
+                let rest = sh.hip + sh.root_size.y * 0.5;
+                let top = trace.iter().map(|t| t.1.y).fold(f32::MIN, f32::max);
+                assert!((top - (rest + 2.0)).abs() < 0.05 && trace.iter().all(|(s, _)| *s != State::Climbing),
+                    "r6 {r6} {fps}: 2-stud step-up peaked at {top}");
+            }
+        }
+    }
+
+    /// The tops of a truss and a rung ladder, with and without a platform
+    /// behind them: Studio climbs over the lip and stands on the top (own
+    /// hidden Studio, ~110 fps, walking at 16). Climbing lasts R6 truss
+    /// 1.042 / 1.050 s, rungs 0.954 / 0.963 s; R15 truss 1.050 / 1.041 s,
+    /// rungs 0.970 / 0.971 s; Climbing → Running with (0, 11.2, 0) at root
+    /// 14.6–14.9 (truss) or 13.9–14.0 (rungs), then over the edge onto the
+    /// top (R6 root 15.0, R15 15.19, i.e. top 12 + rest height) within
+    /// 0.1–0.2 s, a brief Freefall → Landed on the way for most; it runs on
+    /// across the top and falls off the far side (the column) or along the
+    /// platform. Never back down the face, never hanging at the lip.
+    #[test]
+    fn ladder_tops_carry_over_like_studio() {
+        use crate::rig::State;
+        for (r6, kind, studio) in [(true, "truss", 1.042_f32), (true, "truss+platform", 1.050), (true, "rungs", 0.954),
+            (true, "rungs+platform", 0.963), (false, "truss", 1.050), (false, "truss+platform", 1.041),
+            (false, "rungs", 0.970), (false, "rungs+platform", 0.971)] {
+            for fps in [30.0_f32, 60.0, 144.0, 240.0] {
+                let (sh, trace) = ledge_walk(kind, r6, fps, 3.0);
+                let rest = sh.hip + sh.root_size.y * 0.5;
+                let grab = trace.iter().position(|t| t.0 == State::Climbing).expect("climbs");
+                let off = grab + trace[grab..].iter().position(|t| t.0 != State::Climbing).expect("lets go");
+                let held = (off - grab) as f32 / fps;
+                assert!((held - studio).abs() < 0.07, "r6 {r6} {kind} {fps}: climbed {held} s (Studio {studio})");
+                let release = trace[off - 1].1;
+                assert!(release.y > 12.0 + rest - 1.2, "r6 {r6} {kind} {fps}: let go low, at {release:?}");
+                // On top of it, past the face, a few frames later.
+                let on = (off..trace.len()).find(|&i| trace[i].1.y > 12.0 + rest - 0.1 && trace[i].1.z < -6.0)
+                    .unwrap_or_else(|| panic!("r6 {r6} {kind} {fps}: never on top after {release:?}"));
+                let late = (on - off) as f32 / fps;
+                assert!(late < 0.3, "r6 {r6} {kind} {fps}: {late} s from letting go to standing on top");
+                assert!(trace[off..on].iter().all(|t| t.1.y > release.y - 0.3),
+                    "r6 {r6} {kind} {fps}: fell back from the lip");
+                if kind.ends_with("platform") {
+                    // Running along it (Studio leaves its far side, z −18, ~0.9 s later).
+                    let later = trace[on + (0.5 * fps) as usize].1;
+                    assert!((later.y - (12.0 + rest)).abs() < 0.05 && later.z < -12.0, "r6 {r6} {kind} {fps}: at {later:?} 0.5 s on");
+                }
+            }
+        }
+    }
+
+    /// What does count as a ledge: an edge with room under it. Studio (own
+    /// hidden Studio, R6 and R15, walking at 16): a 1-stud table top at 2–3
+    /// and a single 0.4 bar at 2.6–3.0 are found, climbed and stepped onto
+    /// (Climbing ~0.12 / ~0.18 s, then Running across the top at root
+    /// 3 + 3, R15 3 + 3.19); a 2-stud shelf at 1–3 or 1.5–3.5 is found
+    /// but loses the pattern after ~0.2–0.8 studs of climbing (its single
+    /// run then starts under 0.49 of the scan), so Studio flickers Climbing
+    /// ↔ Running against its face for good and never gets on (R6 shelf 1–3:
+    /// 40+ switches in 2.6 s, peak root 3.58; R15 peak 3.67; 1.5–3.5: R6
+    /// 4.42, R15 4.14). At ~15 fps (a loaded machine) Studio's longer frames
+    /// climb further per frame and it does get on; that is frame-rate
+    /// dependent in Studio too.
+    #[test]
+    fn overhang_ledges_climb_like_studio() {
+        use crate::rig::State;
+        for r6 in [true, false] {
+            for fps in [60.0_f32, 144.0] {
+                for (kind, top) in [("table2to3", 3.0_f32), ("rung2.6", 3.0)] {
+                    let (sh, trace) = ledge_walk(kind, r6, fps, 2.0);
+                    let rest = sh.hip + sh.root_size.y * 0.5;
+                    let grab = trace.iter().position(|t| t.0 == State::Climbing).unwrap_or_else(|| panic!("r6 {r6} {kind} {fps}: no climb"));
+                    let on = (grab..trace.len()).find(|&i| trace[i].1.y > top + rest - 0.1 && trace[i].1.z < -6.0)
+                        .unwrap_or_else(|| panic!("r6 {r6} {kind} {fps}: never on top"));
+                    assert!(((on - grab) as f32 / fps) < 0.6, "r6 {r6} {kind} {fps}: took {} s", (on - grab) as f32 / fps);
+                    assert!(trace.last().unwrap().1.z < -12.0, "r6 {r6} {kind} {fps}: stopped at {:?}", trace.last().unwrap().1);
+                }
+                for (kind, top) in [("shelf1to3", 3.0_f32), ("shelf1.5to3.5", 3.5)] {
+                    let (sh, trace) = ledge_walk(kind, r6, fps, 3.0);
+                    let rest = sh.hip + sh.root_size.y * 0.5;
+                    let grabs = trace.windows(2).filter(|w| w[0].0 != State::Climbing && w[1].0 == State::Climbing).count();
+                    let peak = trace.iter().map(|t| t.1.y).fold(f32::MIN, f32::max);
+                    let end = trace.last().unwrap().1;
+                    assert!(grabs >= 5, "r6 {r6} {kind} {fps}: grabbed {grabs} times");
+                    assert!(peak < top + rest - 1.0 && end.z > -6.0, "r6 {r6} {kind} {fps}: got on (peak {peak}, end {end:?})");
+                }
+            }
+        }
+    }
+
+    /// The top of a rung ladder (rungs 0.4 every stud, top rung 11.6–12):
+    /// FindLadder keeps it while the top rung alone starts more than 0.49
+    /// up the scan, i.e. up to root 13.871 (R6). Studio's first Running
+    /// frame there was at root 13.942 (column) and 13.992 (platform): one
+    /// frame of climbing (≤ 11.2 / 60) past the last root that still found it.
+    #[test]
+    fn rung_ladder_top_release_matches_studio() {
+        let (doc, p) = hum_world(ledge_lane("rungs"));
+        let own = HashSet::new();
+        let found = |y: f32| p.ladder_ahead_scaled(&doc, Vec3::new(0.0, y, -5.48), -Vec3::Z, 3.0, mech::CLIMB_REACH, &own);
+        let last = (0..200).map(|k| 13.0 + k as f32 * 0.005).take_while(|y| found(*y)).last().expect("found below the top");
+        for studio in [13.942_f32, 13.992] {
+            assert!(last < studio && studio - last < 11.2 / 60.0 + 0.01, "kept up to {last}, Studio let go at {studio}");
+        }
+    }
+
+    fn ladder_lane(kind: &str) -> (Vec<InstanceBuilder>, f32) {
+        match kind {
+            // The probe place's lanes (own hidden Studio, climb-r6/r15.rbxlx).
+            "truss" => (vec![truss_box(Vec3::new(0.0, 20.0, -10.0), Vec3::new(2.0, 40.0, 2.0), 0.0)], -9.0),
+            "rungs" => ((0..20).map(|k| part("Rung", Vec3::new(0.0, 1.5 + 2.0 * k as f32, -10.0), true)
+                .with_property("Size", Vector3::new(4.0, 1.0, 1.0))).collect(), -9.5),
+            _ => ((0..8).map(|k| part("Tall", Vec3::new(0.0, 3.0 + 5.0 * k as f32, -10.0), true)
+                .with_property("Size", Vector3::new(4.0, 4.0, 1.0))).collect(), -9.5),
+        }
+    }
+
+    /// Bug: holding Jump on a ladder jumped off and then never grabbed it
+    /// again (play.rs only climbed with Jump up). Studio, own hidden Studio,
+    /// R6 WalkSpeed 16 walking into a 2×40×2 truss with Jump held from
+    /// 2.5 s: Climbing → Jumping → Freefall → Climbing again at 3.034,
+    /// 3.500, 4.090, 4.590, 5.062 s (every ~0.5 s); rungs the same.
+    #[test]
+    fn climbing_held_jump_regrabs_like_studio() {
+        use crate::rig::State;
+        for kind in ["truss", "rungs"] {
+            let (parts, face) = ladder_lane(kind);
+            let (doc, mut p) = hum_world(parts);
+            let sh = hum_shape_r6();
+            let trace = ladder_run(&doc, &mut p, &sh, Vec3::new(0.0, 3.0, face + 4.0), 360, 150);
+            assert_eq!(trace[149].0, State::Climbing, "{kind}: climbing before Jump");
+            let grabs = trace.windows(2).skip(150)
+                .filter(|w| w[0].0 != State::Climbing && w[1].0 == State::Climbing).count();
+            let offs = trace.windows(2).skip(150)
+                .filter(|w| w[0].0 == State::Climbing && w[1].0 == State::Jumping).count();
+            eprintln!("{kind}: held Jump: {grabs} re-grabs, {offs} jumps off in 3.5 s (Studio 5)");
+            assert!(grabs >= 3, "{kind}: only {grabs} re-grabs with Jump held");
+            assert!(offs >= 4, "{kind}: only {offs} jumps off with Jump held");
+        }
+    }
+
+    /// Bug: the climber hung 1–2 studs off the ladder (climb_step moved
+    /// the old 1-stud capsule, which held the root a stud out and rode out
+    /// over each rung). Studio, own hidden Studio, walking in at 16, root
+    /// distance from the face while climbing, constant over the climb: R6
+    /// truss 0.770, rungs 0.519; R15 truss 1.435, rungs 1.035. Nothing pulls
+    /// the body in: it stops where the walk-in runs out after the sensor
+    /// (Running checks every third update, so anywhere from the torso
+    /// against the ladder up to the ray's reach × 1.5 less the ~0.15 the
+    /// controller still carries it) — the R6 rungs run was the torso
+    /// flush (0.519 = half its depth). So: walked in, the root holds one
+    /// distance inside that range; put flush, it stays flush.
+    #[test]
+    fn climbing_hugs_ladder_like_studio() {
+        use crate::rig::State;
+        for (r6, kind, studio) in [(true, "truss", 0.770_f32), (true, "rungs", 0.519),
+            (false, "truss", 1.435), (false, "rungs", 1.035)] {
+            let (parts, face) = ladder_lane(kind);
+            let (doc, mut p) = hum_world(parts);
+            let sh = if r6 { hum_shape_r6() } else { hum_shape_r15() };
+            let y = sh.hip + sh.root_size.y * 0.5;
+            let reach = 1.5 * if r6 { mech::CLIMB_REACH } else { mech::CLIMB_REACH_R15 };
+            let flush = sh.box_hi.z;
+            let trace = ladder_run(&doc, &mut p, &sh, Vec3::new(0.0, y, face + 4.0), 150, usize::MAX);
+            let climb: Vec<f32> = trace.iter().filter(|(s, _)| *s == State::Climbing).map(|(_, r)| r.z - face).collect();
+            assert!(climb.len() > 100, "r6 {r6} {kind}: climbed {} frames", climb.len());
+            let rose = trace.last().unwrap().1.y - y;
+            let (lo, hi) = climb[5..].iter().fold((f32::MAX, f32::MIN), |(a, b), d| (a.min(*d), b.max(*d)));
+            eprintln!("r6 {r6} {kind}: walked in {lo:.3}..{hi:.3} from the face (Studio {studio}), rose {rose:.1}");
+            assert!(rose > 15.0, "r6 {r6} {kind}: rose only {rose}");
+            assert!(hi - lo < 0.02, "r6 {r6} {kind}: drifted {lo}..{hi}");
+            assert!(lo > flush - 0.02 && hi < reach - 0.1, "r6 {r6} {kind}: {lo}..{hi} from the face, outside {flush}..{}", reach - 0.1);
+            // Flush against it (the R6 rungs case): stays flush all the way up.
+            let (doc, mut p) = hum_world(ladder_lane(kind).0);
+            let own = HashSet::new();
+            let mut c = CharBody { pos: Vec3::new(0.0, y + 0.5, face + flush + 0.02), ..Default::default() };
+            let n = p.ladder_normal_scaled(&doc, c.pos, -Vec3::Z, y, reach / 1.5, &own).expect("sensor");
+            for _ in 0..90 {
+                p.climb_step(&mut c, &sh, 0.0, -Vec3::Z * 16.0, -Vec3::Z, n, 1.0 / 60.0, &own);
+                let d = c.pos.z - face;
+                assert!((d - flush).abs() < 0.05, "r6 {r6} {kind}: flush climb {d} from the face at {:?}", c.pos);
+            }
+            if r6 && kind == "rungs" {
+                assert!((c.pos.z - face - studio).abs() < 0.03, "{} vs Studio {studio}", c.pos.z - face);
+            }
+            assert!(c.pos.y > y + 15.0, "r6 {r6} {kind}: flush climb rose to {:?}", c.pos);
+        }
+    }
+
+    /// The same for a ladder of 4-stud parts with 1-stud gaps (Studio only
+    /// grabs it at a gap, from the air): put on it at a gap, the R6 body
+    /// stays within Studio's 0.49–0.68 of the face, never a stud out.
+    #[test]
+    fn climbing_tall_part_ladder_stays_close() {
+        let (parts, face) = ladder_lane("tall");
+        let (doc, mut p) = hum_world(parts);
+        let sh = hum_shape_r6();
+        let own = HashSet::new();
+        let mut c = CharBody { pos: Vec3::new(0.0, 6.5, face + 0.52), ..Default::default() };
+        let n = p.ladder_normal_scaled(&doc, c.pos, -Vec3::Z, 3.0, mech::CLIMB_REACH, &own).expect("grabs at a gap");
+        for _ in 0..60 {
+            p.climb_step(&mut c, &sh, 0.0, -Vec3::Z * 16.0, -Vec3::Z, n, 1.0 / 60.0, &own);
+            let d = c.pos.z - face;
+            assert!((0.45..0.7).contains(&d), "{d} from the face at {:?}", c.pos);
+        }
+        assert!(c.pos.y > 15.0, "{:?}", c.pos);
+    }
+
+    #[test]
+    fn ladder_top_releases_when_lowest_sample_clears() {
+        let (doc, p) = hum_world(vec![sensor_truss(10.0)]);
+        let own = HashSet::new();
+        assert!(p.ladder_ahead_scaled(&doc, Vec3::Y * 12.55, -Vec3::Z, 3.0, 0.7, &own));
+        assert!(!p.ladder_ahead_scaled(&doc, Vec3::Y * 13.0, -Vec3::Z, 3.0, 0.7, &own));
+    }
+
+    #[test]
+    fn humanoid_ladder_jump_impulse() {
+        let (doc, mut p) = hum_world(vec![]);
+        let mut c = CharBody { pos: Vec3::Y * 20.0, vel: Vec3::Y * 11.2,
+            free_jump: true, climb_jump: Some((Vec3::Y + Vec3::Z).normalize()), ..Default::default() };
+        let mut yaw = 0.0;
+        let m = p.move_humanoid(&doc, &mut c, &mut yaw, &hum_shape_r15(), -Vec3::Z * 16.0,
+            Some(53.0), true, 1.0 / 240.0, &HashSet::new());
+        assert!(m.jumped);
+        let impulse = (53.0 - 11.2 * mech::CLIMB_JUMP_COMPONENT) * mech::CLIMB_JUMP_COMPONENT;
+        assert!((c.vel.z - impulse).abs() < 0.7, "{:?}", c.vel);
+        assert!((c.vel.y - (11.2 + impulse)).abs() < 1.0, "{:?}", c.vel);
+        assert_eq!(yaw, 0.0);
+    }
+
     fn hum_shape_r15() -> HumShape {
         HumShape {
             hip: 2.19,
@@ -3593,6 +4335,11 @@ mod tests {
     fn hum_world(extra: Vec<InstanceBuilder>) -> (Document, Physics) {
         let mut doc = Document::new_place();
         let ws = doc.workspace().unwrap();
+        // The fixture promises one floor at Y=0; the default spawn's box
+        // otherwise occludes both floor and low ladder rays at the origin.
+        if let Some(spawn) = doc.find_named(ws, "SpawnLocation") {
+            doc.dom.destroy(spawn);
+        }
         if let Some(bp) = doc.find_named(ws, "Baseplate") {
             doc.dom.destroy(bp);
         }
@@ -3667,6 +4414,43 @@ mod tests {
         }
         assert!(on_ramp > 20, "crossed the ramp ({on_ramp} frames)");
         assert!(c.pos.y > 8.0 + 3.0, "up on top: {:?}", c.pos);
+    }
+
+    /// Holding Space while falling: the next jump takes off on landing, not
+    /// as soon as the floor rays (which reach 1–2 studs below the feet)
+    /// find the floor.
+    #[test]
+    fn humanoid_held_jump_waits_for_landing() {
+        let (doc, mut p) = hum_world(vec![]);
+        let mut c = CharBody { pos: Vec3::new(60.0, 12.0, 60.0), air_time: f32::MAX, ..Default::default() };
+        let mut yaw = 0.0;
+        let sh = hum_shape_r15();
+        let mut took_off = None;
+        for _ in 0..120 {
+            let y = c.pos.y;
+            let m = p.move_humanoid(&doc, &mut c, &mut yaw, &sh, Vec3::ZERO, Some(50.0), true, 1.0 / 60.0, &HashSet::new());
+            if m.jumped {
+                took_off = Some(y);
+                break;
+            }
+        }
+        let y = took_off.expect("jumped on landing");
+        assert!(y < 3.19 + 0.5, "jumped {:.2} studs above rest", y - 3.19);
+    }
+
+    /// Jumping off a truss mid-climb (free_jump): it takes off with no
+    /// floor under it.
+    #[test]
+    fn humanoid_free_jump_leaves_midair() {
+        let (doc, mut p) = hum_world(vec![]);
+        let mut c = CharBody { pos: Vec3::new(60.0, 20.0, 60.0), vel: Vec3::new(0.0, 11.0, 0.0), air_time: f32::MAX, ..Default::default() };
+        let mut yaw = 0.0;
+        let sh = hum_shape_r15();
+        let none = p.move_humanoid(&doc, &mut c, &mut yaw, &sh, Vec3::ZERO, Some(50.0), true, 1.0 / 60.0, &HashSet::new());
+        assert!(!none.jumped, "no jump mid-air without it");
+        c.free_jump = true;
+        let m = p.move_humanoid(&doc, &mut c, &mut yaw, &sh, Vec3::ZERO, Some(50.0), true, 1.0 / 60.0, &HashSet::new());
+        assert!(m.jumped && c.vel.y > 40.0 && !c.free_jump, "{m:?} {:?}", c.vel);
     }
 
     /// Jumping into a wall while holding forward: the body slides down it

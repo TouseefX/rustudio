@@ -1647,7 +1647,9 @@ impl Editor {
             return false;
         };
         let ctx = ui.ctx().clone();
-        let pointer = resp.hover_pos().map(|p| {
+        // (LockCenter: the game's mouse is the middle of the view, wherever
+        // the held system cursor is.)
+        let mut pointer = crate::mouse_lock::game_pointer(self.lock_center_held(), rect, resp.hover_pos()).map(|p| {
             let ray = self.cam.ray(rect, p);
             let hit = self.pick_any(&ray).map(|(r, t)| (r, ray.at(t)));
             Pointer {
@@ -1659,6 +1661,21 @@ impl Editor {
                 side,
             }
         });
+        // Terrain under the mouse (Mouse.Hit / Mouse.Target), through the
+        // shown side's query cache: the same surface Raycast meets.
+        if let Some(p) = pointer.as_mut() {
+            let (o, d) = (p.origin, p.dir);
+            let terrain = self
+                .with_side(side, |rt, _, _| {
+                    crate::runtime::ext::mouse_terrain_hit(&rt.lua, o, d, crate::mech::MOUSE_RAY_LENGTH)
+                })
+                .flatten();
+            if let Some((r, t)) = terrain {
+                if p.hit.is_none_or(|(_, at)| (at - o).length() > t) {
+                    p.hit = Some((r, o + d * t));
+                }
+            }
+        }
         let mut clicks = Vec::new();
         // A click the GUI took doesn't reach the world (ClickDetectors, Mouse, tools).
         if let Some((r, _)) = pointer.and_then(|p| p.hit).filter(|_| !gui_took) {

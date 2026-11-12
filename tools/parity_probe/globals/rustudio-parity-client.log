@@ -85,7 +85,7 @@ Info: [Client] GLOBALS|client|inventory.visible.os|table | table | table: 0x7856
 Info: [Client] GLOBALS|client|inventory.visible.pairs|true | function | function | [C] | -1 | pairs | 0 | true | function: 0x62dcb24361fea502  —  Players.Owner1.PlayerScripts.GlobalsProbe1:4
 Info: [Client] GLOBALS|client|inventory.visible.pcall|true | function | function | [C] | -1 | pcall | 0 | true | function: 0xa53b11be22cca1de  —  Players.Owner1.PlayerScripts.GlobalsProbe1:4
 Info: [Client] GLOBALS|client|inventory.visible.print|true | function | function | [C] | -1 | print | 0 | true | function: 0x2f58fd3a2c97bf52  —  Players.Owner1.PlayerScripts.GlobalsProbe1:4
-Info: [Client] GLOBALS|client|inventory.visible.printidentity|true | function | function | [C] | -1 | printidentity | 0 | true | function: 0x142fef4828db2a48  —  Players.Owner1.PlayerScripts.GlobalsProbe1:4
+Info: [Client] GLOBALS|client|inventory.visible.printidentity|true | function | function | [C] | -1 | printidentity | 0 | true | function: Studio  —  Players.Owner1.PlayerScripts.GlobalsProbe1:4
 Info: [Client] GLOBALS|client|inventory.visible.rawequal|true | function | function | [C] | -1 | rawequal | 0 | true | function: 0x1e3f4514c843a78b  —  Players.Owner1.PlayerScripts.GlobalsProbe1:4
 Info: [Client] GLOBALS|client|inventory.visible.rawget|true | function | function | [C] | -1 | rawget | 0 | true | function: 0x61c63f14c8066270  —  Players.Owner1.PlayerScripts.GlobalsProbe1:4
 Info: [Client] GLOBALS|client|inventory.visible.rawlen|true | function | function | [C] | -1 | rawlen | 0 | true | function: 0x38ef9a5d44c00f90  —  Players.Owner1.PlayerScripts.GlobalsProbe1:4
@@ -452,7 +452,7 @@ Info: [Client] GLOBALS|client|inventory.visible.os|table | table | table: 0x7856
 Info: [Client] GLOBALS|client|inventory.visible.pairs|true | function | function | [C] | -1 | pairs | 0 | true | function: 0x62dcb24361fea502  —  Players.Owner1.PlayerScripts.GlobalsProbe2:4
 Info: [Client] GLOBALS|client|inventory.visible.pcall|true | function | function | [C] | -1 | pcall | 0 | true | function: 0xa53b11be22cca1de  —  Players.Owner1.PlayerScripts.GlobalsProbe2:4
 Info: [Client] GLOBALS|client|inventory.visible.print|true | function | function | [C] | -1 | print | 0 | true | function: 0x2f58fd3a2c97bf52  —  Players.Owner1.PlayerScripts.GlobalsProbe2:4
-Info: [Client] GLOBALS|client|inventory.visible.printidentity|true | function | function | [C] | -1 | printidentity | 0 | true | function: 0x142fef4828db2a48  —  Players.Owner1.PlayerScripts.GlobalsProbe2:4
+Info: [Client] GLOBALS|client|inventory.visible.printidentity|true | function | function | [C] | -1 | printidentity | 0 | true | function: Studio  —  Players.Owner1.PlayerScripts.GlobalsProbe2:4
 Info: [Client] GLOBALS|client|inventory.visible.rawequal|true | function | function | [C] | -1 | rawequal | 0 | true | function: 0x1e3f4514c843a78b  —  Players.Owner1.PlayerScripts.GlobalsProbe2:4
 Info: [Client] GLOBALS|client|inventory.visible.rawget|true | function | function | [C] | -1 | rawget | 0 | true | function: 0x61c63f14c8066270  —  Players.Owner1.PlayerScripts.GlobalsProbe2:4
 Info: [Client] GLOBALS|client|inventory.visible.rawlen|true | function | function | [C] | -1 | rawlen | 0 | true | function: 0x38ef9a5d44c00f90  —  Players.Owner1.PlayerScripts.GlobalsProbe2:4

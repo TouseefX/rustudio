@@ -28,8 +28,9 @@ pub const CORE_GUI_ALL: u32 = 4; // Enum.CoreGuiType.All: StarterGui::setCoreGui
 pub const CORE_GUI_TYPE_COUNT: u32 = 10; // setCoreGuiEnabled loops types 0..9
 pub const PLACE_A_GATE_MIN_MOVE: f32 = 2.0; // self-test Place A match: studs the character must cover while the harness holds W (it walked 13 in 3 s; a downed player crawls)
 pub const MOON_PHASE: f32 = 0.75; // Lighting:GetMoonPhase: Roblox's moon has no cycle; the phase is a constant (estimated)
-pub const SHAPECAST_MAX_SIZE: f32 = 512.0; // FInt ShapecastMaxSize: sphere diameter, block / part side length
-pub const SHAPECAST_MAX_DISTANCE: f32 = 1024.0; // FInt ShapecastMaxDistance: the cast direction's length
+pub const SHAPECAST_MAX_SIZE: f32 = 512.0; // FInt ShapecastMaxSize (registered Studio, value at .data Studio): sphere diameter (radius + radius, compared at Studio), block / part side length
+pub const SHAPECAST_MAX_DISTANCE: f32 = 1024.0; // FInt ShapecastMaxDistance (registered Studio, value at .data Studio): the cast direction's length (Studio)
+pub const MOUSE_RAY_LENGTH: f32 = 10000.0; // studs: how far Mouse.Hit / Mouse.Target look for terrain in Play
 pub const DEFAULT_GLOW_INTENSITY: f32 = 1.0; // Studio glows over-bright pixels (Neon) without a BloomEffect; BloomEffect's own defaults (Intensity 1, Size 24, Threshold 2) are the starting point, checked against the control shots (estimated)
 pub const DEFAULT_GLOW_SIZE_PX: f32 = 24.0; // (BloomEffect.Size default)
 pub const DEFAULT_GLOW_THRESHOLD: f32 = 2.0; // (BloomEffect.Threshold default)
@@ -197,6 +198,7 @@ pub const LIGHTGRID_NORMAL_OFFSET: f32 = 6.0; // studs out along the normal the 
 pub const LIGHTGRID_BORDER: f32 = 0.4921875; // the shaders take the grid only within this share of its size from its centre, per axis, and open sky beyond (CB0 LightConfig3, read from memory: 0.5 − 1/128)
 pub const LIGHTGRID_MOVES_REFRESH_S: f32 = 1.5; // ...and after parts only moved (characters, enemies) at most this often
 pub const LIGHTGRID_REFRESH_S: f32 = 0.25; // rebuild after a part or terrain edit at most this often (Studio updates the touched chunks over a few frames)
+pub const LIGHTGRID_LOCAL_PATCH_MAX: usize = 400_000; // voxels the lights that changed in a frame may reach for an in-frame re-light of just their boxes (a Range-12 muzzle flash reaches ~1.3k; past this the whole local channel is re-lit on a worker)
 // Local lights blocked by parts (round 26, lightocc.rs; corpus lightwall-soft
 // / lightwall-real, docs/MECHANICS.md "Round 26"). Studio: Shadows on blocks them
 // (Future: shadow maps, hard; Soft: its 4-stud lighting voxels, which a
@@ -328,15 +330,63 @@ pub const SEAT_WELD_MIN_ROOT_HEIGHT: f32 = 0.05; // R6 SeatWeld C1.Y = -(max(roo
 pub const PROJECT_DEBOUNCE_MS: u64 = 150; // a project folder's disk changes are applied once the folder has been quiet this long (well inside the 1 s promise)
 pub const GAMEPAD_SCAN_S: f32 = 1.0; // how often Play looks for plugged / unplugged gamepads (rustudio's own polling)
 pub const SEAT_COOLDOWN_S: f32 = 1.0; // after leaving a seat the humanoid doesn't sit again for this long (estimated; Roblox debounces re-sitting)
-pub const CLIMB_SPEED_FACTOR: f32 = 0.7; // Climbing update: vertical speed = |move velocity| × 0.7, no sideways velocity
-pub const CLIMB_MIN_INPUT: f32 = 0.1; // a move speed under 0.1 climbs at CLIMB_CREEP instead
-pub const CLIMB_CREEP: f32 = 0.01;
-pub const CLIMB_DOWN_DOT: f32 = -0.2; // a move direction whose dot with the root's flat look is under -0.2 climbs down
-pub const CLIMB_REACH: f32 = 0.9; // a TrussPart this far past the capsule's side, in the walking direction, is climbed (estimated)
-pub const SWIM_FORCE_MAX: f32 = 10000.0; // Swimming: the swim force's per-axis limit, × the Humanoid's scale³
-pub const SWIM_FORCE_UP_MAX: f32 = 1000.0; // the same, upward
-pub const SWIM_GAIN: f32 = 35.0; // Swimming: force = 35 × mass × (desired − current velocity): the velocity closes on the move vector at 35 /s
-pub const SWIM_FLAT_RATIO: f32 = 2.0; // a move whose horizontal part exceeds 2 × its vertical swims flat at the full speed
+/// The climb target along a tilted ladder: the vertical climb speed turned
+/// into the plane of the sensor's hit normal, its speed kept. Not Studio
+/// code: Studio leaves the target vertical (its Studio /
+/// Studio only bend it along the *floor* normal) and contact with the
+/// truss bends the path. Fitted to own hidden Studio pid 6184, R6, 1 s
+/// averages: 10° (0,10.7205,1.8894), 20° (0,10.4890,3.8164); the
+/// direction matches to 0.05°, the speed to 0.33 studs/s.
+pub fn climb_velocity(normal: glam::Vec3, speed: f32) -> glam::Vec3 {
+    let tangent = glam::Vec3::Y - normal * normal.y;
+    tangent.normalize_or_zero() * speed
+}
+
+/// Studio steps the Humanoid controller at 240 Hz; a frame covers this
+/// many steps (at least one).
+pub fn humanoid_steps(dt: f32) -> u32 {
+    ((dt * HUMANOID_STEP_HZ).round() as u32).max(1)
+}
+pub const HUMANOID_STEP_HZ: f32 = 240.0;
+/// Climbing's velocity controller, per 1/240 s step: the vertical speed
+/// closes CLIMB_GAIN_PER_STEP of its gap, the horizontal the same but at
+/// most CLIMB_HORIZONTAL_STEP_MAX. Own hidden Studio pid 6184 (R6,
+/// WalkSpeed 16): re-grab from −0.8175 read 6.6934 after one step, then
+/// 10.5663, 11.1109 (gap × 0.375 per step); walking off at the foot of a
+/// truss vertical −11.2 → −4.2000 → −0.5906 → −0.0831 and horizontal
+/// 0 → 3.0902 → 9.2705 → 14.6352 (3.0902 per step, then 0.625 × the gap).
+pub fn climb_controller(v: glam::Vec3, target: glam::Vec3, steps: u32) -> glam::Vec3 {
+    let mut v = v;
+    for _ in 0..steps {
+        v.y += (target.y - v.y) * CLIMB_GAIN_PER_STEP;
+        let flat = glam::Vec3::new(target.x - v.x, 0.0, target.z - v.z) * CLIMB_GAIN_PER_STEP;
+        v += flat.clamp_length_max(CLIMB_HORIZONTAL_STEP_MAX);
+    }
+    v
+}
+pub const CLIMB_GAIN_PER_STEP: f32 = 0.625;
+pub const CLIMB_HORIZONTAL_STEP_MAX: f32 = 3.0902;
+pub const CLIMB_SPEED_FACTOR: f32 = 0.7; // Climbing update Studio: vertical speed = |move velocity| × 0.7 (.rdata Studio), no sideways velocity
+pub const CLIMB_MIN_INPUT: f32 = 0.1; // Studio: a move speed under 0.1 (.rdata Studio) climbs at CLIMB_CREEP instead
+pub const CLIMB_CREEP: f32 = 0.01; // Studio: .rdata Studio
+pub const CLIMB_DOWN_DOT: f32 = -0.2; // Studio: a move direction whose dot with the root's flat look is under -0.2 (.rdata Studio) climbs down (sign -1, Studio)
+pub const CLIMB_REACH: f32 = 0.7; // FindLadder caller Studio, .rdata Studio (R6; scaled by head size); measured truss face 1.0 accepted, 1.1 rejected. Query length is twice this.
+pub const CLIMB_REACH_R15: f32 = 1.2; // Studio rig branch, float Studio; both rigs multiply by Head.Size.Y ().
+pub const CLIMB_QUERY_TOP: f32 = 1.0; // Studio: the broad query box ends 1 stud above the root (.rdata Studio); measured own Studio pid 6184 (truss bottom +0.9 climbs, +1.1 does not)
+pub const CLIMB_QUERY_DEPTH_FACTOR: f32 = 0.75; // Studio broad query half depth, .rdata Studio
+#[cfg(test)]
+pub const CLIMB_SCAN_HEIGHT: f32 = 3.0; // default R6: half root Y + max leg Y + HipHeight; setter Studio. Production uses HumShape hip + half root Y.
+pub const CLIMB_SCAN_DIVISOR: f32 = 3.0; // Studio, .rdata Studio
+pub const CLIMB_SCAN_EXTRA_SAMPLES: usize = 10; // Studio: floor((height - 0.3)/step) + 10 loop bound; float Studio.
+pub const CLIMB_SCAN_STEP_FACTOR: f32 = 1.0 / 7.0; // Studio, .rdata Studio
+pub const CLIMB_BOTTOM_MARGIN: f32 = 0.3; // Studio, .rdata Studio
+pub const CLIMB_GAP_FACTOR: f32 = 2.45; // Studio, .rdata Studio
+pub const CLIMB_SINGLE_RUNG_DIVISOR: f32 = 5.0; // .rdata Studio
+pub const CLIMB_JUMP_COMPONENT: f32 = std::f32::consts::FRAC_1_SQRT_2; // Studio: normalize(up - normalized flat look)
+pub const SWIM_FORCE_MAX: f32 = 10000.0; // Swimming Studio: the swim force's per-axis limit (X, Z both ways, Y down; .data Studio 10000 / 0 / 10000, Studio −10000 ×3), × the Humanoid's scale³ ()
+pub const SWIM_FORCE_UP_MAX: f32 = 1000.0; // the same, upward (.data Studio = 1000)
+pub const SWIM_GAIN: f32 = 35.0; // Swimming Studio: force = 35 (.rdata Studio) × mass × (desired − current velocity): the velocity closes on the move vector at 35 /s
+pub const SWIM_FLAT_RATIO: f32 = 2.0; // Studio: a move whose horizontal part exceeds 2 × its vertical (.rdata Studio) swims flat at the full speed
 pub const SWIM_FLOAT_SPEED: f32 = 1.63; // studs/s up while submerged, R15: the humanoid floats to the surface (Studio: 1.63 while swimming forward, round 22 movement_probe water)
 pub const SWIM_FLOAT_SPEED_R6: f32 = 0.446; // the same for R6 (Studio: 0.446 every frame of the water lane's 3 s swim, round 23 movement_probe water; a buoyancy model with R15's fit predicts ~2, so this is measured per rig)
 pub const SWIM_SURFACE_GAP: f32 = 0.19; // the float fades to 0 at the water's surface − this (root centre, studs) …
@@ -425,6 +475,24 @@ pub const PERF_PLACE: &str = "/tmp/rustudio-place-a/place-a-latest.rbxl"; // mai
 pub const PERF_PLACE_FALLBACK: &str = "/home/user/games/place-b/og.rbxl"; // secondary test place (opened read-only)
 pub const PERF_MIN_FPS: f32 = 60.0; // perf check target in Play (person's request)
 pub const SNAP_ON_BY_DEFAULT: bool = false; // Studio opens with move and rotate snapping unticked
+/// Model tab Collisions / Join Surfaces as a fresh Studio has them (the
+/// offline Studio: toggleCollisionCheckAction and toggleJointCreationAction
+/// unticked; a drag onto the baseplate made no Weld until Join was ticked).
+pub const COLLISIONS_ON_BY_DEFAULT: bool = false;
+pub const JOIN_SURFACES_ON_BY_DEFAULT: bool = false;
+/// Collisions: a handle move that would overlap another part by more than
+/// this is pulled back (PartMover.isIntersectingOthers, ArePartsTouchingOthers).
+pub const COLLISION_OVERLAP: f32 = 0.001;
+/// Collisions: bisection steps and stop distance between the last good and
+/// the wanted transform (_safelyTransformParts: 32, 0.0005).
+pub const COLLISION_STEPS: usize = 32;
+pub const COLLISION_EPS: f32 = 0.0005;
+/// Selection and hover outlines in the 3D view (Selection.RenderMode
+/// Outlines): band widths in pixels. Hover: DraggerService.HoverThickness
+/// (4); selection: measured from Studio screenshots (about 3 px of Select
+/// Color 0.1, 0.6, 1 around the silhouette, 2-3 px).
+pub const HOVER_OUTLINE_PX: f32 = 4.0;
+pub const SELECTION_OUTLINE_PX: f32 = 2.5;
 pub const TEXT_WIDTH_PER_SIZE: f32 = 0.5; // TextBounds before the text is first drawn: width per character, as a fraction of TextSize (estimated)
 
 // ParticleEmitters, Beams and Trails (effects.rs, round 25). The shapes of
@@ -847,4 +915,5 @@ pub const GC_STEP_MAX_KB: usize = 16 * 1024; // most Luau GC work per collector 
 pub const GC_FRAME_MAX_KB: f64 = 200.0; // most Luau GC work in one frame: Studio's FInt LuaGcMaxKb (200; its per-frame LuauGc job clamps to it)
 pub const GC_IDLE_CYCLE_S: f64 = 8.0; // seconds a background Luau GC cycle is spread over while no new unparented instance shows up (only ones scripts still hold)
 pub const GC_BUSY_ORPHANS: usize = 64; // unparented instances arriving (or freed) between two collector passes from which the Luau GC is stepped at the fast rate
-pub const HUMANOID_COYOTE_S: f32 = 0.1; // a jump still takes off this long after walking off a ledge (Studio via an offline Studio, 2026-11-09: always within 0.04 s, sometimes to 0.10 s, never from 0.11 s, at WalkSpeed 16 and 8; Running turns Freefall ~0.11 s after the floor goes)
+pub const HUMANOID_LAND_GAP: f32 = 0.25; // a falling Humanoid can jump again once its root is within this of floor + HipHeight + half the root (the floor rays reach 1–2 studs further; holding Space re-jumped that far up)
+pub const HUMANOID_COYOTE_S: f32 = 0.1; // a jump still takes off this long after walking off a ledge (offline Studio, 2026-11-09: always within 0.04 s, sometimes to 0.10 s, never from 0.11 s, at WalkSpeed 16 and 8; Running turns Freefall ~0.11 s after the floor goes)

@@ -529,6 +529,14 @@ impl Voxels {
         self.chunks.contains_key(&chunk_key(v))
     }
 
+    /// Whether chunk `key` or any chunk beside it (the ones its surface is
+    /// made from) is stored: if not, the chunk has no surface at all.
+    pub fn chunk_near(&self, key: [i32; 3]) -> bool {
+        (-1..=1).any(|dx| {
+            (-1..=1).any(|dy| (-1..=1).any(|dz| self.chunks.contains_key(&[key[0] + dx, key[1] + dy, key[2] + dz])))
+        })
+    }
+
     /// The lowest and highest voxel row any stored chunk covers (cheap: from
     /// the chunk keys, so it can be a little wider than the voxels).
     pub fn y_range(&self) -> Option<(i32, i32)> {
@@ -959,24 +967,26 @@ impl Grid {
         let nrm = gradient_normal(&d, fp)
             .or_else(|| gradient_normal(&d, [0.5; 3]))
             .unwrap_or([0.0, 1.0, 0.0]);
-        // The material's shape (Studio's terrain table): cubify puts the
-        // vertex on the voxel grid's corner (box edges), quantize snaps it,
-        // shift jitters it by a fixed random amount.
+        // The material's shape (Studio's deform Studio, one mode per
+        // material): cubify pulls the vertex to the cell centre, quantize
+        // snaps it (half away from zero), shift moves it by ±shift with
+        // bytes 0 / 1 / 2 of the cell's hash (whose low byte is also the
+        // texture random); then clamped to the cell.
         let gc = [0, 1, 2].map(|k| (key[k] << CHUNK_SHIFT) + c[k] as i32 - 1);
         if field == 0 {
             let shape = shape_of(self.cell_material(c));
             if shape.cubify {
                 fp = [0.5; 3];
-            }
-            if shape.quantize > 0.0 {
+            } else if shape.quantize > 0.0 {
                 fp = fp.map(|f| ((f - 0.5) / shape.quantize).round() * shape.quantize + 0.5);
-            }
-            if shape.shift > 0.0 {
-                let r = [cell_rand(gc), cell_rand([gc[1], gc[2], gc[0]]), cell_rand([gc[2], gc[0], gc[1]])];
-                for k in 0..3 {
-                    fp[k] = (fp[k] + (r[k] as f32 / 255.0 - 0.5) * shape.shift).clamp(0.0, 1.0);
+            } else if shape.shift > 0.0 {
+                let h = studio_cell_hash(gc);
+                for (k, f) in fp.iter_mut().enumerate() {
+                    let b = ((h >> (8 * k)) & 0xff) as f32;
+                    *f += (2.0 * b / 255.0 - 1.0) * shape.shift;
                 }
             }
+            fp = fp.map(|f| f.clamp(0.0, 1.0));
         }
         let mut pos = [0f32; 3];
         for k in 0..3 {
@@ -995,6 +1005,9 @@ pub struct Shape {
     pub quantize: f32,
     pub cubify: bool,
     pub faceted: bool,
+    /// Studio's "hardsoft": faceted, but a corner picks its projection axis
+    /// from its vertex normal while that is within 0.75 of the face's.
+    pub hardsoft: bool,
 }
 
 static SHAPE_2022: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
@@ -1003,6 +1016,11 @@ static SHAPE_2022: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool
 /// (MaterialService.Use2022Materials of the place being meshed).
 pub fn set_use2022(on: bool) {
     SHAPE_2022.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// The table set_use2022 last picked.
+pub fn use2022() -> bool {
+    SHAPE_2022.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 fn shape_of(m: u8) -> Shape {
@@ -1135,9 +1153,15 @@ impl State {
                         } else {
                             [ids[0], ids[3], ids[2], ids[1]]
                         };
+                        // Studio's diagonal (as chunk_triangles): q1–q3 when
+                        // q1 and q3 share a cell material q0 or q2 also has.
+                        let flip = field == 1 || {
+                            let cm = [c00, c10, c11, c01].map(|c| g.cell_material(c));
+                            let m = if a_in { cm } else { [cm[0], cm[3], cm[2], cm[1]] };
+                            m[1] == m[3] && (m[1] == m[2] || m[1] == m[0])
+                        };
                         let b = &mut self.builders[mat as usize];
-                        let pp = |i: u32| b.positions[i as usize];
-                        if dist2(pp(q4[0]), pp(q4[2])) >= dist2(pp(q4[1]), pp(q4[3])) {
+                        if !flip {
                             b.indices
                                 .extend_from_slice(&[q4[0], q4[1], q4[2], q4[0], q4[2], q4[3]]);
                         } else {
@@ -1151,10 +1175,6 @@ impl State {
     }
 }
 
-#[inline]
-fn dist2(a: [f32; 3], b: [f32; 3]) -> f32 {
-    (a[0] - b[0]).powi(2) + (a[1] - b[1]).powi(2) + (a[2] - b[2]).powi(2)
-}
 
 /// Smooth surface (surface nets over occupancy, iso 0.5, samples at voxel
 /// centres) in world studs, one mesh per material. Water is its own mesh
@@ -1216,6 +1236,36 @@ fn build_fields(v: &Voxels, fields: [bool; 2]) -> Vec<MaterialMesh> {
         .collect()
 }
 
+/// Studio's water surface as rays and shapecasts meet it: the water mesh
+/// moved down by half a voxel (a 16-tall water FillBlock with its top at 0
+/// is hit at y = 0 from above and at y = -20 from below, where the solid
+/// mesh of the same block lies at +2 / -18; water_probe.luau 2026-11-11).
+pub const WATER_RAY_DROP: f32 = VOXEL * 0.5;
+
+/// One chunk's water surface for rays (world studs, counter-clockwise seen
+/// from outside, `WATER_RAY_DROP` applied): the edges this chunk owns, as
+/// `build_water_meshes` makes them.
+pub fn chunk_water_triangles(v: &Voxels, key: [i32; 3]) -> Vec<[[f32; 3]; 3]> {
+    let mut g = Grid::new();
+    let (_, _, any_w) = g.fill(v, key);
+    if !any_w {
+        return Vec::new();
+    }
+    let mut st = State::new();
+    st.reset_chunk();
+    st.edges(&g, key, 1);
+    let b = &st.builders[WATER as usize];
+    b.indices
+        .chunks_exact(3)
+        .map(|t| {
+            [t[0], t[1], t[2]].map(|i| {
+                let p = b.positions[i as usize];
+                [p[0], p[1] - WATER_RAY_DROP, p[2]]
+            })
+        })
+        .collect()
+}
+
 // ------------------------------------------------- render chunks (round 21)
 
 /// A terrain vertex as Studio's terrain shader takes it (SmoothCluster VS):
@@ -1241,65 +1291,89 @@ pub fn palette(material: u8, face: u8) -> u8 {
     material * 3 + face
 }
 
-/// Studio's 18 projection axes: the six faces and the twelve cube edges.
-pub const AXES: [[f32; 3]; 18] = {
-    const H: f32 = std::f32::consts::FRAC_1_SQRT_2;
-    [
-        [1.0, 0.0, 0.0],
-        [-1.0, 0.0, 0.0],
-        [0.0, 1.0, 0.0],
-        [0.0, -1.0, 0.0],
-        [0.0, 0.0, 1.0],
-        [0.0, 0.0, -1.0],
-        [H, H, 0.0],
-        [-H, H, 0.0],
-        [H, -H, 0.0],
-        [-H, -H, 0.0],
-        [0.0, H, H],
-        [0.0, -H, H],
-        [0.0, H, -H],
-        [0.0, -H, -H],
-        [H, 0.0, H],
-        [-H, 0.0, H],
-        [H, 0.0, -H],
-        [-H, 0.0, -H],
-    ]
-};
+/// Studio's 18 projection axes (its CB2 axisU / axisV tables, 0.7 for the
+/// diagonals, exactly as stored): 0 +X, 1 −X, 2 +Z, 3 −Z, 4–7 the XZ
+/// diagonals, 8 up, 9–12 tilted up (+X, −X, +Z, −Z), 13 down, 14–17 tilted
+/// down. Texture coordinate = (P·U, P·V) × tiling (Studio 0.744:
+/// tables at .rdata Studio / Studio, filled by Studio).
+pub const AXIS_U: [[f32; 3]; 18] = [
+    [0.0, 0.0, -1.0], [0.0, 0.0, 1.0], [1.0, 0.0, 0.0], [-1.0, 0.0, 0.0],
+    [0.7, 0.0, -0.7], [-0.7, 0.0, -0.7], [0.7, 0.0, 0.7], [-0.7, 0.0, 0.7],
+    [-1.0, 0.0, 0.0], [-0.7, 0.7, 0.0], [-0.7, -0.7, 0.0], [-1.0, 0.0, 0.0], [-1.0, 0.0, 0.0],
+    [-1.0, 0.0, 0.0], [-0.7, -0.7, 0.0], [-0.7, 0.7, 0.0], [-1.0, 0.0, 0.0], [-1.0, 0.0, 0.0],
+];
+pub const AXIS_V: [[f32; 3]; 18] = [
+    [0.0, -1.0, 0.0], [0.0, -1.0, 0.0], [0.0, -1.0, 0.0], [0.0, -1.0, 0.0],
+    [0.0, -1.0, 0.0], [0.0, -1.0, 0.0], [0.0, -1.0, 0.0], [0.0, -1.0, 0.0],
+    [0.0, 0.0, -1.0], [0.0, 0.0, -1.0], [0.0, 0.0, -1.0], [0.0, 0.7, -0.7], [0.0, -0.7, -0.7],
+    [0.0, 0.0, 1.0], [0.0, 0.0, 1.0], [0.0, 0.0, 1.0], [0.0, 0.7, 0.7], [0.0, -0.7, 0.7],
+];
 
-/// The projection axis nearest a normal (only the six faces for
-/// cube-mapped materials: Brick, WoodPlanks).
-pub fn nearest_axis(n: [f32; 3], cube: bool) -> u8 {
-    let count = if cube { 6 } else { 18 };
-    let mut best = (0u8, f32::MIN);
-    for (i, a) in AXES.iter().take(count).enumerate() {
-        let d = a[0] * n[0] + a[1] * n[1] + a[2] * n[2];
-        if d > best.1 {
-            best = (i as u8, d);
+/// Studio's projection axis for a corner normal (Studio): bands on the
+/// normal's Y (up above 0.9, tilted up above 0.4, side down to −0.6, tilted
+/// down to −0.8, else down); on the side ±X / ±Z unless the other component
+/// is at least half, then a diagonal. Cube-mapped materials (Brick,
+/// WoodPlanks) take the dominant axis only.
+pub fn studio_axis(n: [f32; 3], cube: bool) -> u8 {
+    let (ax, az, y) = (n[0].abs(), n[2].abs(), n[1]);
+    let neg = |v: f32| (v < 0.0) as u8;
+    if cube {
+        if ax < y && az < y {
+            8
+        } else if y >= -ax || y >= -az {
+            if ax <= az { 2 + neg(n[2]) } else { neg(n[0]) }
+        } else {
+            13
         }
-    }
-    best.0
-}
-
-/// Which face texture a corner with normal `n` shows.
-fn face_of(n: [f32; 3]) -> u8 {
-    if n[1] >= crate::mech::TERRAIN_TOP_NORMAL_Y {
-        0
-    } else if n[1] <= -crate::mech::TERRAIN_TOP_NORMAL_Y {
-        2
+    } else if y > 0.9 {
+        8
+    } else if y > 0.4 {
+        if ax <= az { 11 + neg(n[2]) } else { 9 + neg(n[0]) }
+    } else if y >= -0.8 {
+        if y < -0.6 {
+            if ax <= az { 16 + neg(n[2]) } else { 14 + neg(n[0]) }
+        } else if ax <= 2.0 * az {
+            if az <= 2.0 * ax { 4 + 2 * neg(n[0]) + neg(n[2]) } else { 2 + neg(n[2]) }
+        } else {
+            neg(n[0])
+        }
     } else {
-        1
+        13
     }
 }
 
-/// A stable random byte for a cell (the same in every triangle that shares it).
+/// Which face texture a corner on `axis` shows: side for 0–7, top for
+/// 8–12, bottom for 13–17 (no separate threshold in Studio).
+pub fn face_of_axis(axis: u8) -> u8 {
+    match axis {
+        0..=7 => 1,
+        8..=12 => 0,
+        _ => 2,
+    }
+}
+
+/// Studio's per-cell random (Studio): boost hash_combine of the cell's
+/// global voxel index (its lower-corner sample), then Thomas Wang's 32-bit
+/// hash. A corner's byte is the low byte of its own cell's hash.
+pub fn studio_cell_hash(gc: [i32; 3]) -> u32 {
+    let (x, y) = (gc[0] as i64 as u64, gc[1] as i64 as u64);
+    let s1 = 0x9e37_79b9u64.wrapping_add(x);
+    let s2 = s1 ^ y.wrapping_add(0x9e37_79b9).wrapping_add(s1 << 6).wrapping_add(s1 >> 2);
+    let mut h = (gc[2] as u32)
+        .wrapping_add(0x9e37_79b9)
+        .wrapping_add((s2 as u32) << 6)
+        .wrapping_add((s2 >> 2) as u32)
+        ^ (s2 as u32);
+    h = h.wrapping_add(!(h << 15));
+    h ^= h >> 10;
+    h = h.wrapping_mul(9);
+    h ^= h >> 6;
+    h = h.wrapping_add(!(h << 11));
+    h ^ (h >> 16)
+}
+
 fn cell_rand(gc: [i32; 3]) -> u8 {
-    let mut h = (gc[0] as u32).wrapping_mul(0x8da6_b343)
-        ^ (gc[1] as u32).wrapping_mul(0xd816_3841)
-        ^ (gc[2] as u32).wrapping_mul(0xcb1a_b31f);
-    h ^= h >> 15;
-    h = h.wrapping_mul(0x2c1b_3c6d);
-    h ^= h >> 12;
-    (h & 0xff) as u8
+    studio_cell_hash(gc) as u8
 }
 
 impl Grid {
@@ -1351,6 +1425,7 @@ pub fn chunk_triangles(v: &Voxels, key: [i32; 3], cube: &dyn Fn(u8) -> bool) -> 
         nrm: [f32; 3],
         mat: u8,
         gc: [i32; 3],
+        c: [usize; 3],
     }
     let mut cells: HashMap<usize, Corner> = HashMap::new();
     let mut quads: Vec<[usize; 4]> = Vec::new();
@@ -1360,7 +1435,7 @@ pub fn chunk_triangles(v: &Voxels, key: [i32; 3], cube: &dyn Fn(u8) -> bool) -> 
             cells.entry(ci).or_insert_with(|| {
                 let (pos, nrm) = g.cell_vertex(0, c, key);
                 let gc = [0, 1, 2].map(|k| (key[k] << CHUNK_SHIFT) + c[k] as i32 - 1);
-                Corner { pos, nrm, mat: g.cell_material(c), gc }
+                Corner { pos, nrm, mat: g.cell_material(c), gc, c }
             });
             ci
         };
@@ -1389,19 +1464,62 @@ pub fn chunk_triangles(v: &Voxels, key: [i32; 3], cube: &dyn Fn(u8) -> bool) -> 
             }
         }
     }
+    // Studio's quad emitter (Studio) picks the diagonal by material,
+    // never by length: q1–q3 when q1 and q3 share a material that q0 or q2
+    // also has (so every flat one-material quad), else q0–q2. Studio's Y
+    // quads list q1 / q3 the other way round; the rule is symmetric in them.
+    let tris: Vec<[usize; 3]> = quads.iter().flat_map(|q4| {
+        let m = |i: usize| cells[&q4[i]].mat;
+        if m(1) == m(3) && (m(1) == m(2) || m(1) == m(0)) {
+            [[q4[0], q4[1], q4[3]], [q4[1], q4[2], q4[3]]]
+        } else {
+            [[q4[0], q4[1], q4[2]], [q4[0], q4[2], q4[3]]]
+        }
+    }).collect();
+    // Vertex normals (Studio): the area-weighted sum of the touching
+    // triangles' normals, from the final (deformed) positions. Cells on the
+    // chunk's rim also touch the neighbour's triangles; they keep the
+    // field's gradient normal, which both chunks agree on.
+    let mut sums: HashMap<usize, glam::Vec3> = HashMap::new();
+    for t in &tris {
+        let p = t.map(|i| glam::Vec3::from(cells[&i].pos));
+        let n = (p[1] - p[0]).cross(p[2] - p[0]);
+        for i in t {
+            *sums.entry(*i).or_default() += n;
+        }
+    }
+    for (i, n) in sums {
+        let k = cells.get_mut(&i).expect("cell");
+        let inner = k.c.iter().all(|&v| v >= 1 && v < CS);
+        if inner && n.length_squared() > 1e-12 {
+            k.nrm = n.normalize().to_array();
+        }
+    }
     let mut out = Vec::with_capacity(quads.len() * 6);
     let mut tri = |t: [usize; 3]| {
         let c = t.map(|i| &cells[&i]);
         // Cells with no solid sample of their own take a neighbour's material.
         let fallback = c.iter().map(|k| k.mat).find(|&m| m != 0).unwrap_or(2);
         let mats = c.map(|k| if k.mat == 0 { fallback } else { k.mat });
-        let pal = [0, 1, 2].map(|i| palette(mats[i], face_of(c[i].nrm)));
-        let ax = [0, 1, 2].map(|i| nearest_axis(c[i].nrm, cube(mats[i])));
-        let rnd = c.map(|k| cell_rand(k.gc));
         // Hard materials (Studio's "hard" / "hardsoft": Rock, Basalt, Brick…)
         // shade each triangle flat; the rest smooth.
         let (a, b, d) = (glam::Vec3::from(c[0].pos), glam::Vec3::from(c[1].pos), glam::Vec3::from(c[2].pos));
         let face = (b - a).cross(d - a).normalize_or_zero();
+        // The normal a corner picks its axis (and so its face texture) from
+        // (Studio): soft the vertex normal, hard the face's, hardsoft the
+        // vertex normal while within 0.75 of the face's.
+        let axis_normal = |i: usize| {
+            let sh = shape_of(mats[i]);
+            let vn = glam::Vec3::from(c[i].nrm);
+            if face == glam::Vec3::ZERO || !sh.faceted || (sh.hardsoft && face.dot(vn) > 0.75) {
+                c[i].nrm
+            } else {
+                face.to_array()
+            }
+        };
+        let ax = [0, 1, 2].map(|i| studio_axis(axis_normal(i), cube(mats[i])));
+        let pal = [0, 1, 2].map(|i| palette(mats[i], face_of_axis(ax[i])));
+        let rnd = c.map(|k| cell_rand(k.gc));
         for (i, k) in c.iter().enumerate() {
             let q = |f: f32| (f.clamp(-1.0, 1.0) * 127.0).round() as i8;
             let n = if shape_of(mats[i]).faceted && face != glam::Vec3::ZERO {
@@ -1418,15 +1536,8 @@ pub fn chunk_triangles(v: &Voxels, key: [i32; 3], cube: &dyn Fn(u8) -> bool) -> 
             });
         }
     };
-    for q4 in quads {
-        let pp = |i: usize| cells[&i].pos;
-        if dist2(pp(q4[0]), pp(q4[2])) >= dist2(pp(q4[1]), pp(q4[3])) {
-            tri([q4[0], q4[1], q4[2]]);
-            tri([q4[0], q4[2], q4[3]]);
-        } else {
-            tri([q4[0], q4[1], q4[3]]);
-            tri([q4[1], q4[2], q4[3]]);
-        }
+    for t in tris {
+        tri(t);
     }
     out
 }
@@ -1481,7 +1592,7 @@ pub fn grass_blades(v: &Voxels, key: [i32; 3], length: f32) -> Vec<TerrainVertex
                 pos: pos.to_array(),
                 normal: [0, 127, 0, corner],
                 palette: [grass_top, grass_top, grass_top, flag],
-                axis: [2, 2, 2, 0],
+                axis: [8, 8, 8, 0],
                 rand: [shade, shade, shade, if flag == 2 { hq } else { 0 }],
             };
             let (b1, b2) = (p - side, p + side);
@@ -1628,7 +1739,25 @@ mod tests {
     use super::*;
     use std::collections::BTreeMap;
 
-    /// FillBlock / FillBall write what `encode` stores and `decode` reads back.
+    #[test]
+    fn corner_material_sums_occupancy_and_breaks_ties_by_slot() {
+        let mut g = Grid::new();
+        let p = pidx(1, 1, 1);
+        g.mat[p] = 10;
+        g.solid[p] = 1.0;
+        g.mat[p + 1] = 2;
+        g.solid[p + 1] = 0.6;
+        g.mat[p + P] = 2;
+        g.solid[p + P] = 0.6;
+        assert_eq!(g.cell_material([1, 1, 1]), 2);
+        g.solid[p + P] = 0.4;
+        assert_eq!(g.cell_material([1, 1, 1]), 2);
+        g.solid[p + P] = 0.3;
+        assert_eq!(g.cell_material([1, 1, 1]), 10);
+        g.mat[p] = WATER;
+        assert_eq!(g.cell_material([1, 1, 1]), 2);
+    }
+
     #[test]
     fn fill_encode_round_trip() {
         let mut v = Voxels::empty();
@@ -1962,12 +2091,116 @@ mod tests {
 
     #[test]
     fn terrain_block_across_chunk_corner_is_welded() {
-        // 4x4x4 block straddling the corner shared by 8 chunks.
-        let v = Voxels::decode(&encode(&block([-2, -2, -2], [1, 1, 1], (8, 255, None)))).unwrap();
+        // 4x4x4 block straddling the corner shared by 8 chunks. Grass: no
+        // deform (Rock's Studio shift, ±0.3 voxel, can fold so small a block).
+        let v = Voxels::decode(&encode(&block([-2, -2, -2], [1, 1, 1], (2, 255, None)))).unwrap();
         assert_eq!(v.chunk_count(), 8);
         let meshes = build_meshes(&v);
         assert_eq!(meshes.len(), 1);
         check_closed(&meshes[0], [0.0, 0.0, 0.0]);
+    }
+
+    #[test]
+    fn studio_cell_hash_matches_the_exe() {
+        // Vectors from Studio 0.744's mesher (Studio).
+        for (gc, h) in [
+            ([0, 0, 0], 0xbbd5_f441u32),
+            ([1, 0, 0], 0x8bda_f8ed),
+            ([0, 1, 0], 0xca9d_309c),
+            ([0, 0, 1], 0x122c_1148),
+            ([-1, -1, -1], 0x70fb_a62c),
+            ([10, -3, 7], 0x93b6_6c34),
+            ([-100, 25, 300], 0x8169_a389),
+        ] {
+            assert_eq!(studio_cell_hash(gc), h, "{gc:?}");
+        }
+        assert_eq!(cell_rand([0, 0, 0]), 65);
+        assert_eq!(cell_rand([1, 0, 0]), 237);
+    }
+
+    #[test]
+    fn studio_axis_bands_and_faces() {
+        let h = 0.7071;
+        for (n, cube, axis) in [
+            ([0.0, 1.0, 0.0], false, 8),
+            ([0.3, 0.95, 0.0], false, 8),
+            ([0.8, 0.6, 0.0], false, 9),
+            ([-0.8, 0.6, 0.0], false, 10),
+            ([0.0, 0.6, 0.8], false, 11),
+            ([0.0, 0.6, -0.8], false, 12),
+            ([1.0, 0.0, 0.0], false, 0),
+            ([-1.0, 0.0, 0.0], false, 1),
+            ([0.0, 0.0, 1.0], false, 2),
+            ([0.0, 0.0, -1.0], false, 3),
+            ([h, 0.0, h], false, 4),
+            ([h, 0.0, -h], false, 5),
+            ([-h, 0.0, h], false, 6),
+            ([-h, 0.0, -h], false, 7),
+            ([0.9, 0.0, 0.3], false, 0),
+            ([0.7, -0.7, 0.0], false, 14),
+            ([0.0, -0.7, -0.7], false, 17),
+            ([0.0, -1.0, 0.0], false, 13),
+            ([0.6, 0.8, 0.0], true, 8),
+            ([h, 0.0, h], true, 2),
+            ([0.9, 0.3, 0.1], true, 0),
+            ([0.1, -0.9, 0.1], true, 13),
+        ] {
+            assert_eq!(studio_axis(n, cube), axis, "{n:?} cube {cube}");
+        }
+        assert_eq!((0..18).map(face_of_axis).collect::<Vec<_>>(),
+            [1, 1, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 2, 2, 2, 2, 2]);
+        // The U / V tables are unit length but for 0.7 on the diagonals.
+        for i in 0..18 {
+            for t in [AXIS_U[i], AXIS_V[i]] {
+                let l = (t[0] * t[0] + t[1] * t[1] + t[2] * t[2]).sqrt();
+                assert!((l - 1.0).abs() < 1e-6 || (l - 0.98995).abs() < 1e-4, "{i}: {l}");
+            }
+        }
+    }
+
+    #[test]
+    fn flat_ground_splits_like_studio_and_carries_each_cells_byte() {
+        // A one-material slab: every quad splits along q1–q3 (Studio's quad
+        // emitter), every top corner is on axis 8 and shows its top texture,
+        // and corner k's random byte is the hash of its own cell.
+        let v = Voxels::decode(&encode(&block([0, 0, 0], [5, 1, 5], (2, 255, None)))).unwrap();
+        let tris = chunk_triangles(&v, [0, 0, 0], &|_| false);
+        let mut tops = 0;
+        for t in tris.chunks_exact(3) {
+            if t.iter().any(|v| v.normal[1] < 120) {
+                continue;
+            }
+            tops += 1;
+            for v in t {
+                let corner = v.normal[3] as usize;
+                assert_eq!(v.axis[corner], 8);
+                assert_eq!(v.palette[corner], palette(2, 0));
+                // The slab's top lies on its cell's upper face (crossing at
+                // (255 + 1) / 256): the cell is the one below that boundary.
+                let gc = [0, 1, 2].map(|k| (v.pos[k] / VOXEL - 0.5 - 1e-3).floor() as i32);
+                assert_eq!(v.rand[corner], cell_rand(gc), "{:?}", v.pos);
+            }
+            // The two triangles of a q1–q3 split share the diagonal that runs
+            // from (x−1, z) to (x, z−1) on Studio's +Y quad: the corners of a
+            // triangle never lie on one row and one column both.
+            let p = t.iter().map(|v| (v.pos[0], v.pos[2])).collect::<Vec<_>>();
+            let same_x = p.iter().filter(|q| (q.0 - p[0].0).abs() < 1e-3).count();
+            let same_z = p.iter().filter(|q| (q.1 - p[0].1).abs() < 1e-3).count();
+            assert!(same_x <= 2 && same_z <= 2);
+        }
+        assert!(tops > 0);
+    }
+
+    #[test]
+    fn deform_is_one_mode_per_material() {
+        let s = |m: u8| crate::terrain_mat::material(m, false).unwrap().shape;
+        let rock = s(8);
+        assert!(rock.shift > 0.29 && rock.quantize == 0.0 && !rock.cubify && rock.hardsoft);
+        let brick = s(5);
+        assert!(brick.cubify && brick.shift == 0.0 && brick.quantize == 0.0 && !brick.hardsoft);
+        let cobble = s(17);
+        assert!(cobble.quantize > 0.14 && cobble.shift == 0.0 && cobble.hardsoft);
+        assert!(!s(2).cubify && s(2).shift == 0.0 && s(2).quantize == 0.0);
     }
 
     #[test]

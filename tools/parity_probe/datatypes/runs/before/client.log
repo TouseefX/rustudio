@@ -1112,7 +1112,7 @@ Info: [Client] DT|client|NumberRange.read|false|string|attempt to get an unknown
 Info: [Client] DT|client|NumberRange.read.info|true|[C]|-1||0|true  —  Players.testuser1.PlayerScripts.DatatypeProbe:2
 Info: [Client] DT|client|NumberRange.read.identity|true  —  Players.testuser1.PlayerScripts.DatatypeProbe:2
 Info: [Client] DT|client|NumberRange.read.direct.empty|false|function|function: 0xe3b6b4dff4fd14b2  —  Players.testuser1.PlayerScripts.DatatypeProbe:2
-Info: [Client] DT|client|NumberRange.read.direct.table|false|table|table: 0x1460fcb0853760ba  —  Players.testuser1.PlayerScripts.DatatypeProbe:2
+Info: [Client] DT|client|NumberRange.read.direct.table|false|table|table: Studio  —  Players.testuser1.PlayerScripts.DatatypeProbe:2
 Info: [Client] DT|client|NumberRange.read.direct.self|false|userdata|0.33333334 2   —  Players.testuser1.PlayerScripts.DatatypeProbe:2
 Info: [Client] DT|client|NumberRange.concat|false|string|Players.testuser1.PlayerScripts.DatatypeProbe:49: attempt to concatenate NumberRange with string  —  Players.testuser1.PlayerScripts.DatatypeProbe:2
 Info: [Client] DT|client|NumberRange.concat.info|true|Players.testuser1.PlayerScripts.DatatypeProbe|49|concat|1|false  —  Players.testuser1.PlayerScripts.DatatypeProbe:2
