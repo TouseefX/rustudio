@@ -24,17 +24,20 @@ quite yet.
 ## Features
 
 - **Editor:** Explorer, Properties, Output, script tabs, move/scale/rotate
-  tools, terrain tools, undo/redo, and Studio's menus, ribbon and shortcuts.
+  tools with drag duplication and selection rotation, pop-out panels, terrain
+  brushes and threaded generation, undo/redo, and Studio's menus and shortcuts.
 - **Files:** `.rbxl` / `.rbxlx` places and `.rbxm` / `.rbxmx` models, plus
   project folders (`*.project.json` with plain files as the source of truth,
   Rojo/Argon sync rules, `sourcemap.json`, and File > Save as Project
   Folder… to turn any place into one).
 - **Play / Run:** separate server and client, remotes, physics (rapier3d),
-  R15/R6 characters and animation, sounds, tweens, 2D and 3D GUIs.
+  R15/R6 characters with climbing and held jump, saved play settings, shift
+  lock, sounds, tweens, 2D and 3D GUIs.
 - **Luau:** the real Luau VM, with most of the engine API that real games
   call (see [docs/ENGINE-GAPS.md](docs/ENGINE-GAPS.md) for what's missing).
 - **Rendering:** wgpu, with lighting, shadows, sky, atmosphere and materials
-  tuned against Studio. Meshes, FBX import and terrain are supported.
+  tuned against Studio, incremental local lights and truss geometry. Meshes,
+  FBX import and terrain are supported.
 - **Roblox account:** open your places, load assets and avatars, use
   DataStores, and join Team Create sessions.
 

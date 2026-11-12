@@ -245,7 +245,7 @@ GLOBALS|server|inventory.math.rad|true | function | function | [C] | -1 | rad | 
 GLOBALS|server|inventory.math.random|true | function | function | [C] | -1 | random | 0 | true | function: 0x442dfae97bcc9af0
 GLOBALS|server|inventory.math.randomseed|true | function | function | [C] | -1 | randomseed | 0 | true | function: 0xdd367a0c36b16446
 GLOBALS|server|inventory.math.round|true | function | function | [C] | -1 | round | 0 | true | function: 0xe2b5be8a49544686
-GLOBALS|server|inventory.math.sign|true | function | function | [C] | -1 | sign | 0 | true | function: Studio
+GLOBALS|server|inventory.math.sign|true | function | function | [C] | -1 | sign | 0 | true | function: pointer
 GLOBALS|server|inventory.math.sin|true | function | function | [C] | -1 | sin | 0 | true | function: 0xd259857f0ccaa6c0
 GLOBALS|server|inventory.math.sinh|true | function | function | [C] | -1 | sinh | 0 | true | function: 0x9607e47653aac693
 GLOBALS|server|inventory.math.sqrt|true | function | function | [C] | -1 | sqrt | 0 | true | function: 0xbd91bb944d5564c5
@@ -610,7 +610,7 @@ GLOBALS|server|inventory.math.rad|true | function | function | [C] | -1 | rad | 
 GLOBALS|server|inventory.math.random|true | function | function | [C] | -1 | random | 0 | true | function: 0x442dfae97bcc9af0
 GLOBALS|server|inventory.math.randomseed|true | function | function | [C] | -1 | randomseed | 0 | true | function: 0xdd367a0c36b16446
 GLOBALS|server|inventory.math.round|true | function | function | [C] | -1 | round | 0 | true | function: 0xe2b5be8a49544686
-GLOBALS|server|inventory.math.sign|true | function | function | [C] | -1 | sign | 0 | true | function: Studio
+GLOBALS|server|inventory.math.sign|true | function | function | [C] | -1 | sign | 0 | true | function: pointer
 GLOBALS|server|inventory.math.sin|true | function | function | [C] | -1 | sin | 0 | true | function: 0xd259857f0ccaa6c0
 GLOBALS|server|inventory.math.sinh|true | function | function | [C] | -1 | sinh | 0 | true | function: 0x9607e47653aac693
 GLOBALS|server|inventory.math.sqrt|true | function | function | [C] | -1 | sqrt | 0 | true | function: 0xbd91bb944d5564c5

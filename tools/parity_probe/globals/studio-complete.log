@@ -183,7 +183,7 @@ GLOBALS|server|inventory.os.time|true | function | function | [C] | -1 | time | 
 GLOBALS|server|meta.os|nil | nil
 GLOBALS|server|inventory.math.abs|true | function | function | [C] | -1 | abs | 0 | true | function: 0x9bd31e3e485a81c5
 GLOBALS|server|inventory.math.acos|true | function | function | [C] | -1 | acos | 0 | true | function: 0xfb69ba21121d7363
-GLOBALS|server|inventory.math.asin|true | function | function | [C] | -1 | asin | 0 | true | function: Studio
+GLOBALS|server|inventory.math.asin|true | function | function | [C] | -1 | asin | 0 | true | function: pointer
 GLOBALS|server|inventory.math.atan|true | function | function | [C] | -1 | atan | 0 | true | function: 0x1a2c0a4c6b4820fa
 GLOBALS|server|inventory.math.atan2|true | function | function | [C] | -1 | atan2 | 0 | true | function: 0xfdac29ac98766341
 GLOBALS|server|inventory.math.ceil|true | function | function | [C] | -1 | ceil | 0 | true | function: 0xf5dde54d0f2a5c52
@@ -548,7 +548,7 @@ GLOBALS|server|inventory.os.time|true | function | function | [C] | -1 | time | 
 GLOBALS|server|meta.os|nil | nil
 GLOBALS|server|inventory.math.abs|true | function | function | [C] | -1 | abs | 0 | true | function: 0x9bd31e3e485a81c5
 GLOBALS|server|inventory.math.acos|true | function | function | [C] | -1 | acos | 0 | true | function: 0xfb69ba21121d7363
-GLOBALS|server|inventory.math.asin|true | function | function | [C] | -1 | asin | 0 | true | function: Studio
+GLOBALS|server|inventory.math.asin|true | function | function | [C] | -1 | asin | 0 | true | function: pointer
 GLOBALS|server|inventory.math.atan|true | function | function | [C] | -1 | atan | 0 | true | function: 0x1a2c0a4c6b4820fa
 GLOBALS|server|inventory.math.atan2|true | function | function | [C] | -1 | atan2 | 0 | true | function: 0xfdac29ac98766341
 GLOBALS|server|inventory.math.ceil|true | function | function | [C] | -1 | ceil | 0 | true | function: 0xf5dde54d0f2a5c52
@@ -1069,7 +1069,7 @@ GLOBALS|client|inventory.visible.Region3int16|table | table | table: 0x41ba7078f
 GLOBALS|client|inventory.visible.RotationCurveKey|table | table | table: 0x0ebe5f6fe002504d
 GLOBALS|client|inventory.visible.SharedTable|table | table | table: 0xb597320f508ecda2
 GLOBALS|client|inventory.visible.Spawn|true | function | function | [C] | -1 | Spawn | 0 | true | function: 0xb9def377a80962ce
-GLOBALS|client|inventory.visible.TweenInfo|table | table | table: Studio
+GLOBALS|client|inventory.visible.TweenInfo|table | table | table: pointer
 GLOBALS|client|inventory.visible.UDim|table | table | table: 0x801ad6a448a1dadf
 GLOBALS|client|inventory.visible.UDim2|table | table | table: 0x804b1fa887e95e0c
 GLOBALS|client|inventory.visible.User|table | table | table: 0xa7272f2c3b76442d
@@ -1112,7 +1112,7 @@ GLOBALS|client|inventory.visible.rawlen|true | function | function | [C] | -1 | 
 GLOBALS|client|inventory.visible.rawset|true | function | function | [C] | -1 | rawset | 0 | true | function: 0x6eb20263e1ce2c91
 GLOBALS|client|inventory.visible.require|true | function | function | [C] | -1 | require | 0 | true | function: 0x2c218ddeb48aa9ea
 GLOBALS|client|inventory.visible.script|userdata | Instance | GlobalsProbe2
-GLOBALS|client|inventory.visible.select|true | function | function | [C] | -1 | select | 0 | true | function: Studio
+GLOBALS|client|inventory.visible.select|true | function | function | [C] | -1 | select | 0 | true | function: pointer
 GLOBALS|client|inventory.visible.setfenv|true | function | function | [C] | -1 | setfenv | 0 | true | function: 0x8a99155d8e3708dc
 GLOBALS|client|inventory.visible.setmetatable|true | function | function | [C] | -1 | setmetatable | 0 | true | function: 0x8210dce0a9552552
 GLOBALS|client|inventory.visible.settings|true | function | function | [C] | -1 | settings | 0 | true | function: 0x791c33d5f11500d8
@@ -1437,7 +1437,7 @@ GLOBALS|client|inventory.visible.Region3int16|table | table | table: 0x41ba7078f
 GLOBALS|client|inventory.visible.RotationCurveKey|table | table | table: 0x0ebe5f6fe002504d
 GLOBALS|client|inventory.visible.SharedTable|table | table | table: 0xb597320f508ecda2
 GLOBALS|client|inventory.visible.Spawn|true | function | function | [C] | -1 | Spawn | 0 | true | function: 0xb9def377a80962ce
-GLOBALS|client|inventory.visible.TweenInfo|table | table | table: Studio
+GLOBALS|client|inventory.visible.TweenInfo|table | table | table: pointer
 GLOBALS|client|inventory.visible.UDim|table | table | table: 0x801ad6a448a1dadf
 GLOBALS|client|inventory.visible.UDim2|table | table | table: 0x804b1fa887e95e0c
 GLOBALS|client|inventory.visible.User|table | table | table: 0xa7272f2c3b76442d
@@ -1480,7 +1480,7 @@ GLOBALS|client|inventory.visible.rawlen|true | function | function | [C] | -1 | 
 GLOBALS|client|inventory.visible.rawset|true | function | function | [C] | -1 | rawset | 0 | true | function: 0x6eb20263e1ce2c91
 GLOBALS|client|inventory.visible.require|true | function | function | [C] | -1 | require | 0 | true | function: 0x2c218ddeb48aa9ea
 GLOBALS|client|inventory.visible.script|userdata | Instance | GlobalsProbe1
-GLOBALS|client|inventory.visible.select|true | function | function | [C] | -1 | select | 0 | true | function: Studio
+GLOBALS|client|inventory.visible.select|true | function | function | [C] | -1 | select | 0 | true | function: pointer
 GLOBALS|client|inventory.visible.setfenv|true | function | function | [C] | -1 | setfenv | 0 | true | function: 0x8a99155d8e3708dc
 GLOBALS|client|inventory.visible.setmetatable|true | function | function | [C] | -1 | setmetatable | 0 | true | function: 0x8210dce0a9552552
 GLOBALS|client|inventory.visible.settings|true | function | function | [C] | -1 | settings | 0 | true | function: 0x791c33d5f11500d8

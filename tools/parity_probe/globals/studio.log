@@ -138,7 +138,7 @@ GLOBALS|server|inventory.buffer.readf32|true | function | function | [C] | -1 | 
 GLOBALS|server|inventory.buffer.readf64|true | function | function | [C] | -1 | readf64 | 0 | true | function: 0x10ae8f9d709f28a1
 GLOBALS|server|inventory.buffer.readi16|true | function | function | [C] | -1 | readi16 | 0 | true | function: 0xbffdc4b6d5a7bd9d
 GLOBALS|server|inventory.buffer.readi32|true | function | function | [C] | -1 | readi32 | 0 | true | function: 0x6cf376ec69534e7b
-GLOBALS|server|inventory.buffer.readi8|true | function | function | [C] | -1 | readi8 | 0 | true | function: Studio
+GLOBALS|server|inventory.buffer.readi8|true | function | function | [C] | -1 | readi8 | 0 | true | function: pointer
 GLOBALS|server|inventory.buffer.readstring|true | function | function | [C] | -1 | readstring | 0 | true | function: 0x6627747689f42c21
 GLOBALS|server|inventory.buffer.readu16|true | function | function | [C] | -1 | readu16 | 0 | true | function: 0x6ba2aa455699cd4b
 GLOBALS|server|inventory.buffer.readu32|true | function | function | [C] | -1 | readu32 | 0 | true | function: 0x865fe6dc1de1fa70
@@ -399,7 +399,7 @@ GLOBALS|server|inventory.buffer.readf32|true | function | function | [C] | -1 | 
 GLOBALS|server|inventory.buffer.readf64|true | function | function | [C] | -1 | readf64 | 0 | true | function: 0x10ae8f9d709f28a1
 GLOBALS|server|inventory.buffer.readi16|true | function | function | [C] | -1 | readi16 | 0 | true | function: 0xbffdc4b6d5a7bd9d
 GLOBALS|server|inventory.buffer.readi32|true | function | function | [C] | -1 | readi32 | 0 | true | function: 0x6cf376ec69534e7b
-GLOBALS|server|inventory.buffer.readi8|true | function | function | [C] | -1 | readi8 | 0 | true | function: Studio
+GLOBALS|server|inventory.buffer.readi8|true | function | function | [C] | -1 | readi8 | 0 | true | function: pointer
 GLOBALS|server|inventory.buffer.readstring|true | function | function | [C] | -1 | readstring | 0 | true | function: 0x6627747689f42c21
 GLOBALS|server|inventory.buffer.readu16|true | function | function | [C] | -1 | readu16 | 0 | true | function: 0x6ba2aa455699cd4b
 GLOBALS|server|inventory.buffer.readu32|true | function | function | [C] | -1 | readu32 | 0 | true | function: 0x865fe6dc1de1fa70
