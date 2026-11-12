@@ -122,10 +122,11 @@ impl Editor {
             "panel_output" => (true, open("Output")),
             "insert_object" => (edit, None),
             "reset_layout" => (true, None),
+            "dock_all" => (!self.ui.popped.is_empty(), None),
             "documentation" | "tutorials" | "developer_forum" => (true, None),
             "command_bar" => (false, Some(false)),
             // Ribbon-only actions.
-            "tool_select" | "tool_move" | "tool_scale" | "tool_rotate" => (true, None),
+            "transform" | "tool_select" | "tool_move" | "tool_scale" | "tool_rotate" => (true, None),
             "part" | "part_block" | "part_sphere" | "part_wedge" | "part_corner" | "part_cylinder" => (edit, None),
             "gui" | "script" => (edit, None),
             "effect" | "attachment" => (edit && parts, None),
@@ -316,16 +317,18 @@ impl Editor {
                 let at = ctx.content_rect().center() - Vec2::new(120.0, 200.0);
                 self.open_insert_popup(parent, at);
             }
+            "dock_all" => self.ui.dock_moves.push(crate::panels::DockMove::DockAll),
             "reset_layout" => {
                 ctx.data_mut(|d| d.insert_temp(egui::Id::new("reset_dock"), true));
             }
             "documentation" => ctx.open_url(egui::OpenUrl::new_tab("https://create.roblox.com/docs")),
             "tutorials" => ctx.open_url(egui::OpenUrl::new_tab("https://create.roblox.com/docs/tutorials")),
             "developer_forum" => ctx.open_url(egui::OpenUrl::new_tab("https://devforum.roblox.com")),
-            "tool_select" => self.tool = Tool::Select,
-            "tool_move" => self.tool = Tool::Move,
-            "tool_scale" => self.tool = Tool::Scale,
-            "tool_rotate" => self.tool = Tool::Rotate,
+            "transform" => self.tool = self.tool.toggle(Tool::Transform),
+            "tool_select" => self.tool = self.tool.toggle(Tool::Select),
+            "tool_move" => self.tool = self.tool.toggle(Tool::Move),
+            "tool_scale" => self.tool = self.tool.toggle(Tool::Scale),
+            "tool_rotate" => self.tool = self.tool.toggle(Tool::Rotate),
             "part" | "part_block" => self.insert_part(MeshKind::Block),
             "part_sphere" => self.insert_part(MeshKind::Ball),
             "part_wedge" => self.insert_part(MeshKind::Wedge),
