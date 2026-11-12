@@ -12,7 +12,8 @@ use glam::Vec3;
 use super::{SelfTest, Step};
 use crate::app::Editor;
 use crate::terrain::Voxels;
-use crate::terrain_editor::{Biome, RegionBox, RegionHandle, Tool};
+use crate::terrain_editor::{RegionBox, RegionHandle, Tool};
+use crate::terrain_gen::Biome;
 use crate::terrain_region::{self as region, Region};
 
 #[derive(Default)]
@@ -34,6 +35,8 @@ pub(super) struct TerrainEdTest {
 }
 
 const SNOW: u8 = 10;
+/// Frames spent drawing on a brand-new place before the hills.
+const EMPTY_DRAW_FRAMES: u64 = 20;
 
 fn voxels(ed: &Editor) -> Voxels {
     match Voxels::from_dom(&ed.doc.dom) {
@@ -55,6 +58,17 @@ fn snow_count(v: &Voxels) -> usize {
     n
 }
 
+/// Looking down on the middle of the place (new_place resets the camera).
+fn look_down(ed: &mut Editor) {
+    ed.cam.mode = crate::camera::CameraMode::Fly;
+    ed.cam.basis = None;
+    ed.cam.pos = Vec3::new(0.0, 90.0, 40.0);
+    ed.cam.focus = Vec3::ZERO;
+    ed.cam.yaw = 0.0;
+    ed.cam.pitch = -1.15;
+    ed.cam.fov_deg = 70.0;
+}
+
 fn button(q: &mut Vec<Event>, p: Pos2, down: bool) {
     q.push(Event::PointerMoved(p));
     q.push(Event::PointerButton { pos: p, button: PointerButton::Primary, pressed: down, modifiers: Modifiers::NONE });
@@ -66,33 +80,52 @@ impl SelfTest {
             if ed.play.is_some() {
                 ed.stop_play();
             }
+            // First a brand-new place, whose Terrain has no SmoothGrid yet:
+            // Draw must still add terrain there (it silently did nothing).
             ed.new_place();
             ed.ui.panel_requests.push((crate::app::Tab::TerrainEditor, Some(true)));
-            ed.terrain_ed.tool = Some(Tool::Generate);
-            ed.terrain_ed.region_pos = [0.0, 16.0, 0.0];
-            ed.terrain_ed.region_size = [128.0, 32.0, 128.0];
-            ed.terrain_ed.biome = Biome::Hills;
-            ed.terrain_ed.gen_water = false;
-            let before = ed.doc.undo_len();
-            ed.terrain_action("generate");
-            self.ted = TerrainEdTest { started: f, undo_before: before, ..Default::default() };
-            // Looking down on the middle of the hills.
-            ed.cam.mode = crate::camera::CameraMode::Fly;
-            ed.cam.basis = None;
-            ed.cam.pos = Vec3::new(0.0, 90.0, 40.0);
-            ed.cam.focus = Vec3::ZERO;
-            ed.cam.yaw = 0.0;
-            ed.cam.pitch = -1.15;
-            ed.cam.fov_deg = 70.0;
+            ed.terrain_ed.tool = Some(Tool::Draw);
+            ed.terrain_ed.material = SNOW;
+            ed.terrain_ed.size = 4.0;
+            ed.terrain_ed.strength = 1.0;
+            self.ted = TerrainEdTest { started: f, ..Default::default() };
+            look_down(ed);
             return false;
         }
-        let t = f - self.ted.started;
+        let raw = f - self.ted.started;
+        if raw < EMPTY_DRAW_FRAMES {
+            let at = ed.viewport_rect.center();
+            match raw {
+                3 => self.queue.push(Event::PointerMoved(at)),
+                5 => button(&mut self.queue, at, true),
+                6..=12 => self.queue.push(Event::PointerMoved(at + Vec2::new((raw - 5) as f32 * 3.0, 0.0))),
+                13 => button(&mut self.queue, at + Vec2::new(21.0, 0.0), false),
+                18 => {
+                    let snow = snow_count(&voxels(ed));
+                    self.ted.ok = snow > 20;
+                    self.ted.notes.push(format!("Draw on a new place (no SmoothGrid yet): {snow} Snow voxels"));
+                    // Then the hills for the rest of the step.
+                    ed.new_place();
+                    look_down(ed);
+                    ed.terrain_ed.tool = Some(Tool::Generate);
+                    ed.terrain_ed.selection = Some(RegionBox::from_studs([0.0, 16.0, 0.0], [128.0, 32.0, 128.0]));
+                    ed.terrain_ed.biomes = Biome::ALL.map(|b| b == Biome::Hills);
+                    self.ted.undo_before = ed.doc.undo_len();
+                    ed.terrain_action("generate");
+                    // It runs on a worker thread; wait for it here.
+                    ed.poll_terrain_job(true);
+                }
+                _ => {}
+            }
+            return false;
+        }
+        let t = raw - EMPTY_DRAW_FRAMES;
         match t {
             10 => {
                 let v = voxels(ed);
                 let open = ed.ui.panels_open.contains("Terrain Editor");
                 let steps = ed.doc.undo_len() - self.ted.undo_before;
-                self.ted.ok = open && v.count() > 1000 && ed.terrain_tris > 0 && steps == 1;
+                self.ted.ok &= open && v.count() > 1000 && ed.terrain_tris > 0 && steps == 1;
                 self.ted.notes.push(format!(
                     "panel open: {open}; Generate: {} voxels, {} triangles, {steps} undo step",
                     v.count(),
@@ -101,7 +134,7 @@ impl SelfTest {
                 self.ted.tris_before = ed.terrain_tris;
                 ed.terrain_ed.tool = Some(Tool::Draw);
                 ed.terrain_ed.material = SNOW;
-                ed.terrain_ed.size = 16.0;
+                ed.terrain_ed.size = 4.0;
                 ed.terrain_ed.strength = 1.0;
                 self.ted.undo_before = ed.doc.undo_len();
                 self.ted.at = ed.viewport_rect.center();
@@ -205,12 +238,12 @@ impl SelfTest {
                 self.ted.ok &= ed.terrain_ed.clipboard.is_some() && n > 50 && left == 0 && steps == 1 && back;
                 self.ted.notes.push(format!("Copy {n} voxels; Delete → {left} left, {steps} undo step; undo → same grid: {back}"));
                 // Move: press on the +X arrow and drag along it.
-                ed.terrain_ed.tool = Some(Tool::Move);
+                ed.terrain_ed.tool = Some(Tool::Transform);
                 self.ted.undo_before = ed.doc.undo_len();
                 let arrow = ed
-                    .region_handles(rect, Tool::Move)
+                    .region_handles(rect, Tool::Transform)
                     .into_iter()
-                    .find(|(h, _)| *h == RegionHandle::Face(0, 1))
+                    .find(|(h, _)| *h == RegionHandle::Arrow(0, 1))
                     .map(|(_, p)| p);
                 match arrow {
                     Some(p) if p.len() == 2 => {
@@ -263,13 +296,13 @@ impl SelfTest {
                 let back = voxels(ed).encode() == self.ted.grid;
                 self.ted.ok &= moved && same && steps == 1 && back;
                 self.ted.notes.push(format!(
-                    "Move drag on +X: box at {:?}, terrain moved with it: {same}, {steps} undo step; undo → same grid: {back}",
+                    "Transform drag on the +X arrow: box at {:?}, terrain moved with it: {same}, {steps} undo step; undo → same grid: {back}",
                     sel.lo
                 ));
                 // Rotate: a quarter turn about Y of the cube in place.
                 let b = self.ted.region;
                 ed.terrain_ed.selection = Some(b);
-                ed.terrain_ed.tool = Some(Tool::Rotate);
+                ed.terrain_ed.tool = Some(Tool::Transform);
                 let u = ed.doc.undo_len();
                 ed.terrain_region_action("rotate_y");
                 let turned = Region::copy(&voxels(ed), b.lo, b.size) == content.rotated(&region::quarter_turns(1, 1));
@@ -293,7 +326,7 @@ impl SelfTest {
                 ed.undo();
                 ed.undo();
                 let back = voxels(ed).encode() == self.ted.grid;
-                self.ted.ok &= snow == 512 && steps == 1 && pasted && paste_steps == 1 && tool == Some(Tool::Move) && back;
+                self.ted.ok &= snow == 512 && steps == 1 && pasted && paste_steps == 1 && tool == Some(Tool::Transform) && back;
                 self.ted.notes.push(format!(
                     "Fill Snow → {snow} Snow voxels, {steps} undo step; Paste over it → the hills again: {pasted} ({paste_steps} step, then {tool:?}); two undos → same grid: {back}"
                 ));

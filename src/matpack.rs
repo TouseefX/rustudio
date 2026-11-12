@@ -346,11 +346,14 @@ pub fn parse_pack(xml: &str) -> Result<Pack, String> {
 /// A decoded pack: two RGBA8 mip chains and a scalar emission mip chain.
 /// `albedo`: colour RGB and its alpha tint mask (not height). `surface`:
 /// normal X/Y (OpenGL convention), roughness, metalness.
+#[derive(Clone)]
 pub struct Maps {
     pub pack: u64,
     pub tiling: f32,
     pub albedo: Vec<u8>,
     pub surface: Vec<u8>,
+    /// Linear height mip chain, independent of the part tint mask.
+    pub height: Vec<u8>,
     /// Scalar emissive mask, linear R8 mip chain.
     pub emissive: Vec<u8>,
     /// Which maps the pack had: colour, normal, roughness, metalness, height.
@@ -518,9 +521,19 @@ fn resized(img: crate::texture::Rgba, size: u32) -> crate::texture::Rgba {
 }
 
 fn build(pack_id: u64, color: u32) -> Result<Maps, String> {
-    let xml = crate::assets::public_cached(pack_id)?;
-    let pack =
-        parse_pack(&String::from_utf8_lossy(&xml)).map_err(|e| format!("pack {pack_id}: {e}"))?;
+    if pack_id & ACR_BIT != 0 {
+        // Studio's own terrain textures, else the pack's maps.
+        let base = pack_id & !ACR_BIT;
+        return build_acr(base).or_else(|why| {
+            eprintln!("terrain pack {base}: {why}; using its maps");
+            build(base, color).map(|m| Maps { pack: pack_id, ..m })
+        });
+    }
+    let registered = variant_packs().lock().expect("variant packs").get(&pack_id).cloned();
+    let pack = if let Some(pack) = registered { pack } else {
+        let xml = crate::assets::public_cached(pack_id)?;
+        parse_pack(&String::from_utf8_lossy(&xml)).map_err(|e| format!("pack {pack_id}: {e}"))?
+    };
     let n = (LAYER_SIZE * LAYER_SIZE) as usize;
     let get = |id: Option<u64>| -> Result<Option<crate::texture::Rgba>, String> {
         id.map(image).transpose()
@@ -564,9 +577,53 @@ fn build(pack_id: u64, color: u32) -> Result<Maps, String> {
         tiling: 1.0,
         albedo: mip_chain(&albedo, true),
         surface: mip_chain(&surface, false),
+        height: height_chain(height.as_ref()),
         emissive: mip_chain(&emissive, false).into_iter().step_by(4).collect(),
         found,
     })
+}
+
+/// Keep height linear through every mip; colour alpha remains a part tint mask.
+fn height_chain(image: Option<&crate::texture::Rgba>) -> Vec<u8> {
+    let n = (LAYER_SIZE * LAYER_SIZE) as usize;
+    let mut rgba = vec![128; n * 4];
+    if let Some(image) = image {
+        for (dst, src) in rgba.chunks_exact_mut(4).zip(image.pixels.chunks_exact(4)) {
+            dst.fill(src[0]);
+        }
+    }
+    mip_chain(&rgba, false).into_iter().step_by(4).collect()
+}
+
+/// Terrain uses height in albedo alpha, while parts use the original tint mask.
+/// Give this view a separate atlas cache key so sharing a pack cannot change parts.
+pub fn terrain_pack_maps(pack: u64, color: u32) -> Lookup {
+    // Table packs come as Studio's KTX2 textures; MaterialVariant packs
+    // (registered, bit 62) only have their maps.
+    let pack = if acr_enabled() && pack & (1u64 << 62) == 0 { pack | ACR_BIT } else { pack };
+    match pack_maps(pack, color) {
+        Lookup::Ready(maps) => {
+            static TERRAIN: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<u64, Arc<Maps>>>> = std::sync::OnceLock::new();
+            let mut cache = TERRAIN.get_or_init(Default::default).lock().expect("terrain maps");
+            if let Some(terrain) = cache.get(&pack) {
+                return Lookup::Ready(terrain.clone());
+            }
+            let mut terrain = (*maps).clone();
+            terrain.pack |= 1u64 << 63;
+            // The tint mask (colour alpha) moves to the surface map's alpha
+            // (metalness, unused by terrain) for CB4's tint form.
+            for (s, a) in terrain.surface.chunks_exact_mut(4).zip(terrain.albedo.chunks_exact(4)) {
+                s[3] = a[3];
+            }
+            for (pixel, height) in terrain.albedo.chunks_exact_mut(4).zip(&terrain.height) {
+                pixel[3] = *height;
+            }
+            let terrain = Arc::new(terrain);
+            cache.insert(pack, terrain.clone());
+            Lookup::Ready(terrain)
+        }
+        other => other,
+    }
 }
 
 /// LAYER_SIZE² RGBA8 plus its mips down to 1×1. `squared`: RGB averaged as
@@ -619,6 +676,22 @@ pub fn mip_levels() -> Vec<(usize, u32)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn terrain_height_mips_are_linear_and_use_red() {
+        let image = crate::texture::Rgba {
+            width: LAYER_SIZE, height: LAYER_SIZE,
+            pixels: [64, 190, 220, 255].repeat((LAYER_SIZE * LAYER_SIZE) as usize),
+        };
+        assert!(height_chain(Some(&image)).iter().all(|v| *v == 64));
+        assert!(height_chain(None).iter().all(|v| *v == 128));
+        let mut alternating = image;
+        for (i, pixel) in alternating.pixels.chunks_exact_mut(4).enumerate() {
+            pixel[0] = if i % 2 == 0 { 0 } else { 128 };
+        }
+        let chain = height_chain(Some(&alternating));
+        assert!(chain[(LAYER_SIZE * LAYER_SIZE) as usize..].iter().all(|v| *v == 64));
+    }
 
     #[test]
     fn tables_follow_studio() {
@@ -711,5 +784,305 @@ mod material_shading_contract {
             let studio = 4.0 * (1.35 * color).powi(4);
             assert!((studio - expected).abs() < 0.00001);
         }
+    }
+}
+
+fn variant_packs() -> &'static Mutex<HashMap<u64, Pack>> {
+    static PACKS: OnceLock<Mutex<HashMap<u64, Pack>>> = OnceLock::new();
+    PACKS.get_or_init(Default::default)
+}
+
+/// Route authored terrain maps through the regular asynchronous pack loader.
+pub fn register_terrain_variant(pack: Pack) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    [pack.color, pack.normal, pack.roughness, pack.metalness, pack.height].hash(&mut h);
+    let id = (h.finish() & ((1u64 << 62) - 1)) | (1u64 << 62);
+    variant_packs().lock().expect("variant packs").entry(id).or_insert(pack);
+    id
+}
+
+// ------------------------------------------------- terrain packs as Studio has them
+//
+// Studio draws terrain from the representations assetdelivery transcodes each
+// TexturePack into (asked for with assetType TexturePack, a
+// contentRepresentationPriorityList of `ktx2` / `7rdo` and
+// doNotFallbackToBaselineRepresentation): three KTX2 textures, BC1 / BC3 with
+// zstd supercompression, 512² (pre-2022 packs) or 1024² (2022 packs), full
+// mip chains. Studio fills its 512² terrain arrays from them
+// ("Terrain TextureArray 512x512, arraySize: 37, mip: 10" in its log):
+// - fidelity AkA= (02 40): albedo as YCoCg, R = Co + ½, G = Y, B = Cg + ½;
+// - fidelity IkA= (22 40): normal, X in A, Y in G (same axes as the pack's
+//   normal map);
+// - fidelity QkA= (42 40): G roughness, B emissive mask, A height.
+// Their albedo is not the pack's colour map: ~7 levels darker on Brick.
+// The raw maps stay the fallback (offline without a cache, or
+// RUSTUDIO_TERRAIN_ACR=0).
+
+/// Key bit: the pack's maps built from its KTX2 representations.
+const ACR_BIT: u64 = 1 << 61;
+
+/// The three representations: (priority list, base64 of
+/// [{"format":"ktx2","majorVersion":"7rdo","fidelity":…}], fidelity bytes).
+const ACR_REPS: [(&str, &str); 3] = [
+    ("W3siZm9ybWF0Ijoia3R4MiIsIm1ham9yVmVyc2lvbiI6IjdyZG8iLCJmaWRlbGl0eSI6IkFrQT0ifV0=", "0240"),
+    ("W3siZm9ybWF0Ijoia3R4MiIsIm1ham9yVmVyc2lvbiI6IjdyZG8iLCJmaWRlbGl0eSI6IklrQT0ifV0=", "2240"),
+    ("W3siZm9ybWF0Ijoia3R4MiIsIm1ham9yVmVyc2lvbiI6IjdyZG8iLCJmaWRlbGl0eSI6IlFrQT0ifV0=", "4240"),
+];
+
+fn acr_enabled() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| !std::env::var("RUSTUDIO_TERRAIN_ACR").is_ok_and(|v| v == "0"))
+}
+
+/// One KTX2 representation of a pack: the disk cache, else assetdelivery
+/// (anonymous, as for public assets).
+fn acr_bytes(pack: u64, rep: usize) -> Result<Vec<u8>, String> {
+    let (list, fid) = ACR_REPS[rep];
+    let path = crate::assets::cache_dir().join("assets").join(format!("{pack}_acr_ktx2-7rdo-{fid}.ktx2"));
+    if let Ok(b) = std::fs::read(&path) {
+        return Ok(b);
+    }
+    use std::io::Read;
+    let agent = rustudio_account::api::agent();
+    let body = format!(
+        "[{{\"assetId\":{pack},\"contentRepresentationPriorityList\":\"{list}\",\
+         \"doNotFallbackToBaselineRepresentation\":\"true\",\"assetType\":\"TexturePack\",\"requestId\":\"0\"}}]"
+    );
+    let mut r = agent
+        .post("https://assetdelivery.roblox.com/v1/assets/batch")
+        .header("Content-Type", "application/json")
+        .send(body.as_str())
+        .map_err(|e| format!("pack {pack} ktx2: {e}"))?;
+    let text = r.body_mut().read_to_string().map_err(|e| format!("pack {pack} ktx2: {e}"))?;
+    let v: serde_json::Value = serde_json::from_str(&text).map_err(|_| format!("pack {pack} ktx2: HTTP {}", r.status()))?;
+    let loc = v.pointer("/0/location").and_then(|l| l.as_str())
+        .ok_or_else(|| format!("pack {pack} ktx2: no location ({})", text.chars().take(120).collect::<String>()))?;
+    let mut r = agent.get(loc).header("Accept-Encoding", "gzip").call().map_err(|e| format!("pack {pack} ktx2: {e}"))?;
+    let mut bytes = Vec::new();
+    r.body_mut().with_config().limit(64 << 20).reader().read_to_end(&mut bytes).map_err(|e| e.to_string())?;
+    if bytes.starts_with(&[0x1f, 0x8b]) {
+        let mut out = Vec::new();
+        flate2::read::GzDecoder::new(&bytes[..]).read_to_end(&mut out).map_err(|e| e.to_string())?;
+        bytes = out;
+    }
+    if !bytes.starts_with(KTX2_MAGIC) {
+        return Err(format!("pack {pack} ktx2: not a KTX2 file"));
+    }
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    let _ = std::fs::write(&path, &bytes);
+    Ok(bytes)
+}
+
+const KTX2_MAGIC: &[u8] = b"\xabKTX 20\xbb\r\n\x1a\n";
+
+/// A KTX2 file's mip levels as RGBA8 (square 2D BC1 / BC3, zstd or none).
+pub fn ktx2_levels(d: &[u8]) -> Result<Vec<(u32, Vec<u8>)>, String> {
+    let u32_at = |o: usize| d.get(o..o + 4).map(|b| u32::from_le_bytes(b.try_into().unwrap())).ok_or("short KTX2");
+    let u64_at = |o: usize| d.get(o..o + 8).map(|b| u64::from_le_bytes(b.try_into().unwrap())).ok_or("short KTX2");
+    if !d.starts_with(KTX2_MAGIC) {
+        return Err("not a KTX2 file".into());
+    }
+    let (format, width, levels, scheme) = (u32_at(12)?, u32_at(20)?, u32_at(40)?.max(1), u32_at(44)?);
+    let block: fn(&[u8], &mut [[u8; 4]; 16]) = match format {
+        131..=134 => bc1_block,
+        137 | 138 => bc3_block,
+        f => return Err(format!("KTX2 format {f} isn't BC1 / BC3")),
+    };
+    let stride = if format <= 134 { 8 } else { 16 };
+    let mut out = Vec::new();
+    for l in 0..levels as usize {
+        let (off, len, raw) = (u64_at(80 + l * 24)? as usize, u64_at(88 + l * 24)? as usize, u64_at(96 + l * 24)? as usize);
+        let blob = d.get(off..off + len).ok_or("short KTX2 level")?;
+        let data = match scheme {
+            0 => blob.to_vec(),
+            2 => zstd::bulk::decompress(blob, raw).map_err(|e| format!("KTX2 zstd: {e}"))?,
+            s => return Err(format!("KTX2 supercompression {s}")),
+        };
+        let size = (width >> l).max(1);
+        let blocks = size.div_ceil(4) as usize;
+        let mut rgba = vec![0u8; (size * size * 4) as usize];
+        let mut px = [[0u8; 4]; 16];
+        for by in 0..blocks {
+            for bx in 0..blocks {
+                let at = (by * blocks + bx) * stride;
+                block(data.get(at..at + stride).ok_or("short KTX2 blocks")?, &mut px);
+                for (i, p) in px.iter().enumerate() {
+                    let (x, y) = (bx * 4 + i % 4, by * 4 + i / 4);
+                    if x < size as usize && y < size as usize {
+                        let o = (y * size as usize + x) * 4;
+                        rgba[o..o + 4].copy_from_slice(p);
+                    }
+                }
+            }
+        }
+        out.push((size, rgba));
+    }
+    Ok(out)
+}
+
+fn rgb565(c: u16) -> [u32; 3] {
+    let (r, g, b) = ((c >> 11) as u32 & 31, (c >> 5) as u32 & 63, c as u32 & 31);
+    [(r << 3) | (r >> 2), (g << 2) | (g >> 4), (b << 3) | (b >> 2)]
+}
+
+/// A BC1 block's colour (RGB block: the 3-colour mode's fourth entry is black).
+fn bc1_colors(b: &[u8], four: bool, px: &mut [[u8; 4]; 16]) {
+    let (c0, c1) = (u16::from_le_bytes([b[0], b[1]]), u16::from_le_bytes([b[2], b[3]]));
+    let (a, z) = (rgb565(c0), rgb565(c1));
+    let mix = |wa: u32, wz: u32, d: u32| [0, 1, 2].map(|i| ((a[i] * wa + z[i] * wz + d / 2) / d) as u8);
+    let pal: [[u8; 3]; 4] = if four || c0 > c1 {
+        [a.map(|v| v as u8), z.map(|v| v as u8), mix(2, 1, 3), mix(1, 2, 3)]
+    } else {
+        [a.map(|v| v as u8), z.map(|v| v as u8), mix(1, 1, 2), [0, 0, 0]]
+    };
+    let idx = u32::from_le_bytes([b[4], b[5], b[6], b[7]]);
+    for (i, p) in px.iter_mut().enumerate() {
+        let c = pal[((idx >> (2 * i)) & 3) as usize];
+        p[..3].copy_from_slice(&c);
+    }
+}
+
+fn bc1_block(b: &[u8], px: &mut [[u8; 4]; 16]) {
+    bc1_colors(b, false, px);
+    px.iter_mut().for_each(|p| p[3] = 255);
+}
+
+fn bc3_block(b: &[u8], px: &mut [[u8; 4]; 16]) {
+    let (a0, a1) = (b[0] as u32, b[1] as u32);
+    let mut pal = [0u8; 8];
+    pal[0] = a0 as u8;
+    pal[1] = a1 as u8;
+    if a0 > a1 {
+        for i in 1..7u32 {
+            pal[i as usize + 1] = (((7 - i) * a0 + i * a1 + 3) / 7) as u8;
+        }
+    } else {
+        for i in 1..5u32 {
+            pal[i as usize + 1] = (((5 - i) * a0 + i * a1 + 2) / 5) as u8;
+        }
+        pal[6] = 0;
+        pal[7] = 255;
+    }
+    let bits = b[2..8].iter().rev().fold(0u64, |acc, &x| (acc << 8) | x as u64);
+    bc1_colors(&b[8..16], true, px);
+    for (i, p) in px.iter_mut().enumerate() {
+        p[3] = pal[((bits >> (3 * i)) & 7) as usize];
+    }
+}
+
+/// The level of a KTX2 chain for a `LAYER_SIZE >> k` texture: the chain's
+/// own level, or its top level repeated up (nearest) when the KTX2 is smaller.
+fn acr_level(levels: &[(u32, Vec<u8>)], size: u32) -> Vec<u8> {
+    if let Some((_, px)) = levels.iter().find(|(s, _)| *s == size) {
+        return px.clone();
+    }
+    let (top, px) = &levels[0];
+    if size > *top {
+        let k = (size / top) as usize;
+        let mut out = vec![0u8; (size * size * 4) as usize];
+        for y in 0..size as usize {
+            for x in 0..size as usize {
+                let s = ((y / k) * *top as usize + x / k) * 4;
+                out[(y * size as usize + x) * 4..][..4].copy_from_slice(&px[s..s + 4]);
+            }
+        }
+        return out;
+    }
+    // A chain stopping short of 1×1: average the last level down.
+    let (mut s, mut cur) = levels.last().map(|(s, p)| (*s, p.clone())).unwrap();
+    while s > size {
+        let h = s / 2;
+        let mut next = vec![0u8; (h * h * 4) as usize];
+        for y in 0..h as usize {
+            for x in 0..h as usize {
+                for c in 0..4 {
+                    let at = |dx: usize, dy: usize| cur[((y * 2 + dy) * s as usize + x * 2 + dx) * 4 + c] as u32;
+                    next[(y * h as usize + x) * 4 + c] = ((at(0, 0) + at(1, 0) + at(0, 1) + at(1, 1) + 2) / 4) as u8;
+                }
+            }
+        }
+        cur = next;
+        s = h;
+    }
+    cur
+}
+
+/// A terrain pack's maps from its KTX2 representations, laid out like
+/// `build`'s (albedo sRGB RGB, surface normal X / Y / roughness / 0, linear
+/// height and emissive), one mip chain level per KTX2 level.
+fn build_acr(pack: u64) -> Result<Maps, String> {
+    let reps = (0..3).map(|i| acr_bytes(pack, i).and_then(|b| ktx2_levels(&b)))
+        .collect::<Result<Vec<_>, _>>()?;
+    let (mut albedo, mut surface, mut height, mut emissive) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+    // Pre-2022 packs come as YCoCg, 2022 packs as RGB + tint mask.
+    let ycocg = crate::terrain_mat::pre2022_pack(pack);
+    for (_, size) in mip_levels() {
+        let [a, n, s] = [0, 1, 2].map(|i| acr_level(&reps[i], size));
+        for ((a, n), s) in a.chunks_exact(4).zip(n.chunks_exact(4)).zip(s.chunks_exact(4)) {
+            if ycocg {
+                let (co, y, cg) = (a[0] as f32 / 255.0 - 0.5, a[1] as f32 / 255.0, a[2] as f32 / 255.0 - 0.5);
+                let q = |v: f32| (v.clamp(0.0, 1.0) * 255.0 + 0.5) as u8;
+                albedo.extend_from_slice(&[q(y - cg + co), q(y + cg), q(y - cg - co), 255]);
+            } else {
+                albedo.extend_from_slice(a);
+            }
+            surface.extend_from_slice(&[n[3], n[1], s[1], 0]);
+            height.push(s[3]);
+            emissive.push(s[2]);
+        }
+    }
+    Ok(Maps { pack: pack | ACR_BIT, tiling: 1.0, albedo, surface, height, emissive, found: [true, true, true, false, true] })
+}
+
+#[cfg(test)]
+mod ktx2_tests {
+    use super::*;
+
+    /// A one-level 4×4 KTX2 holding one block, uncompressed.
+    fn ktx2(format: u32, block: &[u8]) -> Vec<u8> {
+        let mut d = KTX2_MAGIC.to_vec();
+        for v in [format, 1, 4, 4, 0, 0, 1, 1, 0] {
+            d.extend_from_slice(&v.to_le_bytes());
+        }
+        d.resize(80, 0);
+        for v in [104u64, block.len() as u64, block.len() as u64] {
+            d.extend_from_slice(&v.to_le_bytes());
+        }
+        d.extend_from_slice(block);
+        d
+    }
+
+    #[test]
+    fn bc1_and_bc3_blocks_decode() {
+        // BC1: c0 white, c1 black, four-colour mode; texels 0,1,2,3 cycling.
+        let bc1 = [0xff, 0xff, 0, 0, 0b1110_0100, 0b1110_0100, 0b1110_0100, 0b1110_0100];
+        let l = ktx2_levels(&ktx2(131, &bc1)).unwrap();
+        let px = &l[0].1;
+        assert_eq!(&px[0..4], &[255, 255, 255, 255]);
+        assert_eq!(&px[4..8], &[0, 0, 0, 255]);
+        assert_eq!(&px[8..12], &[170, 170, 170, 255]);
+        assert_eq!(&px[12..16], &[85, 85, 85, 255]);
+        // BC3: alpha 200 / 100 (8-value mode), every index 1 → 100; colour as above.
+        let mut bc3 = vec![200, 100];
+        bc3.extend_from_slice(&[0b0100_1001, 0b1001_0010, 0b0010_0100, 0b0100_1001, 0b1001_0010, 0b0010_0100]);
+        bc3.extend_from_slice(&bc1);
+        let l = ktx2_levels(&ktx2(137, &bc3)).unwrap();
+        assert!(l[0].1.chunks_exact(4).all(|p| p[3] == 100));
+        assert_eq!(&l[0].1[8..11], &[170, 170, 170]);
+    }
+
+    #[test]
+    fn acr_levels_fill_the_layer_chain() {
+        let levels = vec![(2u32, vec![10, 20, 30, 40, 50, 60, 70, 80, 90, 100, 110, 120, 130, 140, 150, 160]), (1, vec![1, 2, 3, 4])];
+        // Bigger than the chain: nearest repeat of the top level.
+        let up = acr_level(&levels, 4);
+        assert_eq!(&up[0..4], &[10, 20, 30, 40]);
+        assert_eq!(&up[4..8], &[10, 20, 30, 40]);
+        assert_eq!(&up[8..12], &[50, 60, 70, 80]);
+        // Its own level when it has one.
+        assert_eq!(acr_level(&levels, 1), vec![1, 2, 3, 4]);
     }
 }

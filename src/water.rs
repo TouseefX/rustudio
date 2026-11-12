@@ -196,9 +196,12 @@ impl WaterPass {
         let b = (a + 1.0).rem_euclid(n);
         // Waves (SmoothWater VS): y += (sin((z − x)k − φ) + sin((z + x)k + φ)) × amplitude.
         let phase = look.time * look.wave_speed * crate::mech::WATER_WAVE_PHASE_PER_SPEED;
-        // Depth blend toward the water colour: clear water shows deeper.
+        // Depth blend toward the water colour (Studio's CB3[2], updateWater
+        // Studio): cover = clamp(depth × T / (1990 T + 10) + 1 − T), T
+        // the transparency: at 0.3 a 50-stud bottom shows 28 %, the sky
+        // under 500 studs of water 6 %.
         let clear = look.transparency.clamp(0.0, 1.0);
-        let scale = crate::mech::WATER_DEPTH_SCALE * (1.0 - clear) / (clear + crate::mech::WATER_DEPTH_SOFT);
+        let scale = clear / (1990.0 * clear + 10.0);
         WaterRaw {
             wave: [
                 crate::mech::WATER_WAVE_NUMBER,
@@ -206,7 +209,7 @@ impl WaterPass {
                 look.wave_size.max(0.0) * crate::mech::WATER_WAVE_AMPLITUDE,
                 t.fract(),
             ],
-            frames: [a, b, scale, 0.0],
+            frames: [a, b, scale, 1.0 - clear],
             view: [size[0] as f32, size[1] as f32, crate::mech::WATER_WAVE_FADE, crate::mech::NEAR],
         }
     }

@@ -1445,36 +1445,28 @@ struct TerrainParams {
 };
 @group(1) @binding(0) var<uniform> tp: TerrainParams;
 
-const TERRAIN_AXES = array<vec3<f32>, 18>(
-    vec3<f32>(1.0, 0.0, 0.0), vec3<f32>(-1.0, 0.0, 0.0),
-    vec3<f32>(0.0, 1.0, 0.0), vec3<f32>(0.0, -1.0, 0.0),
-    vec3<f32>(0.0, 0.0, 1.0), vec3<f32>(0.0, 0.0, -1.0),
-    vec3<f32>(0.70710678, 0.70710678, 0.0), vec3<f32>(-0.70710678, 0.70710678, 0.0),
-    vec3<f32>(0.70710678, -0.70710678, 0.0), vec3<f32>(-0.70710678, -0.70710678, 0.0),
-    vec3<f32>(0.0, 0.70710678, 0.70710678), vec3<f32>(0.0, -0.70710678, 0.70710678),
-    vec3<f32>(0.0, 0.70710678, -0.70710678), vec3<f32>(0.0, -0.70710678, -0.70710678),
-    vec3<f32>(0.70710678, 0.0, 0.70710678), vec3<f32>(-0.70710678, 0.0, 0.70710678),
-    vec3<f32>(0.70710678, 0.0, -0.70710678), vec3<f32>(-0.70710678, 0.0, -0.70710678),
+// Studio's 18 projection axes (terrain.rs AXIS_U / AXIS_V: its CB2 axisU /
+// axisV, 0.7 on the diagonals): 0–7 the XZ plane, 8–12 up, 13–17 down.
+const TERRAIN_U = array<vec3<f32>, 18>(
+    vec3<f32>(0.0, 0.0, -1.0), vec3<f32>(0.0, 0.0, 1.0), vec3<f32>(1.0, 0.0, 0.0), vec3<f32>(-1.0, 0.0, 0.0),
+    vec3<f32>(0.7, 0.0, -0.7), vec3<f32>(-0.7, 0.0, -0.7), vec3<f32>(0.7, 0.0, 0.7), vec3<f32>(-0.7, 0.0, 0.7),
+    vec3<f32>(-1.0, 0.0, 0.0), vec3<f32>(-0.7, 0.7, 0.0), vec3<f32>(-0.7, -0.7, 0.0), vec3<f32>(-1.0, 0.0, 0.0), vec3<f32>(-1.0, 0.0, 0.0),
+    vec3<f32>(-1.0, 0.0, 0.0), vec3<f32>(-0.7, -0.7, 0.0), vec3<f32>(-0.7, 0.7, 0.0), vec3<f32>(-1.0, 0.0, 0.0), vec3<f32>(-1.0, 0.0, 0.0),
+);
+const TERRAIN_V = array<vec3<f32>, 18>(
+    vec3<f32>(0.0, -1.0, 0.0), vec3<f32>(0.0, -1.0, 0.0), vec3<f32>(0.0, -1.0, 0.0), vec3<f32>(0.0, -1.0, 0.0),
+    vec3<f32>(0.0, -1.0, 0.0), vec3<f32>(0.0, -1.0, 0.0), vec3<f32>(0.0, -1.0, 0.0), vec3<f32>(0.0, -1.0, 0.0),
+    vec3<f32>(0.0, 0.0, -1.0), vec3<f32>(0.0, 0.0, -1.0), vec3<f32>(0.0, 0.0, -1.0), vec3<f32>(0.0, 0.7, -0.7), vec3<f32>(0.0, -0.7, -0.7),
+    vec3<f32>(0.0, 0.0, 1.0), vec3<f32>(0.0, 0.0, 1.0), vec3<f32>(0.0, 0.0, 1.0), vec3<f32>(0.0, 0.7, 0.7), vec3<f32>(0.0, -0.7, 0.7),
 );
 
-/// The texture plane of a projection axis: (U, V), V up the image where it can be.
-fn terrain_frame(axis: u32) -> mat2x3<f32> {
-    let d = TERRAIN_AXES[min(axis, 17u)];
-    var up = vec3<f32>(0.0, 1.0, 0.0);
-    if (abs(d.y) > 0.9) {
-        up = vec3<f32>(0.0, 0.0, -1.0);
-    }
-    let u = normalize(cross(up, d));
-    let v = cross(d, u);
-    return mat2x3<f32>(u, v);
-}
-
-/// A corner's texture coordinate at `p`: projected, tiled, turned and moved
-/// by the corner's random byte (Studio's detiling).
+/// A corner's texture coordinate at `p` (SmoothCluster VS): (P·U, P·V) ×
+/// tiling, turned by (r/128 − 1) × rotation and moved by
+/// (r, ⌊2.6651442 r⌋) × 1/detiling, r the corner's cell byte.
 fn terrain_uv(p: vec3<f32>, pal: u32, axis: u32, rnd: u32) -> vec2<f32> {
     let a = tp.p[pal * 4u];
-    let f = terrain_frame(axis);
-    let uv = vec2<f32>(dot(p, f[0]), -dot(p, f[1])) * a.x;
+    let i = min(axis, 17u);
+    let uv = vec2<f32>(dot(p, TERRAIN_U[i]), dot(p, TERRAIN_V[i])) * a.x;
     let r = (f32(rnd) / 128.0 - 1.0) * a.z;
     let turned = uv * sqrt(max(1.0 - r * r, 0.0)) + uv.yx * vec2<f32>(r, -r);
     let k = f32(rnd);
@@ -1517,55 +1509,58 @@ fn ycocg(c: vec3<f32>) -> vec3<f32> {
     return vec3<f32>((c.r + 2.0 * c.g + c.b) * 0.25, (c.r - c.b) * 0.5, (2.0 * c.g - c.r - c.b) * 0.25);
 }
 
-/// One corner's sample: recoloured albedo (sRGB), height, world normal, roughness.
+/// One corner's texels (SmoothCluster FS HQ reads three arrays at the
+/// corner's coordinate): recoloured albedo as YCoCg, height, the normal
+/// map's X / Y, roughness and the emissive mask.
 struct TerrainSample {
-    albedo: vec3<f32>,
+    ycocg: vec3<f32>,
     height: f32,
-    n: vec3<f32>,
+    nxy: vec2<f32>,
     rough: f32,
+    glow: f32,
 };
 
-fn terrain_sample(uv: vec2<f32>, dx: vec2<f32>, dy: vec2<f32>, pal: u32, axis: u32, rnd: u32, n: vec3<f32>) -> TerrainSample {
+fn terrain_sample(uv: vec2<f32>, dx: vec2<f32>, dy: vec2<f32>, pal: u32) -> TerrainSample {
     var s: TerrainSample;
     let a = tp.p[pal * 4u];
     let layer = i32(a.w);
-    s.n = n;
     // Without its pack (not loaded, or packs off) a material shows its
     // average albedo (the colour table's avgAlbedo), recoloured like a texel:
     // what Studio draws before its texture arrays fill.
     var t = vec4<f32>(tp.p[pal * 4u + 3u].rgb, 0.5);
     var su = vec4<f32>(0.5, 0.5, 1.0, 0.0);
+    var glow = 0.0;
     if (layer >= 0) {
-        t = textureSampleGrad(mat_albedo, studs_sampler, uv, layer, dx, dy);
-        su = textureSampleGrad(mat_surface, studs_sampler, uv, layer, dx, dy);
+        // Studio's terrain arrays are 512² (a 1024² pack drops its top
+        // level), which is level 1 of the 1024² layer: never finer than that
+        // (magnified, Studio filters its 512² level).
+        let fp = max(length(dx), length(dy)) * 1024.0;
+        let k = select(1.0, 2.0 / max(fp, 1e-6), fp < 2.0);
+        t = textureSampleGrad(mat_albedo, studs_sampler, uv, layer, dx * k, dy * k);
+        su = textureSampleGrad(mat_surface, studs_sampler, uv, layer, dx * k, dy * k);
+        glow = textureSampleGrad(mat_emission, studs_sampler, uv, layer, dx * k, dy * k).r;
     }
+    // MaterialColors recolour (luma scale, chroma turn): Studio bakes it
+    // into the array texels, so it blends as YCoCg.
     let rc = tp.p[pal * 4u + 2u];
-    let y = ycocg(t.rgb);
-    let co = rc.y * y.y - rc.z * y.z;
-    let cg = rc.z * y.y + rc.y * y.z;
-    let l = y.x * rc.x;
-    s.albedo = clamp(vec3<f32>(l - cg + co, l + cg, l - cg - co), vec3<f32>(0.0), vec3<f32>(1.0));
-    s.height = t.a;
-    s.rough = 0.089 + 0.911 * su.b;
-    if (layer < 0) {
+    // A 2022 or MaterialService override layer takes CB4's tint form instead:
+    // albedo × mix(1, MaterialColor, tint mask) (row 2 = colour, .w = 1; the
+    // mask rides in the surface map's alpha).
+    var y = ycocg(t.rgb);
+    if (rc.w > 0.5) {
+        let ty = ycocg(t.rgb * mix(vec3<f32>(1.0), rc.rgb, su.a));
+        s.ycocg = ty;
+        s.height = t.a;
+        s.nxy = su.rg;
+        s.rough = su.b;
+        s.glow = glow;
         return s;
     }
-    // Normal map (X right, Y up the image) in the corner's projection frame,
-    // turned with the texture.
-    let xy = su.rg * 2.0 - vec2<f32>(1.0);
-    let z = sqrt(clamp(1.0 - dot(xy, xy), 0.0, 1.0));
-    let f = terrain_frame(axis);
-    let r = (f32(rnd) / 128.0 - 1.0) * a.z;
-    let c = sqrt(max(1.0 - r * r, 0.0));
-    // uv' = R uv: the image axes in world space.
-    let tu = f[0] * c - f[1] * r;
-    let tv = -(f[0] * r + f[1] * c);
-    let tn = normalize(tu - n * dot(tu, n));
-    let bn = normalize(tv - n * dot(tv, n));
-    let bent = tn * xy.x - bn * xy.y + n * z;
-    if (dot(bent, bent) > 1e-8) {
-        s.n = normalize(bent);
-    }
+    s.ycocg = vec3<f32>(y.x * rc.x, rc.y * y.y - rc.z * y.z, rc.z * y.y + rc.y * y.z);
+    s.height = t.a;
+    s.nxy = su.rg;
+    s.rough = su.b;
+    s.glow = glow;
     return s;
 }
 
@@ -1578,9 +1573,9 @@ fn fs_terrain(in: TerrainOut) -> @location(0) vec4<f32> {
     let d1y = dpdy(in.uv01.zw);
     let d2x = dpdx(in.uv2);
     let d2y = dpdy(in.uv2);
-    let s0 = terrain_sample(in.uv01.xy, d0x, d0y, in.palette.x, in.axis.x, in.rnd.x, n0);
-    let s1 = terrain_sample(in.uv01.zw, d1x, d1y, in.palette.y, in.axis.y, in.rnd.y, n0);
-    let s2 = terrain_sample(in.uv2, d2x, d2y, in.palette.z, in.axis.z, in.rnd.z, n0);
+    let s0 = terrain_sample(in.uv01.xy, d0x, d0y, in.palette.x);
+    let s1 = terrain_sample(in.uv01.zw, d1x, d1y, in.palette.y);
+    let s2 = terrain_sample(in.uv2, d2x, d2y, in.palette.z);
     // Height blend (FS HQ): each corner's height remapped and weighted by its
     // barycentric; the highest wins over a softness of bary · sharpness; back
     // to plain barycentrics as the texture gets small on screen.
@@ -1598,15 +1593,33 @@ fn fs_terrain(in: TerrainOut) -> @location(0) vec4<f32> {
     w = w / max(w.x + w.y + w.z, 1e-4);
     let far = clamp(sqrt(max(dot(d0x, d0x), dot(d0y, d0y))) * 7.0, 0.0, 1.0);
     w = mix(w, in.bary, far);
-    var albedo = s0.albedo * w.x + s1.albedo * w.y + s2.albedo * w.z;
-    var n = normalize(s0.n * w.x + s1.n * w.y + s2.n * w.z);
+    // Albedo: the corners' YCoCg texels blended, then R = Y − Cg + Co,
+    // G = Y + Cg, B = Y − Cg − Co, unclamped (squared below).
+    let yc = s0.ycocg * w.x + s1.ycocg * w.y + s2.ycocg * w.z;
+    var albedo = vec3<f32>(yc.x - yc.z + yc.y, yc.x + yc.z, yc.x - yc.z - yc.y);
+    // Normal (FS HQ): the corners' normal texels blended, the bump
+    // strengthened by 1/|w| (blending flattens it), in Studio's fixed frame:
+    // tangent (N.z, 0, −N.x) and bitangent (0, 1, 0) for corners on axes
+    // 0–7 (the XZ plane), (−N.y, N.x, 0) and (0, −N.z, N.y) for axes 8–17
+    // (up and down), blended by the weights.
+    let nt = (s0.nxy * w.x + s1.nxy * w.y + s2.nxy * w.z) * 2.0 - vec2<f32>(1.0);
+    let nz = sqrt(clamp(1.0 - dot(nt, nt), 0.0, 1.0));
+    let nb = normalize((vec3<f32>(nt, nz) - vec3<f32>(0.0, 0.0, 1.0)) * inverseSqrt(max(dot(w, w), 1e-4)) + vec3<f32>(0.0, 0.0, 1.0));
+    let edge = dot(vec3<f32>(vec3<u32>(in.axis.x, in.axis.y, in.axis.z) > vec3<u32>(7u)), w);
+    let tan = mix(vec3<f32>(n0.z, 0.0, -n0.x), vec3<f32>(-n0.y, n0.x, 0.0), edge);
+    let bit = mix(vec3<f32>(0.0, 1.0, 0.0), vec3<f32>(0.0, -n0.z, n0.y), edge);
+    var n = normalize(tan * nb.x + bit * nb.y + n0 * nb.z);
     if (in.palette.w > 0u) {
         // A grass blade: the ground's colour, darker, a little varied per blade.
         albedo = albedo * GRASS_BLADE_SHADE * (0.85 + 0.3 * f32(in.rnd.x) / 255.0);
         n = n0;
     }
-    let rough = s0.rough * w.x + s1.rough * w.y + s2.rough * w.z;
-    let base = sq(albedo);
+    let rough = 0.089 + 0.911 * (s0.rough * w.x + s1.rough * w.y + s2.rough * w.z);
+    // Emission (FS HQ: Σ bary × the material's emissive strength (tint
+    // white), × the blended mask).
+    let glow_k = dot(in.bary, vec3<f32>(b0.w, b1.w, b2.w));
+    let glow = vec3<f32>(glow_k * (s0.glow * w.x + s1.glow * w.y + s2.glow * w.z));
+    let base = albedo * albedo;
 
     let l = normalize(g.sun_dir.xyz);
     let ndl = max(dot(n, l), 0.0);
@@ -1614,21 +1627,33 @@ fn fs_terrain(in: TerrainOut) -> @location(0) vec4<f32> {
     // The light grid's skylight (SmoothCluster FS HQ: LightGridSkylight .x
     // scales SkyAmbient and the sky's share of the ambient cube).
     let sv = light_grid(in.world, n0);
-    var light = g.ambient.rgb + g.outdoor.rgb * sv + g.sun_color.rgb * g.sun_dir.w * ndl * shadow + env_cube(n, sv);
+    // FS HQ: F0 0.04 with the environment BRDF (PrecomputedBRDF at roughness,
+    // N·V), the sun's Schlick Fresnel at L·H; both take their share from the
+    // diffuse light, scaled by EnvironmentSpecularScale (fading with distance).
+    let v = normalize(g.cam_pos.xyz - in.world);
+    let nv = max(dot(n, v), 1e-4);
+    let fade = clamp(1.0 - length(g.cam_pos.xyz - in.world) * ENV_SPEC_FADE, 0.0, 1.0);
+    let sS = select(0.0, g.sky_grad[1].w * fade, g.env_spec.z > 0.5);
+    let ab = brdf_ab(rough, nv);
+    let fe = (0.04 * ab.x + ab.y) / max(ab.x + ab.y, 1e-4);
+    let hv = normalize(v + l);
+    let vh = dot(l, hv);
+    let e5 = pow(1.0 - clamp(vh, 0.0, 1.0), 5.0);
+    let fr = e5 + 0.04 * (1.0 - e5);
+    var light = (1.0 - fe * sS) * env_cube(n, sv) + g.ambient.rgb + g.outdoor.rgb * sv
+        + (1.0 - fr * sS) * g.sun_color.rgb * g.sun_dir.w * ndl * shadow + glow;
     // SmoothCluster VS/FS includes Lamp1 on faces turned away from the sun.
     light += g.lamp1.rgb * max(-dot(n, l), 0.0);
     light += local_lights(in.world, select(n, n0, g.sun_color.w > 0.5));
     var c = base * light;
-    // Sun highlight: GGX with F0 0.04 (the FS HQ's sun term).
-    let v = normalize(g.cam_pos.xyz - in.world);
-    let hv = normalize(v + l);
+    // Sun highlight: GGX (a = roughness⁴), and the prefiltered environment
+    // along the reflection at mip roughness × 5.
     let a2 = rough * rough * rough * rough;
     let nh = max(dot(n, hv), 0.001);
     let dd = nh * nh * (a2 - 1.0) + 1.0;
-    let vh = dot(l, hv);
-    let fr = 0.04 + 0.96 * pow(1.0 - clamp(vh, 0.0, 1.0), 5.0);
     let spec = fr * (a2 + a2 * a2) / (dd * dd * (vh * 3.0 + 0.5) * (nh * 0.75 + 0.25));
-    c += g.sun_color.rgb * g.sun_dir.w * spec * ndl * shadow;
+    c += g.sun_color.rgb * g.sun_dir.w * spec * ndl * shadow * fade;
+    c += env_reflect(reflect(-v, n), rough, sv, false) * fe * sS;
     if (g.fog.z > 0.5) {
         let d = length(in.world - g.cam_pos.xyz);
         let f = fog_amount(d);
