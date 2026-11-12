@@ -55,6 +55,8 @@ fn top_icon(ui: &mut egui::Ui, icon: &str, color: Color32, enabled: bool) -> egu
 
 fn tool_key(t: Tool) -> &'static str {
     match t {
+        Tool::None => "tool.none",
+        Tool::Transform => "tool.transform",
         Tool::Select => "tool.select",
         Tool::Move => "tool.move",
         Tool::Scale => "tool.scale",
@@ -178,9 +180,9 @@ impl Editor {
             self.ui_rects.insert(tool_key(tool), r);
             self.hud.toolbar_buttons += 1;
         }
-        self.rb(ui, "transform", "Transform", "transform", false, act);
+        self.rb(ui, "transform", "Transform", "transform", self.tool == Tool::Transform, act);
         divider(ui);
-        self.rb(ui, "geometry", "Geometric", "geometric", false, act);
+        self.movement_mode_button(ui);
         self.snap_widget(ui);
         divider(ui);
     }
@@ -378,6 +380,20 @@ impl Editor {
                     ui.close();
                 }
             }
+        });
+    }
+
+    /// Geometric (the dragger's movement mode) with its menu: Collisions and
+    /// Join Surfaces (plugin.CollisionEnabled, plugin:GetJoinMode()).
+    fn movement_mode_button(&mut self, ui: &mut egui::Ui) {
+        let resp = ribbon_button(ui, "geometry", "Geometric", false, true);
+        self.ui_rects.insert("model.geometric", resp.rect);
+        let resp = resp.on_hover_text("Geometric movement: Collisions and Join Surfaces");
+        egui::Popup::menu(&resp).show(|ui| {
+            ui.checkbox(&mut self.collisions, "Collisions")
+                .on_hover_text("Moving or scaling with handles stops where parts would overlap");
+            ui.checkbox(&mut self.join_surfaces, "Join Surfaces")
+                .on_hover_text("Dropped parts are welded to the parts they touch");
         });
     }
 

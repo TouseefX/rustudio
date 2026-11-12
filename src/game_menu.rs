@@ -427,6 +427,7 @@ impl Editor {
                 ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(on));
             }
         }
+        let keep = self.harness.keeps_game_settings();
         let Some(s) = self.play.as_mut() else { return };
         let g = &mut s.game;
         g.menu.rects = rects;
@@ -438,6 +439,19 @@ impl Editor {
                 _ => g.menu.back = None,
             }
             g.menu.page = p;
+        }
+        if keep && (asked.sensitivity.is_some() || asked.volume.is_some() || asked.inverted.is_some()) {
+            crate::game_settings::update(|saved| {
+                if let Some(x) = asked.sensitivity {
+                    saved.sensitivity = Some(step_to_sensitivity(x));
+                }
+                if let Some(v) = asked.volume {
+                    saved.volume = Some(v as f32 / 10.0);
+                }
+                if let Some(on) = asked.inverted {
+                    saved.inverted = Some(on);
+                }
+            });
         }
         if let Some(x) = asked.sensitivity {
             g.menu.lua.push(format!(

@@ -87,6 +87,16 @@ pub struct UiState {
     pub panel_requests: Vec<(Tab, Option<bool>)>,
     /// Panels open in the dock last frame (their menu checkmarks).
     pub panels_open: HashSet<&'static str>,
+    /// Pop out / dock back / move between panel windows, done at the end
+    /// of the frame (src/panels.rs).
+    pub dock_moves: Vec<crate::panels::DockMove>,
+    /// The panel windows last frame: key and tabs (menus and the self-test).
+    pub popped: Vec<(String, Vec<Tab>)>,
+    /// The tabs in the 3D view's tab group last frame.
+    pub viewport_group: Vec<Tab>,
+    /// How the panel windows were shown last frame (`Immediate`: real OS
+    /// windows; `EmbeddedWindow`: the backend can't, so inside the main one).
+    pub popped_class: Option<egui::ViewportClass>,
     pub zoom: f32,
     pub fullscreen: bool,
     pub show_gui: bool,
@@ -103,6 +113,10 @@ impl Default for UiState {
             run_type: RunType::Test,
             panel_requests: Vec::new(),
             panels_open: HashSet::new(),
+            dock_moves: Vec::new(),
+            popped: Vec::new(),
+            viewport_group: Vec::new(),
+            popped_class: None,
             zoom: 1.0,
             fullscreen: false,
             show_gui: true,
@@ -345,6 +359,8 @@ pub const WINDOW: &[M] = &[
         I("Tag Editor", "", "tag_editor"),
         I("Task Scheduler", "", "task_scheduler"),
     ]),
+    S,
+    I("Dock All Windows", "", "dock_all"),
     I("Reset Layout", "", "reset_layout"),
 ];
 

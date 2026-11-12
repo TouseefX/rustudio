@@ -99,6 +99,9 @@ mlua = { path = "vendor/mlua" }
 # egui 0.36.2 patched (text_selection/, scroll_area.rs): double/
 # triple click select on the press, not the release, like Studio.
 egui = { path = "vendor/egui" }
+# egui_dock 0.21.1 + a pop-out button next to each tab's close × (TabViewer::
+# show_pop_out_button / on_pop_out, marked rustudio): src/panels.rs.
+egui_dock = { path = "vendor/egui_dock" }
 # rbx_dom_weak 4.2.0 + detach_children / detach_descendants and an
 # end-first child removal: bulk Destroy / ClearAllChildren without a scan
 # of the parent's child list per child (round 2 perf, bulk).

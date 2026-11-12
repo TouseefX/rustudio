@@ -70,6 +70,7 @@ impl Editor {
         let Some(mut d) = self.project_export.take() else { return };
         let mut open = true;
         let mut go = false;
+        let mut browse: Option<String> = None;
         let root = self.doc.dom.root_ref();
         let present: Vec<(&str, bool)> = CONTAINERS
             .iter()
@@ -99,9 +100,7 @@ impl Editor {
                     ui.horizontal(|ui| {
                         ui.add(egui::TextEdit::singleline(&mut d.parent).desired_width(260.0));
                         if ui.button("Browse…").clicked() {
-                            if let Some(p) = rfd::FileDialog::new().set_directory(&d.parent).pick_folder() {
-                                d.parent = p.display().to_string();
-                            }
+                            browse = Some(d.parent.clone());
                         }
                     });
                     ui.end_row();
@@ -134,6 +133,11 @@ impl Editor {
                     go = true;
                 }
             });
+        if let Some(start) = browse {
+            use crate::file_dialog::{Kind, Purpose};
+            let fd = rfd::AsyncFileDialog::new().set_directory(&start);
+            self.dialogs.start(Purpose::ProjectParent, fd, Kind::PickFolder);
+        }
         if go {
             let dir = PathBuf::from(&d.parent).join(safe_name(&d.opts.name));
             let mut opts = d.opts.clone();
