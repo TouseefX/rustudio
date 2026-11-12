@@ -100,8 +100,17 @@ fn file_safe(name: &str) -> String {
     }
 }
 
-/// The reflection default of a property (superclasses followed).
-fn default_of(class: &str, prop: &str) -> Option<&'static Variant> {
+/// The default of a property, as `Document::prop` reads a missing one:
+/// rustudio's Studio overrides, else the reflection database's
+/// (superclasses followed).
+fn default_of(class: &str, prop: &str) -> Option<std::borrow::Cow<'static, Variant>> {
+    if let Some(v) = crate::doc::studio_default(class, prop) {
+        return Some(std::borrow::Cow::Owned(v));
+    }
+    reflection_default(class, prop).map(std::borrow::Cow::Borrowed)
+}
+
+fn reflection_default(class: &str, prop: &str) -> Option<&'static Variant> {
     let db = crate::doc::db();
     let mut cur = db.classes.get(class)?;
     loop {
@@ -154,7 +163,7 @@ impl Ctx<'_> {
             if matches!(k, "Name" | "Attributes" | "Tags") || skip.contains(&k) {
                 continue;
             }
-            if default_of(&cls, k).is_some_and(|d| d == v) {
+            if default_of(&cls, k).is_some_and(|d| *d == *v) {
                 continue;
             }
             match to_json(&cls, k, v) {
@@ -213,7 +222,7 @@ impl Ctx<'_> {
             .properties
             .iter()
             .filter(|(k, _)| !matches!(k.as_str(), "Name" | "Attributes" | "Tags" | "Source") && !IGNORABLE.contains(&k.as_str()))
-            .filter(|(k, v)| default_of(cls, k.as_str()) != Some(*v))
+            .filter(|(k, v)| default_of(cls, k.as_str()).as_deref() != Some(*v))
             .filter(|(_, v)| !matches!(v, Variant::Ref(x) if x.is_none()))
             .filter(|(k, v)| !to_json(cls, k, v).is_some_and(|j| resolve(cls, k, &j).is_ok()))
             .map(|(k, _)| k.to_string())
@@ -549,7 +558,7 @@ mod real {
                 .properties
                 .iter()
                 .filter(|(k, v)| !matches!(v, Variant::Ref(_) | Variant::UniqueId(_) | Variant::SharedString(_)) && k.as_str() != "HistoryId")
-                .filter(|(k, v)| default_of(i.class.as_str(), k.as_str()) != Some(*v))
+                .filter(|(k, v)| default_of(i.class.as_str(), k.as_str()).as_deref() != Some(*v))
                 .map(|(k, v)| match v {
                     Variant::Font(f) => (k.to_string(), format!("{} {:?} {:?}", f.family, f.weight, f.style)),
                     v => (k.to_string(), fuzz(&format!("{v:?}"))),
@@ -563,7 +572,7 @@ mod real {
                 let c = doc.dom.get_by_ref(*k).unwrap();
                 let mut p: Vec<String> = c.properties.iter()
                     .filter(|(_, v)| !matches!(v, Variant::Ref(_) | Variant::UniqueId(_) | Variant::SharedString(_)))
-                    .filter(|(n, v)| default_of(c.class.as_str(), n.as_str()) != Some(*v))
+                    .filter(|(n, v)| default_of(c.class.as_str(), n.as_str()).as_deref() != Some(*v))
                     .map(|(n, v)| match v {
                         Variant::Font(f) => format!("{n}={} {:?} {:?}", f.family, f.weight, f.style),
                         v => format!("{n}={}", fuzz(&format!("{v:?}"))),

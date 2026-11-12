@@ -209,12 +209,15 @@ impl SelfTest {
                 self.pm.notes.push(format!(
                     "right-drag 200 px turned the camera {turned:.1}° (CameraInput: −100°)"
                 ));
+                // A tap that comes and goes inside one frame (a quick press,
+                // or any press during a hitch): the frame's modifier state
+                // never shows it, shift lock must still hear it.
                 self.queue.push(Event::ModifiersChanged(Modifiers::SHIFT));
+                self.queue.push(Event::ModifiersChanged(Modifiers::NONE));
                 self.r4.phase = 66;
                 self.pm.started = f;
             }
             // Shift-lock on.
-            66 if t == 4 => self.queue.push(Event::ModifiersChanged(Modifiers::NONE)),
             66 if t >= 20 => {
                 let (mb, rel) = ed
                     .play
@@ -223,7 +226,16 @@ impl SelfTest {
                     .unwrap_or((0, false));
                 let on = mb == 1 && rel;
                 self.pm.ok &= on;
-                self.pm.notes.push(format!("Shift: shift-lock on (MouseBehavior LockCenter, RotationType CameraRelative): {on}"));
+                self.pm.notes.push(format!("Shift tapped inside one frame: shift-lock on (MouseBehavior LockCenter, RotationType CameraRelative): {on}"));
+                // MouseLockController's icon (PlayerMouse.Icon), drawn in the
+                // middle of the view with the system cursor hidden.
+                let icon = ed.play.as_ref().and_then(|s| s.cursor_image.clone()).unwrap_or_default();
+                let drawn = icon == "rbxasset://textures/MouseLockedCursor.png"
+                    && ed.lock_center_held()
+                    && ed.gui.pointer_override == Some(vp.center())
+                    && ed.game_cursor_hidden;
+                self.pm.ok &= drawn;
+                self.pm.notes.push(format!("shift-lock cursor {icon:?} at the view's middle, system cursor hidden: {drawn}"));
                 self.queue.push(Event::ModifiersChanged(Modifiers::SHIFT));
                 self.r4.phase = 67;
                 self.pm.started = f;
@@ -324,7 +336,8 @@ impl SelfTest {
                     self.pm.ok = false;
                     self.pm.notes.push(format!("lock script: {e}"));
                 }
-                self.queue.push(Event::PointerMoved(vp.center()));
+                // (off the middle, so a release that jumps there shows)
+                self.queue.push(Event::PointerMoved(vp.center() + Vec2::new(60.0, 40.0)));
             }
             68 if t == 75 => {
                 self.pm.yaw0 = client_camera(ed).map(|c| c.1).unwrap_or(0.0);
@@ -340,10 +353,14 @@ impl SelfTest {
                 let mb = ed.play.as_ref().map(|s| s.mouse_behavior).unwrap_or(0);
                 let yaw = client_camera(ed).map(|c| c.1).unwrap_or(self.pm.yaw0);
                 let turned = (yaw - self.pm.yaw0 + 540.0).rem_euclid(360.0) - 180.0;
-                let ok = held && mb == 1 && turned.abs() > 2.0;
+                // The game's mouse is the middle of the view (where the lock
+                // icon is drawn), wherever the held system cursor is.
+                let centred = ed.lock_center_held() && ed.gui.pointer_override == Some(vp.center());
+                let hidden = ed.game_cursor_hidden;
+                let ok = held && mb == 1 && turned.abs() > 2.0 && centred && hidden;
                 self.pm.ok &= ok;
                 self.pm.notes.push(format!(
-                    "LockCenter from a client script, pointer off the view: grab held {held} (MouseBehavior {mb}), camera turned {turned:.1}°"
+                    "LockCenter from a client script, pointer off the view: grab held {held} (MouseBehavior {mb}), camera turned {turned:.1}°, game mouse at the view's middle {centred}, system cursor hidden {hidden}"
                 ));
                 ed.cursor_log.clear();
                 let err = ed.run_luau(
@@ -361,10 +378,14 @@ impl SelfTest {
                 let released = ed.game_grab.is_none();
                 let mb = ed.play.as_ref().map(|s| s.mouse_behavior).unwrap_or(9);
                 let log = ed.cursor_log.clone();
+                // Let go where it is held: never put in the middle of the view
+                // (a Confined grab goes back to where the lock began).
+                let c = vp.center();
+                let centre = format!("game-grab:restore {:.0},{:.0}", c.x, c.y);
                 let ok = released
                     && mb == 0
                     && log.iter().any(|l| l == "game-grab:none")
-                    && log.iter().any(|l| l == "game-grab:restore");
+                    && !log.iter().any(|l| *l == centre);
                 self.pm.ok &= ok;
                 self.pm.notes.push(format!(
                     "Default from the script: grab released {released} (MouseBehavior {mb}), cursor commands {log:?}"

@@ -1,3 +1,9 @@
 target/
 shots/
 __pycache__/
+
+# Generated probes and editor lock files
+tools/parity_probe/*/runs/
+*.rbxlx.lock
+tools/fidelity/truss/build.log
+tools/fidelity/truss/tests.log

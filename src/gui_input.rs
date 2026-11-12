@@ -1117,7 +1117,7 @@ impl Gui {
     /// Pointer over the viewport: hover, clicks and the wheel. Queues events;
     /// returns true when the GUI took the input (no 3D picking or clicks).
     pub fn input(&mut self, ctx: &egui::Context, resp: &egui::Response, rect: Rect) -> bool {
-        let pointer = resp.hover_pos().filter(|p| rect.contains(*p));
+        let pointer = self.pointer_override.or(resp.hover_pos()).filter(|p| rect.contains(*p));
         let under: Vec<Hit> = match pointer {
             Some(p) => self
                 .hits

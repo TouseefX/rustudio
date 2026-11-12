@@ -88,6 +88,16 @@ pub struct Character {
     forced_for: f32,
     /// Climbing / Swimming speed last reported (their events fire on change).
     last_move_speed: f32,
+    /// The ladder sensor's last result (hit normal) and the updates left
+    /// before FindLadder runs again (see `ladder_interval`).
+    ladder: Option<Vec3>,
+    ladder_wait: u8,
+}
+
+/// FindLadder's period in a state, vtable : Running (and Landed,
+/// Jumping) Studio → 2, Climbing and Freefall Studio → 0.
+pub fn ladder_interval(state: State) -> u8 {
+    if matches!(state, State::Climbing | State::Freefall) { 0 } else { 2 }
 }
 
 /// A change of seat this frame: Humanoid.Seated(active, seat).
@@ -602,6 +612,18 @@ impl Editor {
             camera_relative: false,
         });
         self.add_chat_stub();
+        // The menu's settings from earlier playtests (volume, camera
+        // sensitivity, inverted): onto the mixer now, and onto the client's
+        // UserGameSettings on its first tick.
+        if self.harness.keeps_game_settings() {
+            let saved = crate::game_settings::load();
+            if let Some(v) = saved.volume {
+                crate::audio::set_master_global(v);
+            }
+            if let Some(s) = self.play.as_mut() {
+                s.game.menu.lua.extend(saved.client_lua());
+            }
+        }
         if !defaults.is_empty() {
             self.info(format!(
                 "Default player scripts from Studio: {}",
@@ -1379,6 +1401,8 @@ impl Editor {
                 pos: start,
                 vel_y: 0.0,
                 grounded: false,
+                // Not just off a ledge: no coyote jump mid-air at spawn.
+                air_time: f32::MAX,
                 ..Default::default()
             },
             root_lift,
@@ -1401,6 +1425,8 @@ impl Editor {
             forced: None,
             forced_for: 0.0,
             last_move_speed: -1.0,
+            ladder: None,
+            ladder_wait: 0,
         };
         let mut ch = ch;
         let pose = character_pose(&ch, &HashMap::new());
@@ -2063,6 +2089,19 @@ impl Editor {
                         e.push(k);
                     }
                 }
+                // Shift has no key event in egui, only modifier state: a
+                // tap pressed and released between two frames (a hitch, a
+                // quick press) would never reach shift lock without this.
+                let shift = "LeftShift".to_string();
+                if !raw_keys.contains(&shift) && !s.keys_prev.contains(&shift) {
+                    let taps = ctx.input(|i| {
+                        crate::mouse_lock::shift_taps(false, &i.raw.events, i.modifiers.shift)
+                    });
+                    if taps > 0 {
+                        b.push((shift.clone(), textbox));
+                        e.push(shift);
+                    }
+                }
             }
             for (k, p) in &b {
                 if *p {
@@ -2430,6 +2469,7 @@ impl Editor {
             if left_seat && wants_jump {
                 // Jumping out of a seat leaves from where it sat.
                 ch.body.grounded = true;
+                ch.body.free_jump = true;
             }
             // Swimming: the root in terrain water. Climbing: walking into a
             // TrussPart (and holding on to it while standing still).
@@ -2437,28 +2477,32 @@ impl Editor {
                 && !states_off.contains("Swimming")
                 && s.physics.water_at(ch.body.pos) > mech::SWIM_ENTER_WATER;
             let facing = Vec3::new(-ch.yaw.sin(), 0.0, -ch.yaw.cos());
-            // On a truss the root keeps facing it (climbing down moves away
-            // from where it looks); otherwise the walk finds one.
-            let climb_look = if ch.state == State::Climbing {
-                facing
+            // FindLadder (Studio → Studio) looks along the root's
+            // look vector. It runs only in states whose row of the transition
+            // table (Studio, 0x4c per state) has a ladder entry —
+            // Running and Freefall (→ Climbing) and Climbing (lost → Running);
+            // Jumping and Landed have none — and then every vtable 
+            // updates: Climbing and Freefall 0 (Studio: every update),
+            // Running 2 (Studio: every third). Between runs the sensor
+            // keeps its last result; a new state starts its count at 0.
+            let ladder_state = matches!(ch.state, State::Running | State::Freefall | State::Climbing);
+            if !ladder_state {
+                ch.ladder_wait = 0;
+            } else if ch.ladder_wait > 0 {
+                ch.ladder_wait -= 1;
             } else {
-                dir
-            };
+                ch.ladder = s.physics.ladder_normal_scaled(&self.doc, ch.body.pos + Vec3::Y * ch.root_lift, facing,
+                    ch.shape.hip + ch.shape.root_size.y * 0.5,
+                    (if ch.shape.r6 { mech::CLIMB_REACH } else { mech::CLIMB_REACH_R15 }) *
+                        self.doc.find_named(ch.model, "Head").and_then(|r| crate::scene::vec3_of(self.doc.prop(r, "Size"))).map_or(1.0, |s| s.y), &own);
+                ch.ladder_wait = ladder_interval(ch.state);
+            }
+            let ladder_normal = ch.ladder.filter(|_| ladder_state);
             let on_truss = seat_root.is_none()
                 && !in_water
                 && !held
                 && !states_off.contains("Climbing")
-                && climb_look != Vec3::ZERO
-                && [-1.0f32, 0.0, 1.0].iter().any(|dy| {
-                    s.physics
-                        .part_ahead(
-                            ch.body.pos + Vec3::Y * *dy,
-                            climb_look,
-                            mech::CHARACTER_RADIUS + mech::CLIMB_REACH,
-                            &own,
-                        )
-                        .is_some_and(|p| self.doc.class_of(p).is_some_and(|c| c == "TrussPart"))
-                });
+                && ladder_normal.is_some();
             let was_grounded = ch.body.grounded;
             let mut walk = movers.plane.unwrap_or(dir * speed);
             let mut hum_jumped = false;
@@ -2544,27 +2588,23 @@ impl Editor {
                 walk *= mech::SWIM_GAIN / (mech::SWIM_GAIN + drag);
                 swimming_now = walk.length() > mech::CLIMB_MIN_INPUT;
                 char_touches = s.physics.move_character_floating(&mut ch.body, walk, dt, &own);
-            } else if on_truss && !wants_jump {
-                // Studio's Climbing: straight up or down at 0.7 ×
-                // the move speed — down when the move points away from where
-                // the root faces (dot < −0.2) — a 0.01 creep under 0.1 of
-                // input, and no sideways velocity.
+            } else if crate::physics::climbs(ch.state == State::Climbing, ch.body.grounded, on_truss, wants_jump) {
+                // Held Jump doesn't keep it off the ladder: from Freefall it
+                // grabs again, and Climbing's next frame jumps off again.
+                // Studio's Climbing (Studio; physics::climb_step).
                 climbing = true;
-                let input = walk.length();
-                let away = input > 1e-4 && (walk / input).dot(facing) < mech::CLIMB_DOWN_DOT;
-                let up = if input < mech::CLIMB_MIN_INPUT {
-                    mech::CLIMB_CREEP
-                } else {
-                    input * mech::CLIMB_SPEED_FACTOR
-                };
-                ch.body.vel_y = if away { -up } else { up };
-                walk = Vec3::ZERO;
-                char_touches = s.physics.move_character_floating(&mut ch.body, walk, dt, &own);
+                let shape = ch.shape;
+                char_touches = s.physics.climb_step(&mut ch.body, &shape, ch.yaw, walk, facing,
+                    ladder_normal.unwrap_or(-facing), dt, &own);
+                walk = Vec3::new(ch.body.vel.x, 0.0, ch.body.vel.z);
             } else {
-                if (on_truss || ch.state == State::Climbing) && wants_jump {
-                    // Jumping off a truss: away from it.
+                if ch.state == State::Climbing && wants_jump {
+                    // Studio: impulse along normalize(up - flat look),
+                    // only when the previous state was Climbing (12).
                     ch.body.grounded = true;
-                    walk = -facing * speed;
+                    ch.body.free_jump = true;
+                    ch.body.vel = Vec3::Y * ch.body.vel_y;
+                    ch.body.climb_jump = Some((Vec3::Y - facing) * mech::CLIMB_JUMP_COMPONENT);
                 }
                 // Studio's Humanoid controller (round 22): floor rays, the hip
                 // spring, the body box (physics::move_humanoid).
@@ -2642,6 +2682,10 @@ impl Editor {
                 State::Swimming
             } else if climbing {
                 State::Climbing
+            } else if ch.state == State::Climbing && !jumped {
+                // Losing the last rung enters Running before its floor test
+                // takes the character into Freefall on the following step.
+                State::Running
             } else if !ch.body.grounded {
                 // Studio's Jumping lasts one step, then Freefall (longer
                 // against a wall: physics::move_humanoid's hold).
@@ -2672,6 +2716,7 @@ impl Editor {
                     ch.last_speed = -1.0;
                 }
                 ch.last_move_speed = -1.0;
+                ch.ladder_wait = 0;
                 ch.state = next;
             }
             // Humanoid.Climbing(speed) / Swimming(speed) when the speed changes.

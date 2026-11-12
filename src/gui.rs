@@ -154,6 +154,9 @@ enum Img {
 /// GUI state kept between frames (textures, fonts, hover, focus).
 #[derive(Default)]
 pub struct Gui {
+    /// Where the game's mouse is when it isn't the pointer: the middle of
+    /// the view while LockCenter holds the cursor (mouse_lock::game_pointer).
+    pub pointer_override: Option<Pos2>,
     /// SurfaceGui / BillboardGui triangles (AlwaysOnTop false) for the
     /// renderer's depth-tested pass, by egui texture (round 23).
     pub world_batches: Vec<crate::world_gui::GuiBatch>,
@@ -999,7 +1002,7 @@ impl Gui {
         let s = egui::vec2(size[0] as f32, size[1] as f32);
         painter.image(
             tex,
-            Rect::from_center_size(at, s),
+            crate::mouse_lock::icon_rect(at, s, ctx.pixels_per_point()),
             Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)),
             Color32::WHITE,
         );

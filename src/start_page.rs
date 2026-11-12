@@ -24,67 +24,12 @@ use crate::app::{Editor, PendingAction};
 use crate::cloud_ui::Paged;
 use crate::doc::Document;
 use crate::theme;
+use templates::{Kind, Source, TemplateInfo};
 
-/// A new-place template.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Template {
-    Baseplate,
-    FlatTerrain,
-}
-
-impl Template {
-    const ALL: [Template; 2] = [Template::Baseplate, Template::FlatTerrain];
-
-    fn label(self) -> &'static str {
-        match self {
-            Template::Baseplate => "Baseplate",
-            Template::FlatTerrain => "Flat Terrain",
-        }
-    }
-
-    /// The template's place, unsaved and clean.
-    pub fn build(self) -> Document {
-        let mut doc = Document::new_place();
-        if self == Template::FlatTerrain {
-            flat_terrain(&mut doc);
-        }
-        doc.title = self.label().to_string();
-        doc
-    }
-}
-
-/// Flat Terrain: no Baseplate, a 1024×1024 grass slab whose top is y = 0.
-fn flat_terrain(doc: &mut Document) {
-    use rbx_dom_weak::types::{BinaryString, Variant};
-    let Some(ws) = doc.workspace() else { return };
-    let base: Vec<_> = doc
-        .dom
-        .get_by_ref(ws)
-        .map(|w| w.children().to_vec())
-        .unwrap_or_default()
-        .into_iter()
-        .filter(|r| doc.dom.get_by_ref(*r).is_some_and(|i| i.name == "Baseplate"))
-        .collect();
-    for r in base {
-        doc.dom.destroy(r);
-    }
-    let Some(t) = doc.find_child(ws, "Terrain") else { return };
-    let Some(grass) = crate::terrain::material_index("Grass") else { return };
-    let (half, depth) = (512.0f32, 16.0f32);
-    let mut v = crate::terrain::Voxels::empty();
-    let (lo, hi) = ([-half, -depth, -half], [half, 0.0, half]);
-    v.fill(lo, hi, grass, |p| {
-        let c = [0.0, -depth / 2.0, 0.0];
-        let h = [half, depth / 2.0, half];
-        let q = [0, 1, 2].map(|k| (p[k] - c[k]).abs() - h[k]);
-        let out = q.map(|x| x.max(0.0));
-        (out[0] * out[0] + out[1] * out[1] + out[2] * out[2]).sqrt() + q[0].max(q[1]).max(q[2]).min(0.0)
-    });
-    if let Some(i) = doc.dom.get_by_ref_mut(t) {
-        i.properties
-            .insert(rbx_dom_weak::ustr("SmoothGrid"), Variant::BinaryString(BinaryString::from(v.encode())));
-    }
-}
+mod builtin;
+#[cfg(test)]
+mod studio_diff;
+pub mod templates;
 
 type Listing = Option<Result<Vec<Experience>, String>>;
 
@@ -92,6 +37,10 @@ enum Msg {
     Page(ExperienceSource, u32, Result<(Vec<Experience>, bool), String>),
     Groups(Result<Vec<GroupInfo>, String>),
     Icon(u64, egui::ColorImage),
+    /// Studio's template list (develop `v1/gametemplates`).
+    Templates(Result<Vec<TemplateInfo>, String>),
+    /// A template's place file, or why there isn't one.
+    TemplatePlace(TemplateInfo, Result<(Vec<u8>, Source), String>),
     Done,
 }
 
@@ -119,6 +68,16 @@ pub struct StartPage {
     icons_asked: HashSet<u64>,
     /// Whether the lists were loaded for a signed-in session yet.
     loaded_signed_in: bool,
+    /// Studio's templates in its order: Roblox's list once it arrives,
+    /// the measured one until then (or offline).
+    templates: Vec<TemplateInfo>,
+    templates_asked: bool,
+    /// The Templates tab: None is All.
+    template_tab: Option<Kind>,
+    /// The template whose place is being fetched.
+    opening: Option<String>,
+    /// A fetched template place, for the editor to open.
+    opened: Option<(TemplateInfo, Result<(Vec<u8>, Source), String>)>,
 }
 
 impl StartPage {
@@ -151,6 +110,11 @@ impl Default for StartPage {
             icons: HashMap::new(),
             icons_asked: HashSet::new(),
             loaded_signed_in: false,
+            templates: templates::measured(),
+            templates_asked: false,
+            template_tab: None,
+            opening: None,
+            opened: None,
         }
     }
 }
@@ -160,7 +124,8 @@ enum Do {
     Jump(String),
     Toggle(String),
     ShowAll(String),
-    Template(Template),
+    Template(TemplateInfo),
+    TemplateTab(Option<Kind>),
     OpenFile(Option<PathBuf>),
     OpenFolder,
     Cloud(u64, bool),
@@ -214,6 +179,12 @@ impl StartPage {
                     let t = ctx.load_texture(format!("start_icon_{u}"), img, egui::TextureOptions::LINEAR);
                     self.icons.insert(u, t);
                 }
+                Msg::Templates(Ok(list)) => self.templates = list,
+                Msg::Templates(Err(_)) => {}
+                Msg::TemplatePlace(t, r) => {
+                    self.opening = None;
+                    self.opened = Some((t, r));
+                }
                 Msg::Done => self.jobs = self.jobs.saturating_sub(1),
             }
         }
@@ -221,6 +192,13 @@ impl StartPage {
 
     fn busy(&self) -> bool {
         self.jobs > 0
+    }
+
+    /// What New Experience opens: Studio's default template
+    /// (FStringStudioDefaultNewTemplatePlaceId, Baseplate).
+    fn default_template(&self) -> TemplateInfo {
+        let find = |l: &[TemplateInfo]| l.iter().find(|t| t.place_id == templates::DEFAULT_PLACE_ID).cloned();
+        find(&self.templates).or_else(|| find(&templates::measured())).expect("Baseplate is in the measured list")
     }
 
     /// RUSTUDIO_START_PAGE=recent|mine|shared|files: start scrolled there.
@@ -296,6 +274,70 @@ impl Editor {
         });
     }
 
+    /// Studio's template list and the templates' icons: both public, so
+    /// they load signed out too.
+    fn start_templates(&mut self) {
+        self.start.templates_asked = true;
+        let ep = self.cloud.endpoints.clone();
+        let known: Vec<u64> = self.start.templates.iter().map(|t| t.universe_id).collect();
+        for u in &known {
+            self.start.icons_asked.insert(*u);
+        }
+        self.start.spawn(None, ep.clone(), move |_, tx| {
+            let list = templates::fetch_list(&ep.develop);
+            let mut ids = known.clone();
+            if let Ok(l) = &list {
+                ids.extend(l.iter().map(|t| t.universe_id).filter(|u| !known.contains(u)));
+            }
+            let _ = tx.send(Msg::Templates(list));
+            for (id, png) in templates::fetch_icons(&ep.thumbnails, &ids) {
+                let Ok(img) = image::load_from_memory(&png) else { continue };
+                let img = img.thumbnail(256, 256).to_rgba8();
+                let size = [img.width() as usize, img.height() as usize];
+                let _ = tx.send(Msg::Icon(id, egui::ColorImage::from_rgba_unmultiplied(size, img.as_raw())));
+            }
+        });
+    }
+
+    /// Opens a template as Studio does: its place file (downloaded with the
+    /// session, else cached), else the built-in copy.
+    fn start_open_template(&mut self, t: TemplateInfo) {
+        if self.start.opening.is_some() {
+            return;
+        }
+        self.start.opening = Some(t.name.clone());
+        let (client, ep) = self.start_client();
+        self.start.spawn(client, ep, move |a, tx| {
+            let r = templates::fetch_place(a.as_ref(), t.place_id);
+            let _ = tx.send(Msg::TemplatePlace(t, r));
+        });
+    }
+
+    /// A fetched template becomes the document.
+    fn start_finish_template(&mut self) {
+        let Some((t, r)) = self.start.opened.take() else { return };
+        let (doc, how) = match r {
+            Ok((bytes, src)) => match templates::new_place(&t, Some(&bytes)) {
+                Ok(d) => (Ok(d), match src {
+                    Source::Downloaded(v) => format!("downloaded version {v}"),
+                    Source::Cached(v) => format!("cached version {v}"),
+                    Source::BuiltIn => "built in".into(),
+                }),
+                Err(e) => (templates::new_place(&t, None), format!("built in; its place file didn't load: {e}")),
+            },
+            Err(why) => (templates::new_place(&t, None), format!("built in; {why}")),
+        };
+        match doc {
+            Ok(doc) => {
+                // The editor camera starts at the template's saved Camera,
+                // as Studio's does (set_document).
+                self.set_document(doc);
+                self.info(format!("New place from the {} template ({how})", t.name));
+            }
+            Err(e) => self.error(format!("Couldn't open the {} template: {e} ({how})", t.name)),
+        }
+    }
+
     /// Draws the Start Page over the whole window. False once it has gone
     /// (something was opened): the editor draws this frame instead.
     pub fn start_page_ui(&mut self, ui: &mut egui::Ui) -> bool {
@@ -309,6 +351,16 @@ impl Editor {
         let ctx = ui.ctx().clone();
         self.account.restore();
         self.start.poll(&ctx);
+        if !self.start.templates_asked {
+            self.start_templates();
+        }
+        if self.start.opened.is_some() {
+            self.start_finish_template();
+            if self.doc.id != self.start.doc_id {
+                self.start.visible = false;
+                return false;
+            }
+        }
         // Signing in (or the session check finishing) fills the lists.
         let signed = self.account.signed_in();
         if signed && !self.start.loaded_signed_in {
@@ -332,7 +384,7 @@ impl Editor {
             ctx.input_mut(|i| {
                 use egui::{Key, KeyboardShortcut, Modifiers};
                 if i.consume_shortcut(&KeyboardShortcut::new(Modifiers::COMMAND, Key::N)) {
-                    todo.push(Do::Template(Template::Baseplate));
+                    todo.push(Do::Template(self.start.default_template()));
                 }
                 if i.consume_shortcut(&KeyboardShortcut::new(Modifiers::COMMAND, Key::O)) {
                     todo.push(Do::OpenFile(None));
@@ -371,12 +423,8 @@ impl Editor {
                 }
                 Do::Refresh => self.start_load_all(),
                 Do::More(src) => self.start_load_page(src),
-                Do::Template(t) => {
-                    let doc = t.build();
-                    self.set_document(doc);
-                    self.cam = crate::camera::Camera::default();
-                    self.info(format!("New place from the {} template", t.label()));
-                }
+                Do::Template(t) => self.start_open_template(t),
+                Do::TemplateTab(k) => self.start.template_tab = k,
                 Do::OpenFile(p) => self.request(PendingAction::Open(p)),
                 Do::OpenFolder => self.request(PendingAction::OpenFolder),
                 Do::Cloud(p, copy) => {
@@ -440,7 +488,7 @@ impl Editor {
             )
         };
         if big(ui, "+  New Experience", theme::ACCENT).on_hover_text(format!("A new Baseplate place ({})", crate::studio_ui::shortcut_label("Ctrl+N"))).clicked() {
-            todo.push(Do::Template(Template::Baseplate));
+            todo.push(Do::Template(self.start.default_template()));
         }
         ui.add_space(6.0);
         if big(ui, "Open from File…", theme::PANEL_ALT).on_hover_text(crate::studio_ui::shortcut_label("Ctrl+O")).clicked() {
@@ -627,18 +675,7 @@ impl Editor {
 
     fn start_home(&mut self, ui: &mut egui::Ui, todo: &mut Vec<Do>) {
         let searching = !self.start.search.trim().is_empty();
-        let templates: Vec<Template> = Template::ALL.into_iter().filter(|t| self.matches(t.label())).collect();
-        if !templates.is_empty() {
-            Self::section(ui, "New Experience");
-            grid(ui, templates.len(), |ui, i| {
-                let t = templates[i];
-                let r = card(ui, t.label(), "Template", |p, rect| template_thumb(p, rect, t));
-                if r.clicked() {
-                    todo.push(Do::Template(t));
-                }
-            });
-            ui.add_space(14.0);
-        }
+        self.start_templates_section(ui, searching, todo);
 
         // Recently opened from Roblox (the download cache's list).
         let recent: Vec<_> = self
@@ -751,6 +788,66 @@ impl Editor {
             self.start_files(ui, usize::MAX, todo);
         }
         ui.add_space(24.0);
+    }
+
+    /// "Open a Template", as Studio's Home page has it: Roblox's templates
+    /// in its order with their icons and names, the first HOME_MAX with
+    /// "See All" for the rest, and the Templates page's tabs (All, Blank,
+    /// Gameplay, Themed).
+    fn start_templates_section(&mut self, ui: &mut egui::Ui, searching: bool, todo: &mut Vec<Do>) {
+        let tab = self.start.template_tab;
+        let list: Vec<TemplateInfo> = self
+            .start
+            .templates
+            .iter()
+            .filter(|t| tab.is_none_or(|k| t.kind == k) && self.matches(&t.name))
+            .cloned()
+            .collect();
+        if searching && list.is_empty() {
+            return;
+        }
+        Self::section(ui, "Open a Template");
+        ui.label(
+            RichText::new("See what's possible on Roblox in popular genres with our ready-made experiences, or start from scratch.")
+                .color(theme::TEXT_DIM),
+        );
+        ui.add_space(6.0);
+        ui.horizontal(|ui| {
+            for (k, label) in [(None, "All"), (Some(Kind::Generic), Kind::Generic.label()), (Some(Kind::Gameplay), Kind::Gameplay.label()), (Some(Kind::Theme), Kind::Theme.label())] {
+                if ui.selectable_label(tab == k, label).clicked() {
+                    todo.push(Do::TemplateTab(k));
+                }
+            }
+            if let Some(name) = &self.start.opening {
+                ui.add_space(12.0);
+                ui.spinner();
+                ui.label(RichText::new(format!("Opening {name}…")).color(theme::TEXT_DIM));
+            }
+        });
+        ui.add_space(8.0);
+        if list.is_empty() {
+            ui.label(RichText::new("No Templates to display.").color(theme::TEXT_DIM));
+            ui.add_space(14.0);
+            return;
+        }
+        let all = self.start.expanded.contains("templates") || searching || tab.is_some();
+        let shown = if all { list.len() } else { list.len().min(templates::HOME_MAX) };
+        grid(ui, shown, |ui, i| {
+            let t = &list[i];
+            let icon = self.start.icons.get(&t.universe_id).map(|x| x.id());
+            let r = card(ui, &t.name, t.kind.label(), |p, rect| icon_thumb(p, rect, icon, &t.name));
+            let r = r.on_hover_text(format!("{} template\nplace {} · universe {}", t.name, t.place_id, t.universe_id));
+            if r.clicked() {
+                todo.push(Do::Template(t.clone()));
+            }
+        });
+        if !searching && tab.is_none() && list.len() > templates::HOME_MAX {
+            let label = if all { "Show less".to_string() } else { "See All".to_string() };
+            if pill_button(ui, &label, true) {
+                todo.push(Do::ShowAll("templates".into()));
+            }
+        }
+        ui.add_space(14.0);
     }
 
     fn start_files(&mut self, ui: &mut egui::Ui, max: usize, todo: &mut Vec<Do>) {
@@ -1087,83 +1184,328 @@ fn icon_thumb(p: &egui::Painter, r: Rect, icon: Option<egui::TextureId>, name: &
     }
 }
 
-/// A small painting of the template: sky, ground and a spawn pad.
-fn template_thumb(p: &egui::Painter, r: Rect, t: Template) {
-    let top = CornerRadius { nw: 6, ne: 6, sw: 0, se: 0 };
-    let horizon = r.min.y + r.height() * 0.48;
-    let sky = Rect::from_min_max(r.min, Pos2::new(r.max.x, horizon));
-    let mut mesh = egui::Mesh::default();
-    let (a, b) = (Color32::from_rgb(92, 150, 214), Color32::from_rgb(178, 210, 240));
-    mesh.colored_vertex(sky.left_top(), a);
-    mesh.colored_vertex(sky.right_top(), a);
-    mesh.colored_vertex(sky.right_bottom(), b);
-    mesh.colored_vertex(sky.left_bottom(), b);
-    mesh.add_triangle(0, 1, 2);
-    mesh.add_triangle(0, 2, 3);
-    p.rect_filled(sky, top, a);
-    p.add(mesh);
-    let (ground, line) = match t {
-        Template::Baseplate => (Color32::from_rgb(99, 95, 98), Color32::from_rgb(86, 83, 86)),
-        Template::FlatTerrain => (Color32::from_rgb(88, 132, 62), Color32::from_rgb(76, 116, 52)),
-    };
-    // The plane in perspective: a trapezoid with grid lines.
-    let gl = Rect::from_min_max(Pos2::new(r.min.x, horizon), r.max);
-    p.rect_filled(gl, CornerRadius::ZERO, ground);
-    let vp = Pos2::new(r.center().x, horizon - r.height() * 0.6);
-    if t == Template::Baseplate {
-        for k in 0..=12 {
-            let x = r.min.x - r.width() * 0.5 + r.width() * 2.0 * k as f32 / 12.0;
-            let bottom = Pos2::new(x, r.max.y);
-            let tt = (horizon - vp.y) / (bottom.y - vp.y);
-            let at = Pos2::new(vp.x + (bottom.x - vp.x) * tt, horizon);
-            p.line_segment([at, bottom], Stroke::new(1.0, line));
-        }
-        for k in 1..6 {
-            let y = horizon + (r.max.y - horizon) * (k as f32 / 6.0).powf(1.6);
-            p.line_segment([Pos2::new(r.min.x, y), Pos2::new(r.max.x, y)], Stroke::new(1.0, line));
-        }
-    } else {
-        for k in 0..40 {
-            let h = (k * 2654435761u32 as usize) as u32;
-            let x = r.min.x + (h % 1000) as f32 / 1000.0 * r.width();
-            let y = horizon + 4.0 + ((h >> 10) % 1000) as f32 / 1000.0 * (r.max.y - horizon - 6.0);
-            p.line_segment([Pos2::new(x, y), Pos2::new(x + 1.0, y - 3.0)], Stroke::new(1.0, line));
-        }
-    }
-    // The SpawnLocation.
-    let c = Pos2::new(r.center().x, horizon + (r.max.y - horizon) * 0.45);
-    let pad = [
-        Pos2::new(c.x - 22.0, c.y),
-        Pos2::new(c.x, c.y - 7.0),
-        Pos2::new(c.x + 22.0, c.y),
-        Pos2::new(c.x, c.y + 7.0),
-    ];
-    p.add(egui::Shape::convex_polygon(pad.to_vec(), Color32::from_rgb(163, 162, 165), Stroke::new(1.0, Color32::from_rgb(120, 120, 124))));
-    let side = [pad[0], pad[3], pad[3] + Vec2::new(0.0, 3.0), pad[0] + Vec2::new(0.0, 3.0)];
-    p.add(egui::Shape::convex_polygon(side.to_vec(), Color32::from_rgb(130, 129, 132), Stroke::NONE));
-    let side2 = [pad[3], pad[2], pad[2] + Vec2::new(0.0, 3.0), pad[3] + Vec2::new(0.0, 3.0)];
-    p.add(egui::Shape::convex_polygon(side2.to_vec(), Color32::from_rgb(112, 111, 114), Stroke::NONE));
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    #[test]
-    fn templates_build_clean_places() {
-        let bp = Template::Baseplate.build();
-        assert!(!bp.dirty());
-        let ws = bp.workspace().unwrap();
-        assert!(bp.dom.get_by_ref(ws).unwrap().children().iter().any(|r| bp.dom.get_by_ref(*r).unwrap().name == "Baseplate"));
+    use super::templates::{self, TemplateInfo};
 
-        let ft = Template::FlatTerrain.build();
-        assert!(!ft.dirty());
-        let ws = ft.workspace().unwrap();
-        assert!(!ft.dom.get_by_ref(ws).unwrap().children().iter().any(|r| ft.dom.get_by_ref(*r).unwrap().name == "Baseplate"));
-        let v = crate::terrain::Voxels::from_dom(&ft.dom).unwrap().unwrap();
+    fn info(place_id: u64) -> TemplateInfo {
+        templates::measured().into_iter().find(|t| t.place_id == place_id).unwrap()
+    }
+
+    fn builtin(place_id: u64) -> Document {
+        templates::new_place(&info(place_id), None).unwrap()
+    }
+
+    /// Checks `doc` against values read from Studio's DataModel after it
+    /// opened the template (offline Studio, 2026-11-11): (path of names,
+    /// property, value as studio_diff::norm writes it).
+    fn check(doc: &Document, want: &[(&str, &str, &str)]) {
+        let mut bad = Vec::new();
+        for (path, prop, value) in want {
+            let mut r = doc.dom.root_ref();
+            for step in path.split('/') {
+                r = match doc.dom.get_by_ref(r).unwrap().children().iter().copied().find(|c| doc.dom.get_by_ref(*c).unwrap().name == step) {
+                    Some(c) => c,
+                    None => panic!("{path}: no {step}"),
+                };
+            }
+            let got = doc.prop(r, prop).map(|v| super::studio_diff::norm(doc, &v)).unwrap_or_else(|| "<none>".into());
+            if got != *value {
+                bad.push(format!("{path}.{prop}: Studio {value}, rustudio {got}"));
+            }
+        }
+        assert!(bad.is_empty(), "{}", bad.join("\n"));
+    }
+
+    /// What all three blank templates share (Studio's values).
+    const COMMON: &[(&str, &str, &str)] = &[
+        ("Workspace", "CurrentCamera", "ref Camera"),
+        ("Workspace", "Gravity", "196.2"),
+        ("Workspace", "FallenPartsDestroyHeight", "-500"),
+        ("Workspace", "StreamingEnabled", "true"),
+        ("Workspace", "StreamingTargetRadius", "1024"),
+        ("Workspace", "StreamingMinRadius", "64"),
+        ("Workspace", "SignalBehavior", "enum 2"),
+        ("Workspace/Camera", "FieldOfView", "70"),
+        ("Workspace/Terrain", "WaterColor", "rgb 12 84 92"),
+        ("Workspace/Terrain", "WaterReflectance", "1"),
+        ("Workspace/Terrain", "WaterTransparency", "0.3"),
+        ("Workspace/Terrain", "WaterWaveSize", "0.15"),
+        ("Workspace/Terrain", "WaterWaveSpeed", "10"),
+        ("Workspace/Terrain", "GrassLength", "0.7"),
+        ("SoundService", "DistanceFactor", "3.33"),
+        ("SoundService", "RespectFilteringEnabled", "true"),
+        ("SoundService", "DefaultListenerLocation", "enum 3"),
+        ("SoundService", "RolloffScale", "1"),
+        ("StarterPlayer", "CharacterWalkSpeed", "16"),
+        ("StarterPlayer", "CharacterJumpHeight", "7.2"),
+        ("StarterPlayer", "CharacterJumpPower", "50"),
+        ("StarterPlayer", "CharacterBreakJointsOnDeath", "false"),
+        ("StarterPlayer", "CameraMinZoomDistance", "0.5"),
+        ("StarterPlayer", "LoadCharacterAppearance", "true"),
+        ("Players", "CharacterAutoLoads", "true"),
+        ("TextChatService", "ChatVersion", "enum 1"),
+        ("TextChatService", "CreateDefaultTextChannels", "true"),
+        ("TextChatService/BubbleChatConfiguration", "TextSize", "20"),
+        ("TextChatService/ChatWindowConfiguration", "TextSize", "18"),
+        ("MaterialService", "Use2022MaterialsXml", "true"),
+        ("Lighting", "Technology", "enum 3"),
+        ("Lighting", "LightingStyle", "enum 1"),
+        ("Lighting", "PrioritizeLightingQuality", "true"),
+        ("Lighting", "ShadowSoftness", "0.2"),
+        ("Lighting", "GlobalShadows", "true"),
+        ("Lighting", "FogEnd", "100000"),
+        ("Lighting", "FogColor", "rgb 192 192 192"),
+        ("Lighting", "Outlines", "false"),
+        ("Lighting", "ExposureCompensation", "0"),
+    ];
+
+    #[test]
+    fn baseplate_is_studios() {
+        let d = builtin(templates::DEFAULT_PLACE_ID);
+        assert!(!d.dirty());
+        assert_eq!(d.title, "Baseplate");
+        check(&d, COMMON);
+        check(
+            &d,
+            &[
+                ("Workspace/Camera", "CFrame", "cf -19.6961 14.0916 -19.3039 | -0.7062 0.313 -0.6351 0 0.897 0.442 0.7081 0.3121 -0.6334"),
+                ("Workspace/Baseplate", "Size", "v3 2048 16 2048"),
+                ("Workspace/Baseplate", "CFrame", "cf 0 -8 0 | 1 0 0 0 1 0 0 0 1"),
+                ("Workspace/Baseplate", "Color", "rgb 91 91 91"),
+                ("Workspace/Baseplate", "Material", "enum 256"),
+                ("Workspace/Baseplate", "TopSurface", "enum 0"),
+                ("Workspace/Baseplate", "Locked", "true"),
+                ("Workspace/Baseplate", "Anchored", "true"),
+                ("Workspace/Baseplate/Texture", "Texture", "content \"rbxassetid://6372755229\""),
+                ("Workspace/Baseplate/Texture", "Face", "enum 1"),
+                ("Workspace/Baseplate/Texture", "StudsPerTileU", "8"),
+                ("Workspace/Baseplate/Texture", "StudsPerTileV", "8"),
+                ("Workspace/Baseplate/Texture", "Transparency", "0.8"),
+                ("Workspace/Baseplate/Texture", "Color3", "rgb 0 0 0"),
+                ("Workspace/SpawnLocation", "Size", "v3 12 1 12"),
+                ("Workspace/SpawnLocation", "CFrame", "cf 0 0.5 0 | 1 0 0 0 1 0 0 0 1"),
+                ("Workspace/SpawnLocation", "Color", "rgb 163 162 165"),
+                ("Workspace/SpawnLocation", "Duration", "0"),
+                ("Workspace/SpawnLocation", "Neutral", "true"),
+                ("Workspace/SpawnLocation/Decal", "Texture", "content \"rbxasset://textures/SpawnLocation.png\""),
+                ("Workspace/SpawnLocation/Decal", "Face", "enum 1"),
+                ("Workspace/Terrain", "Decoration", "true"),
+                ("Lighting", "Ambient", "rgb 70 70 70"),
+                ("Lighting", "OutdoorAmbient", "rgb 70 70 70"),
+                ("Lighting", "Brightness", "3"),
+                ("Lighting", "TimeOfDay", "\"14:30:00\""),
+                ("Lighting", "GeographicLatitude", "0"),
+                ("Lighting", "EnvironmentDiffuseScale", "1"),
+                ("Lighting", "EnvironmentSpecularScale", "1"),
+                ("Lighting/Sky", "SkyboxBk", "content \"rbxassetid://6444884337\""),
+                ("Lighting/Sky", "SkyboxDn", "content \"rbxassetid://6444884785\""),
+                ("Lighting/Sky", "SkyboxUp", "content \"rbxassetid://6412503613\""),
+                ("Lighting/Sky", "SunTextureId", "content \"rbxassetid://6196665106\""),
+                ("Lighting/Sky", "MoonTextureId", "content \"rbxassetid://6444320592\""),
+                ("Lighting/Sky", "SunAngularSize", "11"),
+                ("Lighting/Sky", "MoonAngularSize", "11"),
+                ("Lighting/Sky", "StarCount", "3000"),
+                ("Lighting/Sky", "CelestialBodiesShown", "true"),
+                ("Lighting/Atmosphere", "Density", "0.3"),
+                ("Lighting/Atmosphere", "Offset", "0.25"),
+                ("Lighting/Atmosphere", "Color", "rgb 199 199 199"),
+                ("Lighting/Atmosphere", "Decay", "rgb 106 112 125"),
+                ("Lighting/Atmosphere", "Glare", "0"),
+                ("Lighting/Atmosphere", "Haze", "0"),
+                ("Lighting/Bloom", "Intensity", "1"),
+                ("Lighting/Bloom", "Size", "24"),
+                ("Lighting/Bloom", "Threshold", "2"),
+                ("Lighting/Bloom", "Enabled", "true"),
+                ("Lighting/DepthOfField", "Enabled", "false"),
+                ("Lighting/DepthOfField", "FarIntensity", "0.1"),
+                ("Lighting/DepthOfField", "FocusDistance", "0.05"),
+                ("Lighting/DepthOfField", "InFocusRadius", "30"),
+                ("Lighting/DepthOfField", "NearIntensity", "0.75"),
+                ("Lighting/SunRays", "Intensity", "0.01"),
+                ("Lighting/SunRays", "Spread", "0.1"),
+                ("Lighting/SunRays", "Enabled", "true"),
+                ("Players", "MaxPlayers", "30"),
+                ("Players", "PreferredPlayers", "30"),
+                ("Players", "RespawnTime", "3"),
+                ("Chat", "BubbleChatEnabled", "true"),
+                ("Chat", "LoadDefaultChat", "true"),
+                ("StarterPlayer", "CameraMaxZoomDistance", "128"),
+                ("StarterPlayer", "CharacterUseJumpPower", "false"),
+                ("StarterGui", "ScreenOrientation", "enum 4"),
+            ],
+        );
+    }
+
+    #[test]
+    fn classic_baseplate_is_studios() {
+        let d = builtin(templates::CLASSIC_BASEPLATE_PLACE_ID);
+        assert_eq!(d.title, "Classic Baseplate");
+        check(&d, COMMON);
+        check(
+            &d,
+            &[
+                ("Workspace/Baseplate", "Size", "v3 512 20 512"),
+                ("Workspace/Baseplate", "CFrame", "cf 0 -10 0 | 1 0 0 0 1 0 0 0 1"),
+                ("Workspace/Baseplate", "Color", "rgb 99 95 98"),
+                ("Workspace/Baseplate", "TopSurface", "enum 3"),
+                ("Workspace/Baseplate", "BottomSurface", "enum 4"),
+                ("Workspace/Terrain", "Decoration", "false"),
+                ("Lighting", "Ambient", "rgb 138 138 138"),
+                ("Lighting", "OutdoorAmbient", "rgb 128 128 128"),
+                ("Lighting", "Brightness", "2"),
+                ("Lighting", "TimeOfDay", "\"14:00:00\""),
+                ("Lighting", "GeographicLatitude", "41.7333"),
+                ("Lighting", "EnvironmentDiffuseScale", "0"),
+                ("Players", "MaxPlayers", "12"),
+                ("Players", "RespawnTime", "5"),
+                ("Chat", "BubbleChatEnabled", "false"),
+                ("StarterPlayer", "CharacterUseJumpPower", "true"),
+            ],
+        );
+        let ws = d.workspace().unwrap();
+        let names: Vec<_> = d.dom.get_by_ref(ws).unwrap().children().iter().map(|r| d.dom.get_by_ref(*r).unwrap().name.clone()).collect();
+        assert_eq!(names, ["Camera", "Baseplate", "Terrain"]);
+        let l = d.find_child(d.dom.root_ref(), "Lighting").unwrap();
+        assert!(d.dom.get_by_ref(l).unwrap().children().is_empty(), "Classic Baseplate's Lighting has no Sky or effects");
+    }
+
+    #[test]
+    fn flat_terrain_is_studios() {
+        let d = builtin(templates::FLAT_TERRAIN_PLACE_ID);
+        assert_eq!(d.title, "Flat Terrain");
+        check(&d, COMMON);
+        check(
+            &d,
+            &[
+                ("Workspace/Camera", "CFrame", "cf 58.4535 31.6316 -219.4025 | -0.113 0.2674 -0.9569 0 0.9631 0.2691 0.9936 0.0304 -0.1088"),
+                ("Workspace/Terrain", "Decoration", "true"),
+                ("Workspace/Terrain", "AcquisitionMethod", "enum 2"),
+                ("Lighting", "Brightness", "3"),
+                ("Lighting", "TimeOfDay", "\"14:30:00\""),
+                ("Lighting/Atmosphere", "Density", "0.3"),
+                ("Players", "MaxPlayers", "12"),
+                ("Players", "PreferredPlayers", "1"),
+                ("StarterPlayer", "CameraMaxZoomDistance", "400"),
+            ],
+        );
+        let ws = d.workspace().unwrap();
+        let names: Vec<_> = d.dom.get_by_ref(ws).unwrap().children().iter().map(|r| d.dom.get_by_ref(*r).unwrap().name.clone()).collect();
+        assert_eq!(names, ["Camera", "Terrain"]);
+        // Studio's ground: solid Grass, voxels x/z -256..255, y -14..1.
+        let v = crate::terrain::Voxels::from_dom(&d.dom).unwrap().unwrap();
+        assert_eq!(v.bounds(), Some(([-256, -14, -256], [255, 1, 255])));
+        assert_eq!(v.count(), 512 * 16 * 512);
         let grass = crate::terrain::material_index("Grass").unwrap();
-        assert_eq!(v.get(0, -1, 0).0, grass);
-        assert_eq!(v.get(100, -2, -100).0, grass);
-        assert_eq!(v.get(0, 1, 0).0, 0);
+        for p in [[-256, -14, -256], [255, 1, 255], [0, 1, 0], [100, -7, -200]] {
+            assert_eq!(v.get_raw(p), (grass, 255, 0), "{p:?}");
+        }
+        assert_eq!(v.get_raw([0, 2, 0]).0, 0);
+    }
+
+    #[test]
+    fn template_list_is_studios() {
+        let names: Vec<_> = templates::measured().into_iter().map(|t| t.name).collect();
+        assert_eq!(
+            names,
+            [
+                "Baseplate", "Classic Baseplate", "Flat Terrain", "Platformer", "Laser Tag", "Boneheads", "UGC Homestore", "FPS System",
+                "Racing", "Classic Obby", "Village", "Castle", "Suburban", "Pirate Island", "Starting Place", "Modern City"
+            ]
+        );
+        let reply = r#"{"data":[{"gameTemplateType":"Generic","hasTutorials":false,"universe":{"id":28220420,"name":"Baseplate","rootPlaceId":95206881}},
+            {"gameTemplateType":"Theme","hasTutorials":false,"universe":{"id":202770430,"name":"Village","rootPlaceId":520390648}},
+            {"gameTemplateType":"Gameplay","universe":{"id":5557500170,"name":"Racing","rootPlaceId":16078915506}}]}"#;
+        let l = templates::parse_list(reply).unwrap();
+        assert_eq!(l, vec![info(95206881), info(520390648), info(16078915506)]);
+        assert!(templates::parse_list(r#"{"data":[]}"#).is_err());
+        // Only the blank three are built in.
+        assert!(templates::new_place(&info(520390648), None).is_err());
+    }
+
+    #[test]
+    fn template_place_file_opens_named_after_the_template() {
+        let bp = builtin(templates::DEFAULT_PLACE_ID);
+        let bytes = bp.encode_all(false).unwrap();
+        let d = templates::new_place(&info(templates::DEFAULT_PLACE_ID), Some(&bytes)).unwrap();
+        assert_eq!(d.title, "Baseplate");
+        assert!(d.path.is_none() && d.cloud.is_none() && !d.dirty());
+        check(&d, COMMON);
+
+        // The template files as Roblox serves them: Lighting saved before
+        // the lighting-style migration (ShadowMap, LightingStyle Realistic,
+        // no marks). Studio opens them Soft and marked.
+        let mut old = builtin(templates::DEFAULT_PLACE_ID);
+        let l = old.find_child(old.dom.root_ref(), "Lighting").unwrap();
+        let i = old.dom.get_by_ref_mut(l).unwrap();
+        i.properties.remove(&rbx_dom_weak::ustr("Attributes"));
+        i.properties.insert(rbx_dom_weak::ustr("LightingStyle"), rbx_dom_weak::types::Variant::Enum(rbx_dom_weak::types::Enum::from_u32(0)));
+        let d = templates::new_place(&info(templates::DEFAULT_PLACE_ID), Some(&old.encode_all(false).unwrap())).unwrap();
+        check(&d, &[("Lighting", "LightingStyle", "enum 1"), ("Lighting", "Technology", "enum 3")]);
+        let l = d.find_child(d.dom.root_ref(), "Lighting").unwrap();
+        match d.prop(l, "Attributes") {
+            Some(rbx_dom_weak::types::Variant::Attributes(a)) => {
+                assert_eq!(a.get("RBX_LightingTechnologyUnifiedMigration"), Some(&rbx_dom_weak::types::Variant::Bool(true)));
+                assert_eq!(a.get("RBX_OriginalTechnologyOnFileLoad"), Some(&rbx_dom_weak::types::Variant::Int32(3)));
+            }
+            other => panic!("Lighting attributes: {other:?}"),
+        }
+    }
+
+    /// RUSTUDIO_GEN_BUILTIN=<dir of studio-<placeId>.rbxlx dumps> cargo test
+    /// generate_builtin_templates -- --ignored: rewrites start_page/builtin.rs.
+    #[test]
+    #[ignore]
+    fn generate_builtin_templates() {
+        let dir = std::path::PathBuf::from(std::env::var("RUSTUDIO_GEN_BUILTIN").expect("RUSTUDIO_GEN_BUILTIN"));
+        let load = |id: u64| Document::open(&dir.join(format!("studio-{id}.rbxlx"))).unwrap();
+        let (base, classic, flat) = (load(95206881), load(6560363541), load(95206192));
+        let src = super::studio_diff::generate(&base, &[("CLASSIC_BASEPLATE", &classic), ("FLAT_TERRAIN", &flat)]);
+        std::fs::write(concat!(env!("CARGO_MANIFEST_DIR"), "/src/start_page/builtin.rs"), src).unwrap();
+    }
+
+    /// RUSTUDIO_TEMPLATE_WRITE=<dir> cargo test write_builtin_templates --
+    /// --ignored: the built-in templates as <placeId>.rbxl (screenshots).
+    #[test]
+    #[ignore]
+    fn write_builtin_templates() {
+        let dir = std::path::PathBuf::from(std::env::var("RUSTUDIO_TEMPLATE_WRITE").expect("RUSTUDIO_TEMPLATE_WRITE"));
+        for id in [templates::DEFAULT_PLACE_ID, templates::CLASSIC_BASEPLATE_PLACE_ID, templates::FLAT_TERRAIN_PLACE_ID] {
+            std::fs::write(dir.join(format!("{id}.rbxl")), builtin(id).encode_all(false).unwrap()).unwrap();
+        }
+        std::fs::write(dir.join("old-new-place.rbxl"), Document::new_place().encode_all(false).unwrap()).unwrap();
+    }
+
+    /// RUSTUDIO_TEMPLATE_DUMP=<Studio's .rbxlx of a template>
+    /// RUSTUDIO_TEMPLATE=<name> cargo test studio_template_diff -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn studio_template_diff() {
+        let path = std::env::var("RUSTUDIO_TEMPLATE_DUMP").expect("RUSTUDIO_TEMPLATE_DUMP");
+        let name = std::env::var("RUSTUDIO_TEMPLATE").unwrap_or_else(|_| "Baseplate".into());
+        let t = templates::measured().into_iter().find(|t| t.name == name).expect("template name");
+        let studio = Document::open(std::path::Path::new(&path)).unwrap();
+        // RUSTUDIO_TEMPLATE_OURS=<file>: how rustudio loads that file instead.
+        let ours = match std::env::var("RUSTUDIO_TEMPLATE_OURS") {
+            Ok(f) => Document::open(std::path::Path::new(&f)).unwrap(),
+            Err(_) => templates::new_place(&t, None).unwrap(),
+        };
+        let (d, n) = super::studio_diff::diff(&studio, &ours, &[]);
+        for (p, k, s, o) in &d {
+            println!("DIFF {p} . {k}\n     studio {s}\n     ours   {o}");
+        }
+        println!("{} differences in {n} properties compared", d.len());
+        if std::env::var("RUSTUDIO_TEMPLATE_VOXELS").is_ok() {
+            for (label, doc) in [("studio", &studio), ("ours", &ours)] {
+                let Some(t) = doc.workspace().and_then(|w| doc.find_child(w, "Terrain")) else { continue };
+                if let Some(rbx_dom_weak::types::Variant::BinaryString(b)) = doc.prop(t, "SmoothGrid") {
+                    for (y, m) in super::studio_diff::voxel_layers(b.as_ref()) {
+                        println!("{label} y={y} {m:?}");
+                    }
+                }
+            }
+        }
     }
 }

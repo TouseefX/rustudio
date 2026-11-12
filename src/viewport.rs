@@ -30,6 +30,9 @@ pub struct Handle {
 
 #[derive(Debug, Clone)]
 pub struct GizmoDrag {
+    undo_parts: Option<Vec<(Ref, Xform, Vec3)>>,
+    undo_pivots: Option<Vec<crate::part_drag::PivotSnapshot>>,
+    pivots: Vec<crate::part_drag::PivotSnapshot>,
     pub handle: Handle,
     origin: Vec3,
     axes: Mat3,
@@ -41,6 +44,9 @@ pub struct GizmoDrag {
     parts: Vec<(Ref, Xform, Vec3)>,
     /// The applied amount (studs or degrees) for the status readout.
     pub amount: f32,
+    /// Collisions: the last amount that didn't overlap anything
+    /// (`_lastGoodGeometricTransform`).
+    last_good: f32,
 }
 
 /// Fly speed multiplier after `held` seconds of holding movement keys
@@ -107,9 +113,6 @@ pub struct LookGrab {
     pub start: Pos2,
     pub confined: bool,
     frames: u32,
-    /// The cursor was moved for the grab (LockCenter puts it in the middle):
-    /// it goes back to `start` on release, as for a confined grab.
-    moved: bool,
     /// Consecutive frames the pointer still moved while supposedly locked.
     moving: u32,
 }
@@ -135,7 +138,25 @@ impl Editor {
         if self.cursor_log.len() > 64 {
             self.cursor_log.remove(0);
         }
+        if std::env::var_os("RUSTUDIO_CURSOR_LOG").is_some() {
+            eprintln!("[cursor] {label} {cmd:?}");
+        }
         ctx.send_viewport_cmd(cmd);
+    }
+
+    /// Lets a game grab go (mouse_lock::release): the cursor stays where it
+    /// is held, never jumping to the middle of the view.
+    fn release_game_grab(&mut self, ctx: &egui::Context, g: &LookGrab, label: &str) {
+        use egui::viewport::CursorGrab;
+        use egui::ViewportCommand as V;
+        for c in crate::mouse_lock::release(g.start, g.confined) {
+            match c {
+                crate::mouse_lock::Cmd::Release => self.cursor_cmd(ctx, V::CursorGrab(CursorGrab::None), label),
+                crate::mouse_lock::Cmd::MoveTo(p) => {
+                    self.cursor_cmd(ctx, V::CursorPosition(p), &format!("game-grab:restore {:.0},{:.0}", p.x, p.y))
+                }
+            }
+        }
     }
 
     /// Right-drag look: grabs and hides the cursor while the button is held
@@ -158,7 +179,6 @@ impl Editor {
                 .unwrap_or(resp.rect.center());
             let confined = self.grab_use_confined;
             self.look_grab = Some(LookGrab {
-                moved: false,
                 start,
                 confined,
                 frames: 0,
@@ -184,17 +204,21 @@ impl Editor {
             return None;
         };
         if !secondary_down {
-            let start = grab.start;
+            let (start, confined) = (grab.start, grab.confined);
             self.look_grab = None;
-            self.cursor_cmd(ctx, V::CursorPosition(start), "restore-position");
+            // (a Locked cursor never moved; a Confined one goes back after
+            // the release: mouse_lock::release)
             self.cursor_cmd(ctx, V::CursorGrab(CursorGrab::None), "grab:none");
+            if confined {
+                self.cursor_cmd(ctx, V::CursorPosition(start), "restore-position");
+            }
             self.cursor_cmd(ctx, V::CursorVisible(true), "show");
             return None;
         }
         grab.frames += 1;
         // A locked cursor never moves. If it still does after a couple of
         // frames, locking isn't supported here: confine it instead.
-        if !grab.confined && grab.frames > 3 {
+        if !grab.confined && grab.frames > 3 && crate::mouse_lock::may_fall_back(crate::mouse_lock::platform_locks()) {
             let moved = ctx
                 .input(|i| i.pointer.latest_pos())
                 .is_some_and(|p| (p - grab.start).length() > 24.0);
@@ -266,12 +290,9 @@ impl Editor {
         if !focused {
             // Ask for a real lock again on return; a confine fallback found
             // earlier is re-detected if the platform still can't lock.
-            self.grab_use_confined = false;
+            self.grab_use_confined = !crate::mouse_lock::platform_locks();
             if let Some(g) = self.game_grab.take() {
-                self.cursor_cmd(ctx, V::CursorGrab(CursorGrab::None), "game-grab:unfocused");
-                if g.confined || g.moved {
-                    self.cursor_cmd(ctx, V::CursorPosition(g.start), "game-grab:restore");
-                }
+                self.release_game_grab(ctx, &g, "game-grab:unfocused");
             }
         }
         let begin = if behavior == 1 { inside } else { resp.hovered() };
@@ -283,7 +304,6 @@ impl Editor {
                 .unwrap_or(resp.rect.center());
             let confined = self.grab_use_confined;
             self.game_grab = Some(LookGrab {
-                moved: false,
                 start,
                 confined,
                 frames: 0,
@@ -302,10 +322,7 @@ impl Editor {
         if !want {
             // (an open menu already let go: free_cursor_for_menu)
             if let Some(g) = self.game_grab.take() {
-                self.cursor_cmd(ctx, V::CursorGrab(CursorGrab::None), "game-grab:none");
-                if g.confined || g.moved {
-                    self.cursor_cmd(ctx, V::CursorPosition(g.start), "game-grab:restore");
-                }
+                self.release_game_grab(ctx, &g, "game-grab:none");
             }
         }
         let grabbed = self.game_grab.is_some();
@@ -317,19 +334,21 @@ impl Editor {
             // instead. One jump isn't enough: coming back to the window
             // (alt-tab) reports the pointer's travel as a single big delta,
             // and taking that for "can't lock" left the cursor free.
-            if !g.confined && g.frames > 3 {
+            // (Never on Wayland: see mouse_lock::may_fall_back.)
+            if !g.confined && g.frames > 3 && crate::mouse_lock::may_fall_back(crate::mouse_lock::platform_locks()) {
                 g.moving = if pointer_delta.length() > 24.0 { g.moving + 1 } else { 0 };
                 if g.moving >= 3 {
                     g.confined = true;
                     fallback = true;
                 }
             }
-            // LockCenter keeps the cursor in the middle of the view.
-            if behavior == 1 && (g.confined || g.frames == 1) {
-                g.moved = true;
-                ctx.send_viewport_cmd(V::CursorPosition(resp.rect.center()));
-            } else if g.confined && behavior == 2 {
-                ctx.send_viewport_cmd(V::CursorPosition(g.start));
+            // The OS cursor stays where it was when the lock began (Roblox's
+            // LockCenter mouse is the middle of the view, but that is the
+            // game's mouse: mouse_lock::game_pointer, and the icon drawn
+            // there). Nothing moves a Locked cursor: a position sent then is a
+            // Wayland hint that Hyprland jumps the cursor to on release.
+            if let Some(at) = crate::mouse_lock::hold_at(g.start, g.confined) {
+                ctx.send_viewport_cmd(V::CursorPosition(at));
             }
         }
         if fallback {
@@ -340,7 +359,10 @@ impl Editor {
                 "game-grab:confined-fallback",
             );
         }
-        let hidden = !icon;
+        // While LockCenter holds the mouse the system cursor hides: Roblox
+        // draws the game's icon in the middle of the view instead (viewport
+        // draw, mouse_lock::locked_icon).
+        let hidden = !icon || (grabbed && behavior == 1);
         if hidden != self.game_cursor_hidden {
             self.game_cursor_hidden = hidden;
             self.cursor_cmd(
@@ -394,12 +416,21 @@ impl Editor {
         }
     }
 
+    /// LockCenter holds the mouse now (shift lock, first person): the
+    /// game's mouse is the middle of the view (mouse_lock::game_pointer).
+    pub fn lock_center_held(&self) -> bool {
+        self.game_grab.is_some()
+            && self
+                .play
+                .as_ref()
+                .is_some_and(|s| s.mouse_behavior == 1 && !s.game.menu_open)
+    }
+
     /// Lets go of a game cursor grab (after Stop).
     pub fn release_game_mouse(&mut self, ctx: &egui::Context) {
-        use egui::viewport::CursorGrab;
         use egui::ViewportCommand as V;
-        if self.game_grab.take().is_some() {
-            self.cursor_cmd(ctx, V::CursorGrab(CursorGrab::None), "game-grab:none");
+        if let Some(g) = self.game_grab.take() {
+            self.release_game_grab(ctx, &g, "game-grab:none");
         }
         if std::mem::take(&mut self.game_cursor_hidden) {
             self.cursor_cmd(ctx, V::CursorVisible(true), "game-cursor:show");
@@ -1082,6 +1113,10 @@ impl Editor {
                     self.warn(format!("Terrain couldn't be read: {e}"));
                     return;
                 }
+                // A Terrain that was never drawn on has no SmoothGrid yet
+                // (every new place): it is empty terrain, which the Terrain
+                // Editor's brushes draw into. Without it they did nothing.
+                None if terrain.is_some() => (Some(crate::terrain::Voxels::empty()), None),
                 None => (None, None),
             },
         };
@@ -1218,7 +1253,7 @@ impl Editor {
         self.terrain_tris = renderer.terrain_triangles();
         self.terrain_present = crate::terrain::materials_present(&voxels);
         self.terrain_params_dirty = true;
-        if !same {
+        if !same && voxels.count() > 0 {
             self.info(format!(
                 "Terrain: {} voxels, {} triangles",
                 voxels.count(),
@@ -1294,7 +1329,7 @@ impl Editor {
     /// blending, MaterialColors recolour): rebuilt after a terrain change and
     /// while texture packs are still arriving.
     fn sync_terrain_params(&mut self) {
-        let generation = crate::matpack::generation();
+        let generation = crate::terrain_mat::palette_generation(&self.doc, crate::matpack::generation());
         if !self.terrain_params_dirty && generation == self.terrain_params_gen {
             return;
         }
@@ -1336,9 +1371,10 @@ impl Editor {
             for face in 0..3u8 {
                 let i = crate::terrain::palette(m, face) as usize * 4;
                 let mut layer = -1.0f32;
-                let tex = t.faces[face as usize].clone().unwrap_or_default();
+                let tex = crate::terrain_mat::terrain_override(&self.doc, m, use2022)
+                    .or_else(|| t.faces[face as usize].clone()).unwrap_or_default();
                 if self.terrain_present[m as usize] && tex.pack != 0 {
-                    match crate::matpack::pack_maps(tex.pack, 0xff80_8080) {
+                    match crate::matpack::terrain_pack_maps(tex.pack, 0xff80_8080) {
                         crate::matpack::Lookup::Ready(maps) => {
                             layer = renderer.material_layer(&device, &queue, &maps) as f32;
                         }
@@ -1359,6 +1395,8 @@ impl Editor {
                     .flatten();
                 let avg = if m >= 2 { unit(fallback.unwrap_or(t.avg_albedo)) } else { unit(rgb) };
                 params[i + 3] = [avg[0], avg[1], avg[2], 0.0];
+                crate::terrain_mat::set_emissive(&mut params, i, m);
+                crate::terrain_mat::set_override_tint(&mut params, i, &self.doc, m, use2022, rgb);
             }
         }
         renderer.set_terrain_params(&queue, &params);
@@ -1415,6 +1453,13 @@ impl Editor {
         if parts.is_empty() {
             return None;
         }
+        if self.doc.selection.len() == 1 {
+            if let Some(pivot) = crate::part_drag::editor_model_pivot(&self.doc, self.doc.selection[0]) {
+                let (mn, mx) = self.selection_bounds()?;
+                let half = (mx - pivot.pos).abs().max((mn - pivot.pos).abs());
+                return Some((pivot.pos, if self.local_space { pivot.rot } else { Mat3::IDENTITY }, half));
+            }
+        }
         if parts.len() == 1 || self.local_space {
             let p = self.scene.get(parts[0])?;
             if self.local_space || self.tool == Tool::Scale {
@@ -1427,9 +1472,16 @@ impl Editor {
 
     /// Screen-space handle shapes for the active tool.
     fn handles(&self, rect: Rect) -> Vec<(Handle, Vec<Pos2>)> {
+        if self.tool == Tool::Transform {
+            return [Tool::Move, Tool::Scale, Tool::Rotate].into_iter()
+                .flat_map(|tool| self.handles_for_tool(rect, tool)).collect();
+        }
+        self.handles_for_tool(rect, self.tool)
+    }
+
+    fn handles_for_tool(&self, rect: Rect, tool: Tool) -> Vec<(Handle, Vec<Pos2>)> {
         let mut out = Vec::new();
-        let tool = self.tool;
-        if tool == Tool::Select {
+        if matches!(tool, Tool::Select | Tool::None) {
             return out;
         }
         let Some((origin, axes, half)) = self.gizmo_frame() else {
@@ -1476,7 +1528,7 @@ impl Editor {
                         ));
                     }
                 }
-                Tool::Select => {}
+                Tool::Select | Tool::None | Tool::Transform => {}
             }
         }
         out
@@ -1499,7 +1551,7 @@ impl Editor {
         best.map(|b| b.1)
     }
 
-    fn start_drag(&mut self, rect: Rect, handle: Handle, p: Pos2) {
+    pub(crate) fn start_drag(&mut self, rect: Rect, handle: Handle, p: Pos2) {
         let Some((origin, axes, _)) = self.gizmo_frame() else {
             return;
         };
@@ -1514,6 +1566,9 @@ impl Editor {
         let center_px = self.cam.project(rect, origin).unwrap_or(p);
         let last_angle = (p.y - center_px.y).atan2(p.x - center_px.x);
         self.drag = Some(GizmoDrag {
+            undo_parts: None,
+            undo_pivots: None,
+            pivots: crate::part_drag::selected_model_pivots(&self.doc),
             handle,
             origin,
             axes,
@@ -1523,71 +1578,24 @@ impl Editor {
             center_px,
             parts,
             amount: 0.0,
+            last_good: 0.0,
         });
     }
 
-    fn update_drag(&mut self, rect: Rect, p: Pos2) {
+    pub(crate) fn update_drag(&mut self, rect: Rect, p: Pos2, symmetric: bool, uniform: bool) {
         let Some(drag) = self.drag.as_mut() else {
             return;
         };
         let h = drag.handle;
         let dir = drag.axes.col(h.axis) * h.sign;
         let ray = self.cam.ray(rect, p);
-        let mut updates: Vec<(Ref, Xform, Vec3)> = Vec::new();
-        match h.tool {
-            Tool::Move => {
+        // The wanted amount (studs or degrees), snapped.
+        let wanted = match h.tool {
+            Tool::Move | Tool::Scale => {
                 let Some(t) = ray.closest_on_line(drag.origin, dir) else {
                     return;
                 };
-                let d = snap(
-                    t - drag.start_param,
-                    if self.snap_move { self.move_inc } else { 0.0 },
-                );
-                drag.amount = d;
-                for (r, xf, size) in &drag.parts {
-                    updates.push((
-                        *r,
-                        Xform {
-                            pos: xf.pos + dir * d,
-                            rot: xf.rot,
-                        },
-                        *size,
-                    ));
-                }
-            }
-            Tool::Scale => {
-                let Some(t) = ray.closest_on_line(drag.origin, dir) else {
-                    return;
-                };
-                let d = snap(
-                    t - drag.start_param,
-                    if self.snap_move { self.move_inc } else { 0.0 },
-                );
-                drag.amount = d;
-                for (r, xf, size) in &drag.parts {
-                    // Grow the part's own axis closest to the dragged direction, one side only.
-                    let k = (0..3)
-                        .max_by(|a, b| {
-                            xf.rot
-                                .col(*a)
-                                .dot(dir)
-                                .abs()
-                                .total_cmp(&xf.rot.col(*b).dot(dir).abs())
-                        })
-                        .unwrap_or(0);
-                    let along = xf.rot.col(k) * xf.rot.col(k).dot(dir).signum();
-                    let mut s = *size;
-                    s[k] = (size[k] + d).max(mech::MIN_PART_SIZE);
-                    let grow = s[k] - size[k];
-                    updates.push((
-                        *r,
-                        Xform {
-                            pos: xf.pos + along * grow * 0.5,
-                            rot: xf.rot,
-                        },
-                        s,
-                    ));
-                }
+                snap(t - drag.start_param, if self.snap_move { self.move_inc } else { 0.0 })
             }
             Tool::Rotate => {
                 let a = (p.y - drag.center_px.y).atan2(p.x - drag.center_px.x);
@@ -1602,26 +1610,31 @@ impl Editor {
                 if facing {
                     deg = -deg;
                 }
-                let deg = snap(
-                    deg,
-                    if self.snap_rotate {
-                        self.rotate_inc
-                    } else {
-                        0.0
-                    },
-                );
-                drag.amount = deg;
-                let rot = Mat3::from_axis_angle(axis, deg.to_radians());
-                for (r, xf, size) in &drag.parts {
-                    let nx = Xform {
-                        pos: drag.origin + rot * (xf.pos - drag.origin),
-                        rot: rot * xf.rot,
-                    }
-                    .orthonormalized();
-                    updates.push((*r, nx, *size));
-                }
+                snap(deg, if self.snap_rotate { self.rotate_inc } else { 0.0 })
             }
-            Tool::Select => {}
+            Tool::Select | Tool::None | Tool::Transform => return,
+        };
+        drag.amount = wanted;
+        let drag = drag.clone();
+        let make = |d: f32| gizmo_updates(&drag, dir, d, symmetric, uniform);
+        // Collisions: stop short of overlapping (TransformHandlesImplementation
+        // ._safelyTransformParts / ExtrudeHandles._binarySearchForGoodPartSize).
+        let amount = if self.collisions {
+            let eps = if h.tool == Tool::Rotate { mech::COLLISION_EPS.to_degrees() } else { mech::COLLISION_EPS };
+            let hits = |d: f32| self.overlaps_others(&make(d));
+            crate::part_drag::safe_amount(drag.last_good, wanted, eps, hits)
+        } else {
+            wanted
+        };
+        if let Some(d) = self.drag.as_mut() {
+            d.last_good = amount;
+        }
+        let updates = make(amount);
+        if h.tool != Tool::Scale {
+            if let (Some((_, old, _)), Some((_, new, _))) = (drag.parts.first(), updates.first()) {
+                let rot = new.rot * old.rot.transpose();
+                crate::part_drag::apply_model_pivots(&mut self.doc, &drag.pivots, Xform { pos: new.pos - rot * old.pos, rot });
+            }
         }
         for (r, xf, size) in updates {
             self.doc
@@ -1633,10 +1646,25 @@ impl Editor {
         }
     }
 
-    fn finish_drag(&mut self) {
+    pub(crate) fn duplicate_handle_drag(&mut self, map: &std::collections::HashMap<Ref, Ref>) {
+        let Some(d) = self.drag.as_mut() else { return };
+        d.parts.retain_mut(|(r, _, _)| {
+            if let Some(copy) = map.get(r) { *r = *copy; true } else { false }
+        });
+        d.pivots.retain_mut(|p| { if let Some(copy) = map.get(&p.r) { p.r = *copy; true } else { false } });
+        d.undo_pivots = Some(crate::part_drag::pivot_undo_baseline(&self.doc, &d.pivots));
+        d.undo_parts = Some(d.parts.iter().filter_map(|(r, _, _)| {
+            let props = &self.doc.dom.get_by_ref(*r)?.properties;
+            let Variant::CFrame(cf) = props.get(&ustr("CFrame"))? else { return None };
+            let Variant::Vector3(size) = props.get(&ustr("Size"))? else { return None };
+            Some((*r, Xform::from_cframe(cf), crate::math::v3(*size)))
+        }).collect());
+    }
+
+    pub(crate) fn finish_drag(&mut self) {
         let Some(drag) = self.drag.take() else { return };
         let mut changes = Vec::new();
-        for (r, xf, size) in &drag.parts {
+        for (r, xf, size) in drag.undo_parts.as_ref().unwrap_or(&drag.parts) {
             let old_cf = Some(Variant::CFrame(xf.to_cframe()));
             if let Some(new_cf) = self
                 .doc
@@ -1666,8 +1694,9 @@ impl Editor {
             Tool::Move => "Move",
             Tool::Scale => "Resize",
             Tool::Rotate => "Rotate",
-            Tool::Select => "Edit",
+            Tool::Select | Tool::None | Tool::Transform => "Edit",
         };
+        changes.extend(crate::part_drag::pivot_changes(&self.doc, drag.undo_pivots.as_ref().unwrap_or(&drag.pivots)));
         self.doc.record_props(label, changes);
     }
 
@@ -1928,6 +1957,7 @@ impl Editor {
         let playing = self.play.is_some();
         // View > Show UI.
         let show_gui = self.ui.show_gui;
+        self.gui.pointer_override = self.lock_center_held().then(|| rect.center());
         let gui_took = {
             let doc_dir = self
                 .doc
@@ -1961,17 +1991,34 @@ impl Editor {
                         playing,
                     },
                 );
-                // The game's cursor image over the view (not while grabbed:
-                // the cursor is hidden then).
-                let image = play
-                    .as_ref()
-                    .filter(|s| s.mouse_icon && game_grab.is_none() && !s.game.menu_open)
-                    .and_then(|s| s.cursor_image.clone());
-                if let (Some(id), Some(at)) = (
-                    image,
-                    ctx.input(|i| i.pointer.latest_pos()).filter(|p| rect.contains(*p)),
-                ) {
-                    if gui.draw_cursor(&ctx, &painter, assets, doc_dir.as_deref(), &id, at) {
+                // The game's cursor image over the view. While LockCenter
+                // holds the mouse (shift lock, first person) Roblox draws it
+                // in the middle of the view, where its mouse is, at the
+                // image's own size (MouseLockedCursor for shift lock, its
+                // arrow when the game set none); the system cursor is hidden
+                // then (update_game_mouse). Other grabs (a right-drag look)
+                // show nothing.
+                let menu = play.as_ref().is_some_and(|s| s.game.menu_open);
+                let locked_center = gui.pointer_override.is_some();
+                let (image, at) = if locked_center {
+                    (
+                        play.as_ref().and_then(|s| {
+                            crate::mouse_lock::locked_icon(s.mouse_icon, s.cursor_image.as_deref())
+                        }),
+                        Some(rect.center()),
+                    )
+                } else {
+                    (
+                        play.as_ref()
+                            .filter(|s| s.mouse_icon && game_grab.is_none() && !menu)
+                            .and_then(|s| s.cursor_image.clone()),
+                        ctx.input(|i| i.pointer.latest_pos()).filter(|p| rect.contains(*p)),
+                    )
+                };
+                if let (Some(id), Some(at)) = (image, at) {
+                    if gui.draw_cursor(&ctx, &painter, assets, doc_dir.as_deref(), &id, at)
+                        && !locked_center
+                    {
                         ctx.set_cursor_icon(egui::CursorIcon::None);
                     }
                 }
@@ -2043,14 +2090,24 @@ impl Editor {
         // The Terrain Editor's brush has the left button while one is picked.
         let brushing = !in_game && !alt && self.terrain_brush_ui(&ctx, rect, &resp, pointer, &painter);
 
+        if self.part_drag.is_some() {
+            for (key, tilt) in [(egui::Key::R, false), (egui::Key::T, true)] {
+                if ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, key)) {
+                    self.rotate_part_drag(tilt);
+                }
+            }
+            if ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::H)) {
+                crate::part_drag::HOTKEY_HELP_HIDDEN.fetch_xor(true, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
         // -------------------------------------------------- select & gizmo
-        let primary_drag = resp.dragged_by(PointerButton::Primary) && !alt && !in_game && !brushing;
-        if resp.drag_started_by(PointerButton::Primary) && !alt && !in_game && !brushing {
+        let primary_drag = resp.dragged_by(PointerButton::Primary) && (!alt || self.drag.is_some()) && !in_game && !brushing;
+        if resp.drag_started_by(PointerButton::Primary) && self.tool != Tool::None && !alt && !in_game && !brushing {
             let start = ctx.input(|i| i.pointer.press_origin()).or(pointer);
             if let Some(p) = start {
                 if let Some(h) = self.handle_at(&handles, p) {
                     self.start_drag(rect, h, p);
-                } else if matches!(self.tool, Tool::Select | Tool::Move)
+                } else if matches!(self.tool, Tool::Select | Tool::Move | Tool::Scale | Tool::Rotate | Tool::Transform)
                     && self.start_part_drag(rect, p, ctrl || shift)
                 {
                     // Studio: pressing on a part and dragging moves it (src/part_drag.rs).
@@ -2063,8 +2120,10 @@ impl Editor {
         if primary_drag {
             if let Some(p) = ctx.input(|i| i.pointer.interact_pos()) {
                 if self.drag.is_some() {
-                    self.update_drag(rect, p);
-                } else if self.part_drag.is_some() {
+                    self.update_drag(rect, p, ctrl, alt);
+                } else if let Some(d) = self.part_drag.as_mut() {
+                    // Shift held: no grid snapping (DraggerContext.shouldGridSnap).
+                    d.shift = shift;
                     self.update_part_drag(rect, p);
                 } else if let Some(start) = self.marquee {
                     // Studio highlights what the box holds while it is dragged.
@@ -2091,7 +2150,7 @@ impl Editor {
                 }
             }
         }
-        if resp.clicked_by(PointerButton::Primary) && !alt && !in_game && !brushing {
+        if resp.clicked_by(PointerButton::Primary) && self.tool != Tool::None && !alt && !in_game && !brushing {
             if let Some(p) = pointer {
                 // A GUI object under the cursor is picked first, as in Studio.
                 let hit = self
@@ -2116,21 +2175,18 @@ impl Editor {
         // ------------------------------------------------------- overlays
         self.scene.sync(&mut self.doc);
         self.draw_selection(&painter, rect);
-        if let Some(h) = self.hover {
+        // Studio's hover outline (DraggerService.HoverThickness); none while
+        // dragging (only the Ready state renders hover).
+        if let Some(h) = self.hover.filter(|_| self.part_drag.is_none() && self.drag.is_none()) {
             for r in std::iter::once(h).chain(self.doc.dom.descendants_of(h).map(|i| i.referent()))
             {
                 if let Some(sp) = self.scene.get(r) {
-                    self.draw_box(
-                        &painter,
-                        rect,
-                        &sp.xf,
-                        sp.size,
-                        Stroke::new(1.0, theme::HOVER_3D.gamma_multiply(0.8)),
-                    );
+                    self.draw_outline(&painter, rect, sp, Stroke::new(mech::HOVER_OUTLINE_PX, theme::HOVER_3D));
                 }
             }
         }
-        let handles = self.handles(rect);
+        // A free drag hides the handles (Studio draws only the pivot then).
+        let handles = if self.part_drag.is_some() { Vec::new() } else { self.handles(rect) };
         // A grab point per handle: arrow/handle tips, and 45° along each ring
         // (where no other ring crosses it).
         self.gizmo_points = handles
@@ -2146,9 +2202,20 @@ impl Editor {
                 )
             })
             .collect();
+        // Dragging a Move arrow: Studio draws only that arrow, a white guide
+        // along its axis through the pivot, and the distance by the arrow.
+        let moving = self.drag.as_ref().filter(|d| d.handle.tool == Tool::Move).map(|d| (d.handle, d.origin, d.axes.col(d.handle.axis), d.amount));
+        if let Some((_, o, axis, _)) = moving {
+            if let (Some(a), Some(b)) = (self.cam.project(rect, o - axis * 1000.0), self.cam.project(rect, o + axis * 1000.0)) {
+                painter.with_clip_rect(rect).line_segment([a, b], Stroke::new(1.0, Color32::WHITE));
+            }
+        }
         for (h, pts) in &handles {
+            if moving.is_some_and(|(mh, ..)| mh != *h) {
+                continue;
+            }
             let active =
-                self.drag.as_ref().is_some_and(|d| d.handle == *h) || hover_handle == Some(*h);
+                hover_handle == Some(*h) && self.drag.is_none();
             let c = if active {
                 HOVER_COLOR
             } else {
@@ -2175,7 +2242,27 @@ impl Editor {
                         Stroke::new(if active { 3.5 } else { 2.5 }, c),
                     ));
                 }
-                Tool::Select => {}
+                Tool::Select | Tool::None | Tool::Transform => {}
+            }
+        }
+        if let Some((mh, ..)) = moving {
+            if let Some((_, pts)) = handles.iter().find(|(h, _)| *h == mh) {
+                let amount = self.drag.as_ref().map(|d| d.amount).unwrap_or(0.0);
+                let text = format!("{}", (amount * 1000.0).round() / 1000.0);
+                let tip = pts[pts.len() - 1] + Vec2::new(-35.0, 30.0);
+                let galley = painter.layout_no_wrap(text, egui::FontId::proportional(15.0), Color32::WHITE);
+                let r = Rect::from_center_size(tip, galley.size() + Vec2::new(10.0, 8.0));
+                painter.rect_filled(r, 3.0, Color32::from_rgb(30, 30, 30));
+                painter.rect_stroke(r, 3.0, Stroke::new(1.0, Color32::from_rgb(90, 90, 90)), egui::StrokeKind::Inside);
+                painter.galley(r.min + Vec2::new(5.0, 4.0), galley, Color32::WHITE);
+            }
+        }
+        // The pivot: a white dot ringed in Select Color at the handles'
+        // centre (Move / Scale / Rotate / Transform, also mid free drag).
+        if !matches!(self.tool, Tool::Select | Tool::None) {
+            if let Some(c) = self.gizmo_frame().and_then(|(o, _, _)| self.cam.project(rect, o)) {
+                painter.circle_filled(c, 4.5, theme::SELECT);
+                painter.circle_filled(c, 2.5, Color32::WHITE);
             }
         }
         if let (Some(start), Some(end)) = (self.marquee, pointer) {
@@ -2194,6 +2281,7 @@ impl Editor {
         // compass or border (tools/fidelity side-by-side shots).
         if !self.is_playing() {
             self.draw_viewport_hud(&painter, rect);
+            self.draw_drag_hotkeys(&painter, rect);
         }
     }
 
@@ -2214,11 +2302,62 @@ impl Editor {
         }
     }
 
+    /// Studio's selection look (Selection.RenderMode Outlines): a band
+    /// around the part's silhouette (the convex hull of its projected shape),
+    /// not its box edges. Behind the camera: the box edges instead.
+    pub(crate) fn draw_outline(&self, painter: &egui::Painter, rect: Rect, sp: &ScenePart, stroke: Stroke) {
+        let solid = self.solid_of(sp);
+        let mut pts3: Vec<Vec3> = solid.geometry().verts;
+        if matches!(sp.draw.mesh, crate::render::MeshKind::Ball | crate::render::MeshKind::Cylinder) {
+            // Round shapes: their rims (a ball's three great circles, a
+            // cylinder's end circles about its X axis).
+            pts3.clear();
+            let h = sp.size * 0.5;
+            let (x, y, z) = (sp.xf.rot.col(0), sp.xf.rot.col(1), sp.xf.rot.col(2));
+            for i in 0..48 {
+                let a = i as f32 / 48.0 * std::f32::consts::TAU;
+                let (c, s) = (a.cos(), a.sin());
+                if sp.draw.mesh == crate::render::MeshKind::Ball {
+                    let r = h.min_element();
+                    pts3.extend([x * c * r + y * s * r, y * c * r + z * s * r, z * c * r + x * s * r].map(|v| sp.xf.pos + v));
+                } else {
+                    let r = h.y.min(h.z);
+                    for e in [-h.x, h.x] {
+                        pts3.push(sp.xf.pos + x * e + y * c * r + z * s * r);
+                    }
+                }
+            }
+        }
+        let pts: Option<Vec<Pos2>> = pts3.iter().map(|p| self.cam.project(rect, *p)).collect();
+        let Some(mut pts) = pts else {
+            self.draw_box(painter, rect, &sp.xf, sp.size, stroke);
+            return;
+        };
+        // Andrew's monotone chain.
+        pts.sort_by(|a, b| a.x.total_cmp(&b.x).then(a.y.total_cmp(&b.y)));
+        let cross = |o: Pos2, a: Pos2, b: Pos2| (a.x - o.x) * (b.y - o.y) - (a.y - o.y) * (b.x - o.x);
+        let mut hull: Vec<Pos2> = Vec::new();
+        for pass in 0..2 {
+            let start = hull.len();
+            let iter: Vec<Pos2> = if pass == 0 { pts.clone() } else { pts.iter().rev().copied().collect() };
+            for p in iter {
+                while hull.len() >= start + 2 && cross(hull[hull.len() - 2], hull[hull.len() - 1], p) <= 0.0 {
+                    hull.pop();
+                }
+                hull.push(p);
+            }
+            hull.pop();
+        }
+        if hull.len() >= 2 {
+            painter.add(egui::Shape::closed_line(hull, stroke));
+        }
+    }
+
     fn draw_selection(&self, painter: &egui::Painter, rect: Rect) {
-        let stroke = Stroke::new(1.6, theme::SELECT);
+        let stroke = Stroke::new(mech::SELECTION_OUTLINE_PX, theme::SELECT);
         for r in self.selected_parts() {
             if let Some(sp) = self.scene.get(r) {
-                self.draw_box(painter, rect, &sp.xf, sp.size, stroke);
+                self.draw_outline(painter, rect, sp, stroke);
             }
         }
         // Models also get a dimmer box around everything they contain.
@@ -2373,7 +2512,11 @@ impl LightingState {
 
     /// Parts or terrain changed since the light grid on the GPU was built.
     pub fn lightgrid_pending(&self) -> bool {
-        self.lightgrid_dirty || self.lightgrid_moves || self.lightgrid_job.is_some()
+        self.lightgrid_dirty
+            || self.lightgrid_moves
+            || self.lightgrid_job.is_some()
+            || self.lightgrid_local_dirty
+            || self.lightgrid_local_job.is_some()
     }
 
 }
@@ -2407,7 +2550,24 @@ pub struct LightingState {
     lightgrid_hull_boxes: std::collections::HashMap<(String, u32), Vec<(Vec3, Vec3)>>,
     lightgrid_terrain: Option<([i32; 3], Option<std::sync::Arc<Vec<u8>>>)>,
     lightgrid_lights: Vec<crate::render::LightRaw>,
-    lightgrid_job: Option<std::sync::mpsc::Receiver<crate::lightgrid::LightGrid>>,
+    #[allow(clippy::type_complexity)]
+    lightgrid_job: Option<std::sync::mpsc::Receiver<(crate::lightgrid::LightGrid, std::sync::Arc<crate::lightgrid::Occupancy>, crate::lightgrid::LocalLights)>>,
+    /// The shown grid's voxels and its local channel as kept
+    /// (lightgrid::LocalLights): a change of lights alone (a muzzle flash's
+    /// PointLight flicked on for 35 ms, moving with the camera) re-lights
+    /// just the boxes of the lights that changed, in the same frame, as
+    /// Studio's grid shows it within a frame or two; a rebuild of the whole
+    /// channel (throttled full builds, then ~30 ms re-lights on a worker)
+    /// showed a flash late, kept it lit after it was off and skipped shots.
+    /// `lightgrid_local_dirty`: the lights changed since `lightgrid_locals`
+    /// last caught up; `lightgrid_local_job`: a whole re-light on a worker
+    /// (when the lights that changed reach more than
+    /// LIGHTGRID_LOCAL_PATCH_MAX voxels).
+    lightgrid_occ: Option<std::sync::Arc<crate::lightgrid::Occupancy>>,
+    lightgrid_locals: Option<crate::lightgrid::LocalLights>,
+    lightgrid_local_dirty: bool,
+    #[allow(clippy::type_complexity)]
+    lightgrid_local_job: Option<std::sync::mpsc::Receiver<(crate::lightgrid::LocalLights, Vec<u8>)>>,
     /// Parts blocking local lights (lightocc.rs): the grid last asked for
     /// (first voxel, studs per voxel, document) and the one on the GPU,
     /// last rebuild, parts changed since, and the worker filling the next.
@@ -2580,11 +2740,36 @@ impl Editor {
         let st = &mut self.lighting;
         if bytemuck::cast_slice::<_, u8>(&st.lightgrid_lights) != bytemuck::cast_slice::<_, u8>(lights) {
             st.lightgrid_lights = lights.to_vec();
-            st.lightgrid_dirty = true;
+            // With the voxels at hand only the local channel needs redoing
+            // (a full build running brings its own lights; the ones after
+            // are caught up when it lands).
+            if st.lightgrid_occ.is_some() {
+                st.lightgrid_local_dirty = true;
+            } else {
+                st.lightgrid_dirty = true;
+            }
+        }
+        if let Some(rx) = &st.lightgrid_local_job {
+            match rx.try_recv() {
+                Ok((locals, local)) => {
+                    if let (Some(renderer), Some(rs)) = (self.renderer.as_mut(), self.render_state.as_ref()) {
+                        // Only if the grid it re-lit is still the one shown.
+                        if st.lightgrid_shown == Some(locals.origin) {
+                            renderer.set_localgrid(&rs.queue, &local);
+                            st.lightgrid_locals = Some(locals);
+                            st.lightgrid_local_dirty = true;
+                        }
+                    }
+                    st.lightgrid_local_job = None;
+                }
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => st.lightgrid_local_job = None,
+                Err(std::sync::mpsc::TryRecvError::Empty) => {}
+            }
         }
         if let Some(rx) = &st.lightgrid_job {
             match rx.try_recv() {
-                Ok(grid) => {
+                Ok((mut grid, occ, locals)) => {
+                    st.lightgrid_occ = Some(occ);
                     if let Ok(points) = std::env::var("RUSTUDIO_LIGHTGRID_DEBUG") {
                         for point in points.split(';') {
                             let p: Vec<f32> = point.split(',').filter_map(|x| x.parse().ok()).collect();
@@ -2598,7 +2783,13 @@ impl Editor {
                         renderer.set_lightgrid(&rs.queue, &grid.data);
                         renderer.set_localgrid(&rs.queue, &grid.local);
                         st.lightgrid_shown = Some(grid.origin);
+                        // (the GPU has the channel; it's kept as `locals`)
+                        grid.local = Vec::new();
                         st.fx.grid = Some(std::sync::Arc::new(grid));
+                        st.lightgrid_locals = Some(locals);
+                        // A re-light running was for the grid before.
+                        st.lightgrid_local_job = None;
+                        st.lightgrid_local_dirty = true;
                     }
                     st.lightgrid_job = None;
                 }
@@ -2705,14 +2896,42 @@ impl Editor {
                 if shadows {
                     crate::lightgrid::sunlight(&occ, &mut grid, sun);
                 }
-                grid.local = crate::lightgrid::local_lights(&occ, &local_lights);
-                let _ = tx.send(grid);
+                let (locals, local) = crate::lightgrid::LocalLights::build(&occ, &local_lights);
+                grid.local = local;
+                let _ = tx.send((grid, std::sync::Arc::new(occ), locals));
             });
             st.lightgrid_job = Some(rx);
             st.lightgrid_key = Some(key);
             st.lightgrid_at = Some(std::time::Instant::now());
             st.lightgrid_dirty = pending_meshes;
             st.lightgrid_moves = false;
+        }
+        // Lights changed, voxels didn't: re-light the boxes of the lights
+        // that changed now (also while a full build runs: it catches up
+        // when it lands), or the whole channel on a worker when they're big.
+        if st.lightgrid_local_dirty && st.lightgrid_local_job.is_none() {
+            if let (Some(occ), Some(locals)) = (st.lightgrid_occ.clone(), st.lightgrid_locals.as_mut()) {
+                if Some(locals.origin) == st.lightgrid_shown {
+                    let _b = crate::bench::scope("lightgrid_local");
+                    match locals.update(&occ, &st.lightgrid_lights, mech::LIGHTGRID_LOCAL_PATCH_MAX) {
+                        Ok(patch) => {
+                            if let (Some(p), Some(renderer), Some(rs)) = (patch, self.renderer.as_mut(), self.render_state.as_ref()) {
+                                renderer.set_localgrid_region(&rs.queue, &p);
+                            }
+                            st.lightgrid_local_dirty = false;
+                        }
+                        Err(()) => {
+                            let lights = st.lightgrid_lights.clone();
+                            let (tx, rx) = std::sync::mpsc::channel();
+                            std::thread::spawn(move || {
+                                let _ = tx.send(crate::lightgrid::LocalLights::build(&occ, &lights));
+                            });
+                            st.lightgrid_local_job = Some(rx);
+                            st.lightgrid_local_dirty = false;
+                        }
+                    }
+                }
+            }
         }
         match st.lightgrid_shown {
             Some(o) => [o[0] as f32, o[1] as f32, o[2] as f32, mech::LIGHTGRID_NORMAL_OFFSET],
@@ -3103,4 +3322,42 @@ fn orient_sky(cube: [Vec<u8>; 6], size: u32, orient: Vec3) -> [Vec<u8>; 6] {
         }
         px
     })
+}
+
+/// The parts' new (CFrame, Size) for a handle drag of `d` studs (Move,
+/// Scale) or degrees (Rotate).
+fn gizmo_updates(drag: &GizmoDrag, dir: Vec3, d: f32, symmetric: bool, uniform: bool) -> Vec<(Ref, Xform, Vec3)> {
+    let h = drag.handle;
+    let mut updates = Vec::new();
+    match h.tool {
+        Tool::Move => {
+            for (r, xf, size) in &drag.parts {
+                updates.push((*r, Xform { pos: xf.pos + dir * d, rot: xf.rot }, *size));
+            }
+        }
+        Tool::Scale => {
+            for (r, xf, size) in &drag.parts {
+                // Grow the part's own axis closest to the dragged direction, one side only.
+                let k = (0..3)
+                    .max_by(|a, b| xf.rot.col(*a).dot(dir).abs().total_cmp(&xf.rot.col(*b).dot(dir).abs()))
+                    .unwrap_or(0);
+                let along = xf.rot.col(k) * xf.rot.col(k).dot(dir).signum();
+                let (s, grow) = crate::part_drag::scaled_size(*size, k, d, symmetric, uniform);
+                updates.push((
+                    *r,
+                    Xform { pos: xf.pos + along * grow * if symmetric { 0.0 } else { 0.5 }, rot: xf.rot },
+                    s,
+                ));
+            }
+        }
+        Tool::Rotate => {
+            let rot = Mat3::from_axis_angle(drag.axes.col(h.axis), d.to_radians());
+            for (r, xf, size) in &drag.parts {
+                let nx = Xform { pos: drag.origin + rot * (xf.pos - drag.origin), rot: rot * xf.rot }.orthonormalized();
+                updates.push((*r, nx, *size));
+            }
+        }
+        Tool::Select | Tool::None | Tool::Transform => {}
+    }
+    updates
 }

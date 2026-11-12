@@ -14,6 +14,8 @@ use crate::app::{Editor, Tool};
 use crate::doc::Document;
 use crate::viewport::Handle;
 
+mod duplicate_drag;
+mod drag_parity;
 mod movement_r6;
 mod account;
 mod cloud;
@@ -32,6 +34,7 @@ mod client_velocity;
 mod gui_modal;
 mod pause_menu;
 mod hud_resize;
+mod popout;
 mod project;
 mod ui;
 mod ui2;
@@ -97,6 +100,7 @@ pub struct SelfTest {
     cvel: client_velocity::ClientVelocityTest,
     gmodal: gui_modal::GuiModalTest,
     hud: hud_resize::HudResizeTest,
+    popout: popout::PopoutTest,
     pj: project::ProjectTest,
     ui: ui::UiTest,
     ui2: ui2::Ui2Test,
@@ -193,6 +197,7 @@ impl SelfTest {
             cvel: client_velocity::ClientVelocityTest::default(),
             gmodal: gui_modal::GuiModalTest::default(),
             hud: hud_resize::HudResizeTest::default(),
+            popout: popout::PopoutTest::default(),
             pj: project::ProjectTest::default(),
             ui: ui::UiTest::default(),
             ui2: ui2::Ui2Test::default(),
@@ -242,6 +247,18 @@ impl SelfTest {
     /// Advances the script one frame; returns true when finished.
     pub fn tick(&mut self, ed: &mut Editor, _ctx: &egui::Context) -> bool {
         self.frame += 1;
+        if std::env::var_os("RUSTUDIO_DRAG_PARITY_REGRESSION").is_some() {
+            if self.frame < 3 { return false; }
+            let (cases, bad) = ed.regression_drag_parity();
+            std::fs::write(&self.out, json!({"test": "drag_parity", "passed": bad.is_empty(), "cases": cases, "failures": bad}).to_string()).unwrap();
+            return true;
+        }
+        if std::env::var_os("RUSTUDIO_DUPLICATE_DRAG_REGRESSION").is_some() {
+            if self.frame < 3 { return false; }
+            let cases = ed.regression_duplicate_during_drag();
+            std::fs::write(&self.out, format!("{{\"test\":\"duplicate_during_drag\",\"passed\":true,\"cases\":{cases}}}")).unwrap();
+            return true;
+        }
         let (t0, last) = *self.clock.get_or_insert((std::time::Instant::now(), 0.0));
         let now = t0.elapsed().as_secs_f32();
         while self.step_secs.len() < self.steps.len() {
@@ -764,8 +781,18 @@ impl SelfTest {
                     .iter()
                     .any(|s| s.starts_with("grab:locked") || s.starts_with("grab:confined"))
                     && l.mid_log.iter().any(|s| s == "hide");
-                let restored =
-                    ed.look_grab.is_none() && tail == ["restore-position", "grab:none", "show"];
+                // mouse_lock::release: let go first; only a Confined grab (no
+                // real lock, or the fallback) is put back where it began,
+                // since winit only moves an unlocked cursor. A Locked one
+                // never moved.
+                let confined = l.mid_log.iter().any(|s| s.starts_with("grab:confined"));
+                let want: &[&str] = if confined {
+                    &["grab:none", "restore-position", "show"]
+                } else {
+                    &["grab:none", "show"]
+                };
+                let tail = &tail[tail.len().saturating_sub(want.len())..];
+                let restored = ed.look_grab.is_none() && tail == want;
                 self.steps.push(Step {
                     step: "cursor-grab",
                     passed: l.mid_grabbed && grabbed && restored,
@@ -2122,6 +2149,8 @@ impl SelfTest {
             114..=115 => return self.tick_bloom(f, ed),
             // Round 21: the Terrain Editor (Generate, a Draw stroke, Clear, undo).
             116 => return self.tick_terrain_ed(f, ed),
+            // Panel windows: pop out, keep drawing, dock back; placement.
+            117 => return self.tick_popout(f, ed),
             // Everything has run: the report.
             96 => return self.finish(),
             // og.rbxl (or RUSTUDIO_PERF_PLACE): 10 s of Play, frame times.

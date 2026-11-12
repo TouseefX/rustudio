@@ -66,12 +66,19 @@ impl UiShots {
             let _ = std::fs::create_dir_all(&dir);
             use crate::terrain_editor::Tool;
             let shots = [
-                ("draw", Tool::Draw),
+                ("create", Tool::Clear),
+                ("import", Tool::Import),
                 ("generate", Tool::Generate),
+                ("clear", Tool::Clear),
                 ("select", Tool::Select),
-                ("move", Tool::Move),
-                ("rotate", Tool::Rotate),
+                ("transform", Tool::Transform),
                 ("fill", Tool::Fill),
+                ("sealevel", Tool::SeaLevel),
+                ("draw", Tool::Draw),
+                ("sculpt", Tool::Sculpt),
+                ("smooth", Tool::Smooth),
+                ("paint", Tool::Paint),
+                ("flatten", Tool::Flatten),
             ]
                 .into_iter()
                 .map(|(n, t)| (format!("terrain-{n}"), Show::Terrain(t)))
@@ -253,12 +260,14 @@ impl Editor {
             (0, Show::Tab(t)) => self.ui.tab = *t,
             (0, Show::Terrain(tool)) => {
                 self.ui.panel_requests.push((crate::app::Tab::TerrainEditor, Some(true)));
-                self.terrain_ed.tool = Some(*tool);
+                self.terrain_ed.tab = if crate::terrain_editor::Tool::CREATE.contains(tool) { 0 } else { 1 };
+                // "create": the Create tab with no tool picked.
+                self.terrain_ed.tool = if name == "terrain-create" { None } else { Some(*tool) };
                 // Region tools (round 25): a box on some hills.
                 if tool.is_region() && self.terrain_ed.selection.is_none() {
-                    self.terrain_ed.region_pos = [0.0, 16.0, 0.0];
-                    self.terrain_ed.region_size = [128.0, 32.0, 128.0];
+                    self.terrain_ed.selection = Some(crate::terrain_editor::RegionBox::from_studs([0.0, 0.0, 0.0], [128.0, 64.0, 128.0]));
                     self.terrain_action("generate");
+                    self.poll_terrain_job(true);
                     self.terrain_ed.selection = Some(crate::terrain_editor::RegionBox::from_studs([0.0, 16.0, 0.0], [40.0, 32.0, 32.0]));
                     self.cam.mode = crate::camera::CameraMode::Fly;
                     self.cam.basis = None;

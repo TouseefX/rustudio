@@ -152,7 +152,7 @@ pub struct Document {
 /// isn't the reflection database's: Lighting.Brightness reads 1 in Studio and
 /// 1.981 from the database (round 21, terrain corpus place: its sun was twice
 /// Studio's).
-fn studio_default(class: &str, name: &str) -> Option<Variant> {
+pub(crate) fn studio_default(class: &str, name: &str) -> Option<Variant> {
     match (class, name) {
         ("Lighting", "Brightness") => Some(Variant::Float32(crate::mech::LIGHTING_BRIGHTNESS_DEFAULT)),
         // On in Studio; the reflection database's default is false, which
@@ -161,6 +161,16 @@ fn studio_default(class: &str, name: &str) -> Option<Variant> {
         // Studio's UICorner default; the reflection database has none, and
         // files saved at the default leave it out (Place B's index UI).
         ("UICorner", "CornerRadius") => Some(Variant::UDim(rbx_dom_weak::types::UDim::new(0.0, 8))),
+        // Studio's Instance.new / Insert Part are Smooth on every face (the
+        // API dump's default); the reflection database still has the old
+        // Studs top / Inlet bottom, which put studs on every part a script
+        // made or a file left them out of. TrussPart keeps its own.
+        (
+            c,
+            "TopSurface" | "BottomSurface" | "FrontSurface" | "BackSurface" | "LeftSurface" | "RightSurface",
+        ) if c != "TrussPart" && is_a(c, "BasePart") => {
+            Some(Variant::Enum(rbx_dom_weak::types::Enum::from_u32(0)))
+        }
         _ => None,
     }
 }
@@ -581,6 +591,14 @@ impl Document {
         Ok(doc)
     }
 
+    /// A new, unsaved place from a DataModel built in memory (the Start
+    /// Page's built-in templates), with what every place has.
+    pub fn from_template_dom(dom: WeakDom, title: String) -> Self {
+        let mut doc = Self::from_dom(dom, DocKind::Place, None, title);
+        doc.ensure_services();
+        doc
+    }
+
     pub fn from_place_bytes(bytes: &[u8], title: String) -> Result<Self, String> {
         let mut doc = Self::from_dom(Self::decode(bytes)?, DocKind::Place, None, title);
         doc.ensure_services();
@@ -838,7 +856,7 @@ impl Document {
         }
     }
 
-    fn can_edit_structure(&self, r: Ref) -> bool {
+    pub(crate) fn can_edit_structure(&self, r: Ref) -> bool {
         r != self.dom.root_ref() && self.class_of(r).is_some_and(|c| !is_service(&c))
     }
 
@@ -1041,6 +1059,23 @@ impl Document {
             })
             .collect();
         self.push(label, changes, None);
+    }
+
+    /// Records a drag as one step: property values already changed live and
+    /// instances already inserted (`(instance, parent)`, e.g. Join Surfaces welds).
+    pub fn record_drag(
+        &mut self,
+        label: &str,
+        changes: Vec<(Ref, Ustr, Option<Variant>, Variant)>,
+        created: Vec<(Ref, Ref)>,
+    ) {
+        let mut all: Vec<Change> = changes
+            .into_iter()
+            .filter(|(_, _, old, new)| old.as_ref() != Some(new))
+            .map(|(r, name, old, new)| Change::Prop { r, name, old, new: Some(new) })
+            .collect();
+        all.extend(created.into_iter().map(|(r, parent)| Change::Create { r, parent }));
+        self.push(label, all, None);
     }
 
     /// Changes a property without recording undo (live preview while dragging).
@@ -1515,5 +1550,26 @@ impl ClassIndex {
             }
         }
         changed
+    }
+}
+
+
+#[cfg(test)]
+mod surface_default_tests {
+    use rbx_dom_weak::{types::Variant, InstanceBuilder};
+
+    #[test]
+    fn new_parts_are_smooth_like_studio() {
+        let mut d = super::Document::empty();
+        let root = d.dom.root_ref();
+        for class in ["Part", "WedgePart", "CornerWedgePart", "MeshPart"] {
+            let r = d.dom.insert(root, InstanceBuilder::new(class));
+            for face in ["TopSurface", "BottomSurface", "FrontSurface"] {
+                assert_eq!(d.prop(r, face), Some(Variant::Enum(rbx_dom_weak::types::Enum::from_u32(0))), "{class}.{face}");
+            }
+        }
+        // A saved Studs surface still shows.
+        let r = d.dom.insert(root, InstanceBuilder::new("Part").with_property("TopSurface", Variant::Enum(rbx_dom_weak::types::Enum::from_u32(3))));
+        assert_eq!(d.prop(r, "TopSurface"), Some(Variant::Enum(rbx_dom_weak::types::Enum::from_u32(3))));
     }
 }

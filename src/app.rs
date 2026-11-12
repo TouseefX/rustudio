@@ -6,7 +6,7 @@ use std::path::PathBuf;
 use std::time::Instant;
 
 use egui::{Key, KeyboardShortcut, Modifiers, RichText};
-use egui_dock::{DockArea, DockState, NodeIndex, TabViewer};
+use egui_dock::{DockArea, DockState, TabViewer};
 use glam::Vec3;
 use rbx_dom_weak::types::{Ref, Variant};
 use rbx_dom_weak::InstanceBuilder;
@@ -25,6 +25,8 @@ use crate::viewport::GizmoDrag;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Tool {
+    None,
+    Transform,
     Select,
     Move,
     Scale,
@@ -32,8 +34,14 @@ pub enum Tool {
 }
 
 impl Tool {
+    pub fn toggle(self, requested: Self) -> Self {
+        if self == requested { Self::None } else { requested }
+    }
+
     pub fn label(self) -> &'static str {
         match self {
+            Tool::None => "None",
+            Tool::Transform => "Transform",
             Tool::Select => "Select",
             Tool::Move => "Move",
             Tool::Scale => "Scale",
@@ -157,6 +165,11 @@ pub struct Editor {
     pub cam: Camera,
     pub tool: Tool,
     pub snap_move: bool,
+    /// Model tab Collisions: handle moves / scales stop where parts would
+    /// overlap (TransformHandlesImplementation._safelyTransformParts).
+    pub collisions: bool,
+    /// Model tab Join Surfaces: drops weld touching faces (JointPairs).
+    pub join_surfaces: bool,
     pub move_inc: f32,
     pub snap_rotate: bool,
     pub rotate_inc: f32,
@@ -286,6 +299,8 @@ pub struct Editor {
     /// File > Save as Project Folder… / Project Settings… (src/project_ui.rs).
     pub project_export: Option<crate::project_ui::ExportDialog>,
     pub project_settings: Option<crate::project_ui::SettingsDialog>,
+    /// Open / save file dialogs, run off the UI thread (src/file_dialog.rs).
+    pub dialogs: crate::file_dialog::Dialogs,
     /// Studio's chrome: ribbon tab, run type, panel toggles, popups (src/studio_ui.rs).
     pub ui: crate::studio_ui::UiState,
     /// Test Here: the character's first spawn point (the camera's position).
@@ -319,14 +334,19 @@ pub struct RustudioApp {
     pub ed: Editor,
     /// Keeps the dock, window and view settings (src/layout_store.rs).
     layout: Option<crate::layout_store::Saver>,
+    /// Panels popped out into their own windows, and where each panel was
+    /// last docked (src/panels.rs).
+    pub panels: crate::panels::Panels,
 }
 
+/// Studio's starting layout, from the placement table (src/panels.rs):
+/// Explorer right, Properties under it, Output under the 3D view.
 pub fn default_dock() -> DockState<Tab> {
     let mut dock = DockState::new(vec![Tab::Viewport]);
-    let surface = dock.main_surface_mut();
-    let [center, right] = surface.split_right(NodeIndex::root(), 0.76, vec![Tab::Explorer]);
-    let [_, _props] = surface.split_below(right, 0.46, vec![Tab::Properties]);
-    let [_, _out] = surface.split_below(center, 0.76, vec![Tab::Output]);
+    let none = HashMap::new();
+    for t in [Tab::Explorer, Tab::Properties, Tab::Output] {
+        crate::panels::place(&mut dock, t, &none);
+    }
     dock
 }
 
@@ -339,15 +359,25 @@ impl RustudioApp {
     ) -> Self {
         crate::ti::install(&cc.egui_ctx);
         theme::apply(&cc.egui_ctx);
+        {
+            // (whether the cursor can truly lock: mouse_lock::platform_locks)
+            use eframe::egui_wgpu::wgpu::rwh::{HasWindowHandle, RawWindowHandle};
+            crate::mouse_lock::note_window(
+                cc.window_handle().ok().map(|h| matches!(h.as_raw(), RawWindowHandle::Wayland(_))),
+            );
+        }
         let render_state = cc.wgpu_render_state.clone();
         let renderer = render_state
             .as_ref()
             .map(|rs| Renderer::new(&rs.device, &rs.queue));
         let mut ed = Editor {
+            dialogs: crate::file_dialog::Dialogs::new(cc.egui_ctx.clone()),
             doc: Document::new_place(),
             cam: Camera::default(),
             tool: Tool::Select,
             snap_move: mech::SNAP_ON_BY_DEFAULT,
+            collisions: mech::COLLISIONS_ON_BY_DEFAULT,
+            join_surfaces: mech::JOIN_SURFACES_ON_BY_DEFAULT,
             move_inc: mech::MOVE_SNAP,
             snap_rotate: mech::SNAP_ON_BY_DEFAULT,
             rotate_inc: mech::ROTATE_SNAP_DEG,
@@ -415,7 +445,7 @@ impl RustudioApp {
             confirm_discard: None,
             last_selection: Vec::new(),
             look_grab: None,
-            grab_use_confined: false,
+            grab_use_confined: !crate::mouse_lock::platform_locks(),
             game_grab: None,
             game_cursor_hidden: false,
             cursor_log: Vec::new(),
@@ -491,6 +521,7 @@ impl RustudioApp {
         // The last session's layout and view settings (plain runs only).
         let mut dock = default_dock();
         let mut layout = None;
+        let mut panels = crate::panels::Panels::default();
         if crate::layout_store::enabled(&ed.harness) {
             let saved = crate::layout_store::load();
             if let Some(l) = &saved {
@@ -498,6 +529,7 @@ impl RustudioApp {
                 if let Some(d) = l.dock() {
                     dock = d;
                 }
+                panels = l.panels(&dock);
             }
             layout = Some(crate::layout_store::Saver::new(saved.as_ref()));
         }
@@ -507,6 +539,7 @@ impl RustudioApp {
             dock,
             ed,
             layout,
+            panels,
         }
     }
 }
@@ -758,24 +791,49 @@ impl Editor {
     }
 
     pub fn open_folder_dialog(&mut self) {
-        if let Some(dir) = rfd::FileDialog::new().pick_folder() {
-            self.open_folder(dir, true);
+        use crate::file_dialog::{Kind, Purpose};
+        self.dialogs.start(Purpose::OpenFolder, rfd::AsyncFileDialog::new(), Kind::PickFolder);
+    }
+
+    /// A file dialog closed: act on its answer.
+    pub fn poll_file_dialogs(&mut self) {
+        use crate::file_dialog::Purpose;
+        let Some((purpose, path)) = self.dialogs.poll() else {
+            return;
+        };
+        let Some(path) = path else {
+            return;
+        };
+        match purpose {
+            Purpose::OpenPlace => self.open_path(path),
+            Purpose::OpenFolder => self.open_folder(path, true),
+            Purpose::SaveAs => self.save_to(path),
+            Purpose::InsertModel => self.insert_model_file(path),
+            Purpose::SaveSelection(sel) => match self.doc.save_selection_to(&sel, &path) {
+                Ok(()) => self.info(format!("Saved selection to {}", path.display())),
+                Err(e) => self.error(format!("Save failed: {e}")),
+            },
+            Purpose::TerrainImage { height } => self.load_import_image(path, height),
+            Purpose::ProjectParent => {
+                if let Some(d) = self.project_export.as_mut() {
+                    d.parent = path.display().to_string();
+                }
+            }
         }
     }
 
+    /// File > New / Ctrl+N: Studio's Baseplate template as Studio opens it
+    /// (start_page/templates.rs), its editor camera at the template's saved
+    /// Camera.
     pub fn new_place(&mut self) {
-        self.set_document(Document::new_place());
-        self.cam = Camera::default();
+        self.set_document(crate::start_page::templates::baseplate());
         self.info("New place created");
     }
 
     pub fn open_dialog(&mut self) {
-        if let Some(path) = rfd::FileDialog::new()
-            .add_filter("Roblox place or model", &["rbxl", "rbxlx", "rbxm", "rbxmx"])
-            .pick_file()
-        {
-            self.open_path(path);
-        }
+        use crate::file_dialog::{Kind, Purpose};
+        let d = rfd::AsyncFileDialog::new().add_filter("Roblox place or model", &["rbxl", "rbxlx", "rbxm", "rbxmx"]);
+        self.dialogs.start(Purpose::OpenPlace, d, Kind::PickFile);
     }
 
     pub fn save(&mut self) {
@@ -808,13 +866,9 @@ impl Editor {
             DocKind::Place => "place.rbxl",
             DocKind::Model => "model.rbxm",
         };
-        if let Some(p) = rfd::FileDialog::new()
-            .add_filter(name, exts)
-            .set_file_name(default)
-            .save_file()
-        {
-            self.save_to(p);
-        }
+        use crate::file_dialog::{Kind, Purpose};
+        let d = rfd::AsyncFileDialog::new().add_filter(name, exts).set_file_name(default);
+        self.dialogs.start(Purpose::SaveAs, d, Kind::SaveFile);
     }
 
     pub fn save_to(&mut self, p: PathBuf) {
@@ -825,12 +879,12 @@ impl Editor {
     }
 
     pub fn insert_from_file(&mut self) {
-        let Some(path) = rfd::FileDialog::new()
-            .add_filter("Roblox model", &["rbxm", "rbxmx"])
-            .pick_file()
-        else {
-            return;
-        };
+        use crate::file_dialog::{Kind, Purpose};
+        let d = rfd::AsyncFileDialog::new().add_filter("Roblox model", &["rbxm", "rbxmx"]);
+        self.dialogs.start(Purpose::InsertModel, d, Kind::PickFile);
+    }
+
+    fn insert_model_file(&mut self, path: PathBuf) {
         match std::fs::read(&path) {
             Ok(bytes) => {
                 let parent = self.paste_target(false);
@@ -851,16 +905,9 @@ impl Editor {
             self.warn("Select something to save as a model");
             return;
         }
-        if let Some(p) = rfd::FileDialog::new()
-            .add_filter("Roblox model", &["rbxm", "rbxmx"])
-            .set_file_name("model.rbxm")
-            .save_file()
-        {
-            match self.doc.save_selection_to(&self.doc.selection.clone(), &p) {
-                Ok(()) => self.info(format!("Saved selection to {}", p.display())),
-                Err(e) => self.error(format!("Save failed: {e}")),
-            }
-        }
+        use crate::file_dialog::{Kind, Purpose};
+        let d = rfd::AsyncFileDialog::new().add_filter("Roblox model", &["rbxm", "rbxmx"]).set_file_name("model.rbxm");
+        self.dialogs.start(Purpose::SaveSelection(self.doc.selection.clone()), d, Kind::SaveFile);
     }
 
     pub fn select(&mut self, refs: Vec<Ref>) {
@@ -948,8 +995,28 @@ impl Editor {
 
     pub fn duplicate(&mut self) {
         let sel = self.doc.selection.clone();
+        // Commit the motion so far before Duplicate's own undo step. Keep the
+        // pointer geometry, but transfer the active targets to the copies.
+        let free = self.part_drag.clone();
+        let handle = self.drag.clone();
+        self.finish_part_drag();
+        self.finish_drag();
+        let roots: Vec<_> = self.doc.top_level(&sel).into_iter()
+            .filter(|r| self.doc.can_edit_structure(*r)).collect();
         let refs = self.doc.duplicate(&sel);
+        self.part_drag = free;
+        self.drag = handle;
         if !refs.is_empty() {
+            let mut map = std::collections::HashMap::new();
+            let mut pending: Vec<_> = roots.into_iter().zip(refs.iter().copied()).collect();
+            while let Some((old, new)) = pending.pop() {
+                map.insert(old, new);
+                if let (Some(a), Some(b)) = (self.doc.dom.get_by_ref(old), self.doc.dom.get_by_ref(new)) {
+                    pending.extend(a.children().iter().copied().zip(b.children().iter().copied()));
+                }
+            }
+            self.duplicate_part_drag(&map);
+            self.duplicate_handle_drag(&map);
             self.select(refs);
         }
     }
@@ -1261,6 +1328,12 @@ impl Editor {
             check(sc(Modifiers::COMMAND, Key::N), "new");
             check(sc(Modifiers::COMMAND, Key::I), "insert_object");
             check(sc(Modifiers::COMMAND, Key::L), "toggle_space");
+            check(sc(Modifiers::COMMAND, Key::R), "rotate_selection");
+            check(sc(Modifiers::COMMAND, Key::T), "tilt_selection");
+            check(sc(Modifiers::NONE, Key::Num1), "tool_select");
+            check(sc(Modifiers::NONE, Key::Num2), "tool_move");
+            check(sc(Modifiers::NONE, Key::Num3), "tool_scale");
+            check(sc(Modifiers::NONE, Key::Num4), "tool_rotate");
             check(sc(Modifiers::COMMAND, Key::Num1), "tool_select");
             check(sc(Modifiers::COMMAND, Key::Num2), "tool_move");
             check(sc(Modifiers::COMMAND, Key::Num3), "tool_scale");
@@ -1344,10 +1417,12 @@ impl Editor {
                 self.open_insert_popup(parent, at);
             }
             "toggle_space" => self.local_space = !self.local_space,
-            "tool_select" => self.tool = Tool::Select,
-            "tool_move" => self.tool = Tool::Move,
-            "tool_scale" => self.tool = Tool::Scale,
-            "tool_rotate" => self.tool = Tool::Rotate,
+            "rotate_selection" => self.rotate_selection(false),
+            "tilt_selection" => self.rotate_selection(true),
+            "tool_select" => self.tool = self.tool.toggle(Tool::Select),
+            "tool_move" => self.tool = self.tool.toggle(Tool::Move),
+            "tool_scale" => self.tool = self.tool.toggle(Tool::Scale),
+            "tool_rotate" => self.tool = self.tool.toggle(Tool::Rotate),
             "rename" => {
                 if let Some(&r) = self.doc.selection.first() {
                     let name = self
@@ -1440,31 +1515,29 @@ impl Editor {
             });
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 ui.label(RichText::new(format!("{:.0} fps", self.fps)).color(theme::TEXT_DIM));
-                if let Some(l) = self.log.last() {
-                    let c = match l.level {
-                        Level::Info => theme::TEXT_DIM,
-                        Level::Warn => theme::WARN,
-                        Level::Error => theme::ERROR,
-                    };
-                    ui.label(RichText::new(&l.text).color(c));
-                }
             });
         });
     }
 
-    /// Opens requested scripts as tabs next to the viewport (or focuses them).
-    fn open_script_tabs(&mut self, dock: &mut DockState<Tab>) {
+    /// Opens requested scripts as tabs next to the viewport (or focuses
+    /// them, in a panel window too).
+    fn open_script_tabs(&mut self, dock: &mut DockState<Tab>, panels: &mut crate::panels::Panels) {
         for r in std::mem::take(&mut self.open_script) {
+            let tab = Tab::Script(r);
+            if let Some(w) = panels.popped.iter_mut().find(|w| w.dock.find_tab(&tab).is_some()) {
+                if let Some(at) = w.dock.find_tab(&tab) {
+                    let _ = w.dock.set_active_tab(at);
+                }
+                w.focus = true;
+                continue;
+            }
             let tree = dock.main_surface_mut();
-            if let Some((node, tab)) = tree.find_tab(&Tab::Script(r)) {
+            if let Some((node, tab)) = tree.find_tab(&tab) {
                 let _ = tree.set_active_tab(node, tab);
                 tree.set_focused_node(node);
                 continue;
             }
-            if let Some((node, _)) = tree.find_tab(&Tab::Viewport) {
-                tree.set_focused_node(node);
-            }
-            tree.push_to_focused_leaf(Tab::Script(r));
+            crate::panels::place(dock, tab, &panels.homes);
         }
     }
 
@@ -1503,6 +1576,10 @@ impl Editor {
 
 struct Viewer<'a> {
     ed: &'a mut Editor,
+    /// The panel window this dock is in (None: the main window).
+    window: Option<&'a str>,
+    /// Every panel window: key and title (the tab menu's Move to window).
+    windows: &'a [(String, String)],
 }
 
 impl TabViewer for Viewer<'_> {
@@ -1549,6 +1626,62 @@ impl TabViewer for Viewer<'_> {
         }
     }
 
+    fn show_pop_out_button(&self, tab: &Tab) -> bool {
+        *tab != Tab::Viewport
+    }
+
+    fn pop_out_docks_back(&self, _tab: &Tab) -> bool {
+        self.window.is_some()
+    }
+
+    fn pop_out_tooltip(&self, _tab: &Tab) -> String {
+        if self.window.is_some() {
+            "Dock back into the main window".into()
+        } else {
+            "Pop out into its own window".into()
+        }
+    }
+
+    fn on_pop_out(&mut self, tab: &mut Tab) {
+        use crate::panels::DockMove;
+        self.ed.ui.dock_moves.push(if self.window.is_some() { DockMove::DockBack(*tab) } else { DockMove::PopOut(*tab) });
+    }
+
+    fn context_menu(&mut self, ui: &mut egui::Ui, tab: &mut Tab, _path: egui_dock::NodePath) {
+        use crate::panels::DockMove;
+        if *tab == Tab::Viewport {
+            return;
+        }
+        let alone = self.window.is_some()
+            && self.ed.ui.popped.iter().find(|(k, _)| Some(k.as_str()) == self.window).is_some_and(|(_, t)| t.len() == 1);
+        if !alone && ui.button("Pop Out").clicked() {
+            self.ed.ui.dock_moves.push(DockMove::PopOut(*tab));
+        }
+        if self.window.is_some() && ui.button("Dock Back").clicked() {
+            self.ed.ui.dock_moves.push(DockMove::DockBack(*tab));
+        }
+        let others: Vec<&(String, String)> = self.windows.iter().filter(|(k, _)| Some(k.as_str()) != self.window).collect();
+        if !others.is_empty() {
+            ui.menu_button("Move to Window", |ui| {
+                for (k, title) in others {
+                    if ui.button(title).clicked() {
+                        self.ed.ui.dock_moves.push(DockMove::MoveTo(*tab, k.clone()));
+                    }
+                }
+            });
+        }
+    }
+
+    fn no_tab_bar(&self, tabs: &[Tab]) -> bool {
+        // The 3D view alone: no strip with the place's name over it.
+        tabs == [Tab::Viewport]
+    }
+
+    fn allowed_in_windows(&self, tab: &mut Tab) -> bool {
+        // Dragged out, a tab becomes a panel window; the 3D view stays.
+        *tab != Tab::Viewport
+    }
+
     fn is_closeable(&self, tab: &Tab) -> bool {
         // The place tab's × is File > Close Place (not while playing).
         *tab != Tab::Viewport || self.ed.play_status().is_none()
@@ -1573,10 +1706,90 @@ impl TabViewer for Viewer<'_> {
     }
 }
 
+impl RustudioApp {
+    /// Draws each panel window (its own OS window: an immediate viewport),
+    /// then does the frame's pop-out / dock-back moves and turns tabs
+    /// dragged out of a dock into windows. `dock_rect`: the main dock's
+    /// area (a popped tab's window opens over where it was).
+    fn panel_windows(&mut self, ctx: &egui::Context, windows: &[(String, String)], dock_rect: egui::Rect) {
+        let mut closed = Vec::new();
+        for (i, w) in self.panels.popped.iter_mut().enumerate() {
+            let id = w.viewport_id();
+            if std::mem::take(&mut w.focus) {
+                ctx.send_viewport_cmd_to(id, egui::ViewportCommand::Focus);
+            }
+            let ed = &mut self.ed;
+            let close = ctx.show_viewport_immediate(id, w.builder(), |ui, class| {
+                ed.ui.popped_class = Some(class);
+                let vctx = ui.ctx().clone();
+                w.track(&vctx);
+                let key = w.key.clone();
+                egui::CentralPanel::default()
+                    .frame(egui::Frame::new().fill(theme::BG))
+                    .show(ui, |ui| {
+                        DockArea::new(&mut w.dock)
+                            .id(egui::Id::new(("panel_window_dock", &key)))
+                            .style(theme::dock_style(ui.style()))
+                            .show_add_buttons(false)
+                            .show_leaf_collapse_buttons(false)
+                            .show_leaf_close_all_buttons(false)
+                            .show_inside(ui, &mut Viewer { ed: &mut *ed, window: Some(&key), windows });
+                    });
+                vctx.input(|i| i.viewport().close_requested())
+            });
+            if close {
+                // Closing the window docks its panels back (not lost).
+                closed.push(i);
+            }
+        }
+        for i in closed.into_iter().rev() {
+            self.panels.dock_back_window(&mut self.dock, i);
+        }
+        // Tabs dragged out of a panel window's dock: windows of their own.
+        let zoom = ctx.zoom_factor();
+        let mut adopted = Vec::new();
+        for w in self.panels.popped.iter_mut() {
+            let mut sub = crate::panels::Panels::default();
+            let origin = w.pos.map(|p| egui::pos2(p[0] / zoom, p[1] / zoom));
+            sub.adopt_floating(&mut w.dock, origin, zoom);
+            adopted.extend(sub.popped);
+        }
+        self.panels.popped.retain(|w| w.dock.iter_all_tabs().next().is_some());
+        for mut w in adopted {
+            w.key = self.panels.free_key(w.tabs()[0].key());
+            self.panels.popped.push(w);
+        }
+        // Main window: its outer top-left on the screen (None on Wayland).
+        let origin = ctx.input(|i| {
+            let v = i.viewport();
+            match (v.outer_rect, v.inner_rect) {
+                (Some(_), Some(inner)) => Some(inner.min),
+                _ => None,
+            }
+        });
+        self.panels.adopt_floating(&mut self.dock, origin, zoom);
+        for mv in std::mem::take(&mut self.ed.ui.dock_moves) {
+            // A popped tab opens about where it sat, at its size.
+            let tab = match &mv {
+                crate::panels::DockMove::PopOut(t) => Some(*t),
+                _ => None,
+            };
+            let rect = tab
+                .and_then(|t| self.dock.find_main_surface_tab(&t))
+                .and_then(|(n, _)| self.dock.main_surface()[n].get_leaf().map(|l| l.rect))
+                .filter(|r| r.is_finite() && r.width() > 50.0 && r.height() > 50.0)
+                .unwrap_or_else(|| egui::Rect::from_center_size(dock_rect.center(), egui::vec2(420.0, 320.0)));
+            let size = [(rect.width() * zoom).max(320.0), (rect.height() * zoom).max(220.0)];
+            let pos = origin.filter(|_| rect.is_finite()).map(|o| [(o.x + rect.min.x) * zoom, (o.y + rect.min.y) * zoom]);
+            self.panels.apply(&mut self.dock, mv, size, pos);
+        }
+    }
+}
+
 impl eframe::App for RustudioApp {
     fn on_exit(&mut self) {
         if let Some(s) = self.layout.as_mut() {
-            s.save(&self.dock, &self.ed);
+            s.save(&self.dock, &self.panels, &self.ed);
         }
     }
     fn raw_input_hook(&mut self, _ctx: &egui::Context, raw: &mut egui::RawInput) {
@@ -1601,6 +1814,7 @@ impl eframe::App for RustudioApp {
         for p in crate::macos::take_opened() {
             ed.request(PendingAction::Open(Some(p)));
         }
+        ed.poll_file_dialogs();
         ed.frame_no += 1;
         let frame_start = Instant::now();
         let now = Instant::now();
@@ -1693,7 +1907,15 @@ impl eframe::App for RustudioApp {
             .data_mut(|d| d.remove_temp::<bool>(egui::Id::new("reset_dock")))
             .unwrap_or(false)
         {
+            // Reset Layout: panel windows close, their tabs go back too.
+            let popped: Vec<Tab> = self.panels.popped_tabs().collect();
+            self.panels = crate::panels::Panels::default();
             self.dock = default_dock();
+            for t in popped {
+                if self.dock.find_tab(&t).is_none() && !matches!(t, Tab::AvatarSettings | Tab::TerrainEditor) {
+                    crate::panels::place(&mut self.dock, t, &self.panels.homes);
+                }
+            }
         }
 
         let ed = &mut self.ed;
@@ -1755,43 +1977,47 @@ impl eframe::App for RustudioApp {
         }
 
         let _dock_scope = crate::bench::scope("dock_panels");
+        let windows: Vec<(String, String)> = self.panels.popped.iter().map(|w| (w.key.clone(), w.title())).collect();
+        let mut dock_rect = egui::Rect::NOTHING;
         egui::CentralPanel::default()
             .frame(egui::Frame::new().fill(theme::BG))
             .show(ui, |ui| {
+                dock_rect = ui.max_rect();
                 DockArea::new(&mut self.dock)
                     .style(theme::dock_style(ui.style()))
                     .show_add_buttons(false)
                     .show_leaf_collapse_buttons(false)
                     .show_leaf_close_all_buttons(false)
-                    .show_inside(ui, &mut Viewer { ed: &mut self.ed });
+                    .show_inside(ui, &mut Viewer { ed: &mut self.ed, window: None, windows: &windows });
             });
-
         drop(_dock_scope);
-        // Window > Explorer / Properties / Output / Avatar Settings toggles,
-        // and which panels are open (their checkmarks next frame).
+        self.panel_windows(&ctx, &windows, dock_rect);
+        // Window > Explorer / Properties / Output / Avatar Settings toggles
+        // (in a panel window too), new panels where Studio docks them
+        // (src/panels.rs, never over the 3D view), and which panels are
+        // open (their checkmarks next frame).
+        use crate::panels::Location;
         for (tab, want) in std::mem::take(&mut self.ed.ui.panel_requests) {
-            let found = self.dock.find_tab(&tab);
+            let found = self.panels.locate(&self.dock, &tab);
             let open = want.unwrap_or(found.is_none());
             match (found, open) {
-                (Some(at), false) => {
-                    self.dock.remove_tab(at);
+                (Some(_), false) => {
+                    self.panels.take(&mut self.dock, &tab);
                 }
-                (Some(at), true) => {
+                (Some(Location::Main(at)), true) => {
                     let _ = self.dock.set_active_tab(at);
                 }
+                (Some(Location::Popped(i, at)), true) => {
+                    let w = &mut self.panels.popped[i];
+                    let _ = w.dock.set_active_tab(at);
+                    w.focus = true;
+                }
                 (None, true) => {
-                    let tree = self.dock.main_surface_mut();
-                    // Avatar Settings docks under the viewport, like Studio's;
-                    // the Terrain Editor beside the Explorer.
-                    let anchor = match tab {
-                        Tab::AvatarSettings => Tab::Output,
-                        Tab::TerrainEditor => Tab::Explorer,
-                        _ => Tab::Viewport,
-                    };
-                    if let Some((node, _)) = tree.find_tab(&anchor) {
-                        tree.set_focused_node(node);
+                    if crate::panels::placement(tab.key()).floats {
+                        self.panels.pop_out(tab, [420.0, 520.0], None);
+                    } else {
+                        crate::panels::place(&mut self.dock, tab, &self.panels.homes);
                     }
-                    tree.push_to_focused_leaf(tab);
                 }
                 (None, false) => {}
             }
@@ -1804,14 +2030,22 @@ impl eframe::App for RustudioApp {
             (Tab::TerrainEditor, "Terrain Editor"),
         ]
         .into_iter()
-        .filter(|(t, _)| self.dock.find_tab(t).is_some())
+        .filter(|(t, _)| self.panels.locate(&self.dock, t).is_some())
         .map(|(_, n)| n)
         .collect();
+        let ed = &mut self.ed;
+        ed.open_script_tabs(&mut self.dock, &mut self.panels);
+        crate::panels::record_homes(&self.dock, &mut self.panels.homes);
+        self.ed.ui.popped = self.panels.popped.iter().map(|w| (w.key.clone(), w.tabs())).collect();
+        self.ed.ui.viewport_group = self
+            .dock
+            .find_main_surface_tab(&Tab::Viewport)
+            .and_then(|(n, _)| self.dock.main_surface()[n].tabs().map(|t| t.to_vec()))
+            .unwrap_or_default();
         if let Some(s) = self.layout.as_mut() {
-            s.tick(&ctx, &self.dock, &self.ed);
+            s.tick(&ctx, &self.dock, &self.panels, &self.ed);
         }
         let ed = &mut self.ed;
-        ed.open_script_tabs(&mut self.dock);
         ed.insert_popup_ui(&ctx);
         ed.about_ui(&ctx);
         ed.user_screenshot_tick(&ctx);
