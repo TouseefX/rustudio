@@ -867,6 +867,14 @@ pub(crate) fn part_draw(doc: &Document, inst: &Instance) -> Option<ScenePart> {
             }
         }
     }
+    if class == "TrussPart" {
+        mesh_asset = Some(MeshAsset {
+            id: format!("rustudio-truss:{:08x}:{:08x}:{:08x}:{}", size.x.to_bits(), size.y.to_bits(), size.z.to_bits(), enum_u32(doc.prop(r, "Style").or_else(|| doc.prop(r, "style"))).unwrap_or(0)),
+            fit_to_part: true,
+            scale: Vec3::ONE,
+            offset: Vec3::ZERO,
+        });
+    }
     // Default R6 body geometry comes from Studio's shipped avatar meshes.
     // Explicit CharacterMesh and DataModelMesh children take precedence.
     // (The limb name is checked first: the Humanoid look scans the parent's

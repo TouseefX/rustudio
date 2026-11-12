@@ -2572,6 +2572,18 @@ impl Renderer {
         wgpu::Extent3d { width: nx, height: nz, depth_or_array_layers: ny });
     }
 
+    /// Uploads part of the local light channel (lightgrid::LocalPatch).
+    pub fn set_localgrid_region(&mut self, queue: &wgpu::Queue, p: &crate::lightgrid::LocalPatch) {
+        let size = [0, 1, 2].map(|k| (p.hi[k] - p.lo[k] + 1) as u32);
+        if p.data.len() != (size[0] * size[1] * size[2] * 4) as usize { return; }
+        queue.write_texture(wgpu::TexelCopyTextureInfo {
+            texture: &self.localgrid_tex, mip_level: 0,
+            origin: wgpu::Origin3d { x: p.lo[0] as u32, y: p.lo[2] as u32, z: p.lo[1] as u32 },
+            aspect: wgpu::TextureAspect::All,
+        }, &p.data, wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(size[0] * 4), rows_per_image: Some(size[2]) },
+        wgpu::Extent3d { width: size[0], height: size[2], depth_or_array_layers: size[1] });
+    }
+
     /// Uploads the parts' light occupancy (lightocc.rs: X, then Y, then Z).
     pub fn set_lightocc(&mut self, queue: &wgpu::Queue, data: &[u8]) {
         let [nx, ny, nz] = crate::lightocc::dims().map(|n| n as u32);

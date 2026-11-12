@@ -1065,162 +1065,358 @@ mod tests {
 /// Studio 0.746 CPU local lighting:,
 /// shadow sweep and filter/RGB-scale packing.
 /// Distances here are in four-stud voxels, independently of surface normals.
+/// (The viewport keeps it as LocalLights; this is the whole channel at once.)
+#[allow(dead_code)]
 pub fn local_lights(occ: &Occupancy, lights: &[crate::render::LightRaw]) -> Vec<u8> {
     local_lights_dims(occ, lights, dims())
 }
 
+#[allow(dead_code)]
 fn local_lights_dims(
     occ: &Occupancy,
     lights: &[crate::render::LightRaw],
     dims: [usize; 3],
 ) -> Vec<u8> {
+    LocalLights::build_dims(occ, lights, dims).1
+}
+
+/// The voxels light `l` reaches in a grid of `dims` whose first voxel is
+/// `origin`: (first, last), inclusive, or None when it reaches none.
+fn light_box(origin: [i32; 3], l: &crate::render::LightRaw, dims: [usize; 3]) -> Option<([usize; 3], [usize; 3])> {
     let [nx, ny, nz] = dims;
-    let len = nx * ny * nz;
-    if lights.is_empty() {
-        return vec![0; len * 4];
+    let pos = Vec3::from_slice(&l.pos_range) * 0.25 - Vec3::from_array(origin.map(|v| v as f32));
+    let range = l.pos_range[3] * 0.25;
+    if range <= 0.0 || !pos.is_finite() || !range.is_finite() {
+        return None;
     }
+    let u = Vec3::from_slice(&l.surface_u);
+    let v = Vec3::from_slice(&l.surface_v);
+    let hu = l.surface_u[3] * 0.25;
+    let hv = l.surface_v[3] * 0.25;
+    let extent = Vec3::splat(range + 2.0) + if l.color[3] > 1.5 { u.abs() * hu + v.abs() * hv } else { Vec3::ZERO };
+    let lo = (pos - extent).floor().max(Vec3::ZERO);
+    let hi = (pos + extent).ceil().min(Vec3::new(nx as f32 - 1.0, ny as f32 - 1.0, nz as f32 - 1.0));
+    if lo.cmpgt(hi).any() {
+        return None;
+    }
+    Some(([lo.x as usize, lo.y as usize, lo.z as usize], [hi.x as usize, hi.y as usize, hi.z as usize]))
+}
+
+fn box_volume(b: ([usize; 3], [usize; 3])) -> usize {
+    (0..3).map(|k| b.1[k] - b.0[k] + 1).product()
+}
+
+/// Adds (or, `remove`, takes away exactly what adding it gave) light `l`'s
+/// unfiltered radiance to `raw` over its box `(a, b)`.
+fn light_into(
+    occ: &Occupancy,
+    l: &crate::render::LightRaw,
+    dims: [usize; 3],
+    (a, b): ([usize; 3], [usize; 3]),
+    raw: &mut [Vec3],
+    remove: bool,
+) {
+    let [nx, _, nz] = dims;
     let index = |p: [usize; 3]| (p[1] * nz + p[2]) * nx + p[0];
-    let mut raw = vec![Vec3::ZERO; len];
-    let mut active_lo = dims;
-    let mut active_hi = [0; 3];
-    for l in lights {
-        let pos =
-            Vec3::from_slice(&l.pos_range) * 0.25 - Vec3::from_array(occ.origin.map(|v| v as f32));
-        let range = l.pos_range[3] * 0.25;
-        if range <= 0.0 {
-            continue;
-        }
-        let u = Vec3::from_slice(&l.surface_u);
-        let v = Vec3::from_slice(&l.surface_v);
-        let hu = l.surface_u[3] * 0.25;
-        let hv = l.surface_v[3] * 0.25;
-        let extent = Vec3::splat(range + 2.0)
-            + if l.color[3] > 1.5 {
-                u.abs() * hu + v.abs() * hv
-            } else {
-                Vec3::ZERO
-            };
-        let lo = (pos - extent).floor().max(Vec3::ZERO);
-        let hi =
-            (pos + extent)
-                .ceil()
-                .min(Vec3::new(nx as f32 - 1.0, ny as f32 - 1.0, nz as f32 - 1.0));
-        if (lo.cmpgt(hi)).any() {
-            continue;
-        }
-        let a = [lo.x as usize, lo.y as usize, lo.z as usize];
-        let b = [hi.x as usize, hi.y as usize, hi.z as usize];
-        for k in 0..3 {
-            active_lo[k] = active_lo[k].min(a[k]);
-            active_hi[k] = active_hi[k].max(b[k]);
-        }
-        let size = [0, 1, 2].map(|k| b[k] - a[k] + 1);
-        let si = |p: [usize; 3]| ((p[1] - a[1]) * size[2] + p[2] - a[2]) * size[0] + p[0] - a[0];
-        let source = [0, 1, 2].map(|k| pos[k].floor() as i32);
-        let mut shadow = vec![255u8; size.iter().product()];
-        let order: [Vec<usize>; 3] = [0, 1, 2].map(|k| {
-            let mut axis: Vec<_> = (a[k]..=b[k]).collect();
-            axis.sort_by_key(|&i| (i as i32 - source[k]).abs());
-            axis
-        });
-        let color = Vec3::from_slice(&l.color);
-        let dir = Vec3::from_slice(&l.dir);
-        for &y in &order[1] {
-            for &z in &order[2] {
-                for &x in &order[0] {
-                    let p = [x, y, z];
-                    let i = index(p);
-                    let delta = Vec3::new(x as f32 + 0.5, y as f32 + 0.5, z as f32 + 0.5) - pos;
-                    let mut visibility = 1.0;
-                    if l.extra[2] > 0.5 && l.color[3] < 1.5 {
-                        let w = [0, 1, 2].map(|k| {
-                            if p[k] as i32 == source[k] {
-                                0.0
-                            } else {
-                                // The shadow sweep uses the integer voxel coordinate;
-                                // the radiance writer uses its centre instead.
-                                (p[k] as f32 - pos[k]).powi(2)
-                            }
-                        });
-                        let total: f32 = w.iter().sum();
-                        if total > 0.0 {
-                            let mut recv = 0.0;
-                            let mut block = 0.0;
-                            for k in 0..3 {
-                                if w[k] == 0.0 {
-                                    continue;
-                                }
-                                let mut q = p;
-                                let next =
-                                    p[k] as i32 + if (p[k] as i32) < source[k] { 1 } else { -1 };
-                                let got = if next < a[k] as i32 || next > b[k] as i32 {
-                                    255
-                                } else {
-                                    q[k] = next as usize;
-                                    shadow[si(q)]
-                                };
-                                recv += got as f32 * w[k];
-                                block += occ.planes[k][i] as f32 * w[k];
-                            }
-                            shadow[si(p)] = ((recv / total + 0.5) as i32
-                                - (block / total + 0.5) as i32)
-                                .max(0) as u8;
+    let pos = Vec3::from_slice(&l.pos_range) * 0.25 - Vec3::from_array(occ.origin.map(|v| v as f32));
+    let range = l.pos_range[3] * 0.25;
+    let u = Vec3::from_slice(&l.surface_u);
+    let v = Vec3::from_slice(&l.surface_v);
+    let hu = l.surface_u[3] * 0.25;
+    let hv = l.surface_v[3] * 0.25;
+    let size = [0, 1, 2].map(|k| b[k] - a[k] + 1);
+    let si = |p: [usize; 3]| ((p[1] - a[1]) * size[2] + p[2] - a[2]) * size[0] + p[0] - a[0];
+    let source = [0, 1, 2].map(|k| pos[k].floor() as i32);
+    let shadowed = l.extra[2] > 0.5 && l.color[3] < 1.5;
+    let mut shadow = if shadowed { vec![255u8; size.iter().product()] } else { Vec::new() };
+    let order: [Vec<usize>; 3] = [0, 1, 2].map(|k| {
+        let mut axis: Vec<_> = (a[k]..=b[k]).collect();
+        axis.sort_by_key(|&i| (i as i32 - source[k]).abs());
+        axis
+    });
+    let color = Vec3::from_slice(&l.color);
+    let dir = Vec3::from_slice(&l.dir);
+    for &y in &order[1] {
+        for &z in &order[2] {
+            for &x in &order[0] {
+                let p = [x, y, z];
+                let i = index(p);
+                let delta = Vec3::new(x as f32 + 0.5, y as f32 + 0.5, z as f32 + 0.5) - pos;
+                let mut visibility = 1.0;
+                if shadowed {
+                    let w = [0, 1, 2].map(|k| {
+                        if p[k] as i32 == source[k] {
+                            0.0
+                        } else {
+                            // The shadow sweep uses the integer voxel coordinate;
+                            // the radiance writer uses its centre instead.
+                            (p[k] as f32 - pos[k]).powi(2)
                         }
-                        visibility = shadow[si(p)] as f32 / 255.0;
+                    });
+                    let total: f32 = w.iter().sum();
+                    if total > 0.0 {
+                        let mut recv = 0.0;
+                        let mut block = 0.0;
+                        for k in 0..3 {
+                            if w[k] == 0.0 {
+                                continue;
+                            }
+                            let mut q = p;
+                            let next = p[k] as i32 + if (p[k] as i32) < source[k] { 1 } else { -1 };
+                            let got = if next < a[k] as i32 || next > b[k] as i32 {
+                                255
+                            } else {
+                                q[k] = next as usize;
+                                shadow[si(q)]
+                            };
+                            recv += got as f32 * w[k];
+                            block += occ.planes[k][i] as f32 * w[k];
+                        }
+                        shadow[si(p)] =
+                            ((recv / total + 0.5) as i32 - (block / total + 0.5) as i32).max(0) as u8;
                     }
-                    let mut d = delta;
-                    if l.color[3] > 1.5 {
-                        d -= u * delta.dot(u).clamp(-hu, hu) + v * delta.dot(v).clamp(-hv, hv);
-                    }
-                    let distance = d.length();
-                    let shifted = (distance - 0.71 * range).max(0.0);
-                    let t = (shifted / (0.29 * range)).min(1.0);
-                    let mut energy =
-                        (1.0 - (3.0 - 2.0 * t) * t * t) * 1.35 / (shifted * shifted + 1.35);
-                    if l.color[3] > 0.5 {
-                        let cosine = d.dot(dir) / distance.max(1e-6);
-                        energy *=
-                            ((cosine - l.dir[3]) / (1.0 - l.dir[3]).max(1e-6)).clamp(0.0, 1.0);
-                    }
-                    raw[i] += color * (energy * visibility);
+                    visibility = shadow[si(p)] as f32 / 255.0;
+                }
+                let mut d = delta;
+                if l.color[3] > 1.5 {
+                    d -= u * delta.dot(u).clamp(-hu, hu) + v * delta.dot(v).clamp(-hv, hv);
+                }
+                let distance = d.length();
+                let shifted = (distance - 0.71 * range).max(0.0);
+                let t = (shifted / (0.29 * range)).min(1.0);
+                let mut energy = (1.0 - (3.0 - 2.0 * t) * t * t) * 1.35 / (shifted * shifted + 1.35);
+                if l.color[3] > 0.5 {
+                    let cosine = d.dot(dir) / distance.max(1e-6);
+                    energy *= ((cosine - l.dir[3]) / (1.0 - l.dir[3]).max(1e-6)).clamp(0.0, 1.0);
+                }
+                let c = color * (energy * visibility);
+                if remove {
+                    raw[i] -= c;
+                } else {
+                    raw[i] += c;
                 }
             }
         }
     }
-    // Separable uniform 3x3x3 convolution, before encoding/interpolation.
-    let mut tmp = vec![Vec3::ZERO; len];
+}
+
+/// Packs one filtered radiance: RGB plus the shared scale (Studio).
+fn encode_local(c: Vec3) -> [u8; 4] {
+    let c = c.max(Vec3::ZERO).min(Vec3::splat(120.0));
+    let a = (c.max_element() * 2.125).max(12.75).ceil();
+    let rgb = (c * (541.875 / a)).as_uvec3();
+    [rgb.x as u8, rgb.y as u8, rgb.z as u8, a as u8]
+}
+
+/// The filtered, packed local channel over `lo..=hi` (X fastest, then Z,
+/// then Y, as the texture), from the unfiltered `raw`: the separable
+/// uniform 3x3x3 filter, in the full build's order, so the voxels come out
+/// as a full build gives them.
+fn filter_region(raw: &[Vec3], dims: [usize; 3], lo: [usize; 3], hi: [usize; 3]) -> Vec<u8> {
+    let [nx, _, nz] = dims;
+    // What the filter reads: one voxel more on every side (in the grid).
+    let slo = [0, 1, 2].map(|k| lo[k].saturating_sub(1));
+    let shi = [0, 1, 2].map(|k| (hi[k] + 1).min(dims[k] - 1));
+    let size = [0, 1, 2].map(|k| shi[k] - slo[k] + 1);
+    let si = |p: [usize; 3]| ((p[1] - slo[1]) * size[2] + p[2] - slo[2]) * size[0] + p[0] - slo[0];
+    let mut sub = vec![Vec3::ZERO; size.iter().product()];
+    for y in slo[1]..=shi[1] {
+        for z in slo[2]..=shi[2] {
+            let row = (y * nz + z) * nx;
+            let at = si([slo[0], y, z]);
+            sub[at..at + size[0]].copy_from_slice(&raw[row + slo[0]..=row + shi[0]]);
+        }
+    }
+    let mut tmp = vec![Vec3::ZERO; sub.len()];
     for axis in [0, 2, 1] {
-        // Zero outside the light bounds. Expanding by the kernel radius
-        // preserves the full-volume result without filtering empty space.
-        active_lo[axis] = active_lo[axis].saturating_sub(1);
-        active_hi[axis] = (active_hi[axis] + 1).min(dims[axis] - 1);
-        for y in active_lo[1]..=active_hi[1] {
-            for z in active_lo[2]..=active_hi[2] {
-                for x in active_lo[0]..=active_hi[0] {
+        for y in slo[1]..=shi[1] {
+            for z in slo[2]..=shi[2] {
+                for x in slo[0]..=shi[0] {
                     let p = [x, y, z];
                     let mut sum = Vec3::ZERO;
                     for offset in -1..=1 {
                         let c = p[axis] as i32 + offset;
-                        if c >= 0 && c < dims[axis] as i32 {
+                        // (past the sub-volume's own edge only its border is
+                        // wrong, and the border isn't kept)
+                        if c >= slo[axis] as i32 && c <= shi[axis] as i32 {
                             let mut q = p;
                             q[axis] = c as usize;
-                            sum += raw[index(q)];
+                            sum += sub[si(q)];
                         }
                     }
-                    tmp[index(p)] = sum / 3.0;
+                    tmp[si(p)] = sum / 3.0;
                 }
             }
         }
-        std::mem::swap(&mut raw, &mut tmp);
+        std::mem::swap(&mut sub, &mut tmp);
     }
-    raw.into_iter()
-        .flat_map(|c| {
-            let c = c.min(Vec3::splat(120.0));
-            let a = (c.max_element() * 2.125).max(12.75).ceil();
-            let rgb = (c * (541.875 / a)).as_uvec3();
-            [rgb.x as u8, rgb.y as u8, rgb.z as u8, a as u8]
-        })
-        .collect()
+    let mut out = Vec::with_capacity((0..3).map(|k| hi[k] - lo[k] + 1).product::<usize>() * 4);
+    for y in lo[1]..=hi[1] {
+        for z in lo[2]..=hi[2] {
+            for x in lo[0]..=hi[0] {
+                out.extend_from_slice(&encode_local(sub[si([x, y, z])]));
+            }
+        }
+    }
+    out
+}
+
+/// The local channel as it is kept between frames: the unfiltered sum of
+/// every light, so a change of a few lights (a muzzle flash's PointLight
+/// flicked on and off, moving with the camera) re-lights just their boxes
+/// on the spot, as Studio's grid shows a flash within a frame or two,
+/// instead of the whole grid (~30 ms, which showed a flash late and kept
+/// it lit after it was off).
+pub struct LocalLights {
+    pub origin: [i32; 3],
+    dims: [usize; 3],
+    /// Unfiltered radiance per voxel (empty while there are no lights).
+    raw: Vec<Vec3>,
+    /// The lights in `raw`.
+    pub lights: Vec<crate::render::LightRaw>,
+}
+
+/// A re-light of part of the local channel: its first and last voxel and
+/// the packed voxels between (as `filter_region`).
+pub struct LocalPatch {
+    pub lo: [usize; 3],
+    pub hi: [usize; 3],
+    pub data: Vec<u8>,
+}
+
+impl LocalLights {
+    /// Every light from scratch: the kept state and the packed channel.
+    pub fn build(occ: &Occupancy, lights: &[crate::render::LightRaw]) -> (LocalLights, Vec<u8>) {
+        Self::build_dims(occ, lights, dims())
+    }
+
+    fn build_dims(occ: &Occupancy, lights: &[crate::render::LightRaw], dims: [usize; 3]) -> (LocalLights, Vec<u8>) {
+        let len = dims.iter().product::<usize>();
+        let mut me = LocalLights { origin: occ.origin, dims, raw: Vec::new(), lights: lights.to_vec() };
+        let mut active: Option<([usize; 3], [usize; 3])> = None;
+        for l in lights {
+            let Some(bx) = light_box(occ.origin, l, dims) else { continue };
+            if me.raw.is_empty() {
+                me.raw = vec![Vec3::ZERO; len];
+            }
+            light_into(occ, l, dims, bx, &mut me.raw, false);
+            active = Some(union(active, bx));
+        }
+        let mut out = Vec::with_capacity(len * 4);
+        for _ in 0..len {
+            out.extend_from_slice(&encode_local(Vec3::ZERO));
+        }
+        if let Some((lo, hi)) = active {
+            let (lo, hi) = grow(lo, hi, dims);
+            let patch = filter_region(&me.raw, dims, lo, hi);
+            me.write(&mut out, lo, hi, &patch);
+        }
+        (me, out)
+    }
+
+    fn write(&self, out: &mut [u8], lo: [usize; 3], hi: [usize; 3], patch: &[u8]) {
+        let [nx, _, nz] = self.dims;
+        let w = (hi[0] - lo[0] + 1) * 4;
+        let mut at = 0;
+        for y in lo[1]..=hi[1] {
+            for z in lo[2]..=hi[2] {
+                let i = ((y * nz + z) * nx + lo[0]) * 4;
+                out[i..i + w].copy_from_slice(&patch[at..at + w]);
+                at += w;
+            }
+        }
+    }
+
+    /// Brings the kept lights to `lights` by taking away the ones gone and
+    /// adding the new ones (the same ones, byte for byte, stay). Returns the
+    /// re-filtered part of the channel to upload, None when nothing changed;
+    /// Err when the lights that changed reach more than `max_voxels`
+    /// (re-light everything on a worker instead; nothing was touched).
+    pub fn update(
+        &mut self,
+        occ: &Occupancy,
+        lights: &[crate::render::LightRaw],
+        max_voxels: usize,
+    ) -> Result<Option<LocalPatch>, ()> {
+        if occ.origin != self.origin {
+            return Err(());
+        }
+        let key = |l: &crate::render::LightRaw| bytemuck::bytes_of(l).to_vec();
+        let mut kept: std::collections::HashMap<Vec<u8>, usize> = std::collections::HashMap::new();
+        for l in &self.lights {
+            *kept.entry(key(l)).or_default() += 1;
+        }
+        let mut added = Vec::new();
+        for l in lights {
+            match kept.get_mut(&key(l)) {
+                Some(n) if *n > 0 => *n -= 1,
+                _ => added.push(*l),
+            }
+        }
+        let removed: Vec<_> = {
+            let mut left = kept;
+            self.lights
+                .iter()
+                .filter(|l| match left.get_mut(&key(l)) {
+                    Some(n) if *n > 0 => {
+                        *n -= 1;
+                        true
+                    }
+                    _ => false,
+                })
+                .copied()
+                .collect()
+        };
+        if added.is_empty() && removed.is_empty() {
+            self.lights = lights.to_vec();
+            return Ok(None);
+        }
+        let boxes: Vec<_> = removed
+            .iter()
+            .map(|l| (*l, true))
+            .chain(added.iter().map(|l| (*l, false)))
+            .filter_map(|(l, rm)| light_box(self.origin, &l, self.dims).map(|b| (l, rm, b)))
+            .collect();
+        if boxes.iter().map(|(_, _, b)| box_volume(*b)).sum::<usize>() > max_voxels {
+            return Err(());
+        }
+        self.lights = lights.to_vec();
+        let mut dirty = None;
+        for (l, rm, b) in &boxes {
+            if self.raw.is_empty() {
+                self.raw = vec![Vec3::ZERO; self.dims.iter().product()];
+            }
+            light_into(occ, l, self.dims, *b, &mut self.raw, *rm);
+            dirty = Some(union(dirty, *b));
+        }
+        let Some((lo, hi)) = dirty else { return Ok(None) };
+        if self.lights.iter().all(|l| light_box(self.origin, l, self.dims).is_none()) {
+            // (no light left: no float residue either, in the boxes the
+            // ones taken away reached)
+            let [nx, _, nz] = self.dims;
+            for y in lo[1]..=hi[1] {
+                for z in lo[2]..=hi[2] {
+                    let row = (y * nz + z) * nx;
+                    self.raw[row + lo[0]..=row + hi[0]].iter_mut().for_each(|c| *c = Vec3::ZERO);
+                }
+            }
+        }
+        let (lo, hi) = grow(lo, hi, self.dims);
+        let data = filter_region(&self.raw, self.dims, lo, hi);
+        Ok(Some(LocalPatch { lo, hi, data }))
+    }
+}
+
+fn union(a: Option<([usize; 3], [usize; 3])>, b: ([usize; 3], [usize; 3])) -> ([usize; 3], [usize; 3]) {
+    match a {
+        None => b,
+        Some((lo, hi)) => ([0, 1, 2].map(|k| lo[k].min(b.0[k])), [0, 1, 2].map(|k| hi[k].max(b.1[k]))),
+    }
+}
+
+/// A box with the filter's reach (one voxel) added, in the grid.
+fn grow(lo: [usize; 3], hi: [usize; 3], dims: [usize; 3]) -> ([usize; 3], [usize; 3]) {
+    ([0, 1, 2].map(|k| lo[k].saturating_sub(1)), [0, 1, 2].map(|k| (hi[k] + 1).min(dims[k] - 1)))
 }
 
 #[cfg(test)]
@@ -1271,6 +1467,76 @@ mod local_tests {
             decode(&shadowed, [4, 4, 4]) > 0.9,
             "the source remains lit in front of the wall"
         );
+    }
+    /// The packed channel a patch leaves, written into `full`.
+    fn apply(ll: &LocalLights, full: &mut [u8], patch: &LocalPatch) {
+        ll.write(full, patch.lo, patch.hi, &patch.data);
+    }
+    fn wall_occ() -> Occupancy {
+        let mut occ = Occupancy { origin: [0; 3], planes: std::array::from_fn(|_| vec![0; 16 * 16 * 16]) };
+        for plane in &mut occ.planes {
+            for y in 0..16 {
+                for z in 0..16 {
+                    plane[(y * 16 + z) * 16 + 9] = 255;
+                }
+            }
+        }
+        occ
+    }
+    fn max_diff(a: &[u8], b: &[u8]) -> f32 {
+        let n = a.len() / 4;
+        (0..n)
+            .map(|i| {
+                let d = |x: &[u8]| x[i * 4] as f32 * x[i * 4 + 3] as f32 * 120.0 / (255.0 * 255.0);
+                (d(a) - d(b)).abs()
+            })
+            .fold(0.0, f32::max)
+    }
+    #[test]
+    fn local_update_matches_a_full_build() {
+        let occ = wall_occ();
+        let mut lamp = light(24.0);
+        lamp.extra[2] = 1.0; // shadowed, behind the wall's other side
+        lamp.pos_range = [44.0, 30.0, 30.0, 24.0];
+        let mut flash = light(12.0);
+        flash.pos_range = [14.0, 20.0, 22.0, 12.0];
+        flash.color = [3.5, 2.6, 1.6, 0.0];
+        let dims = [16; 3];
+        let (mut ll, mut shown) = LocalLights::build_dims(&occ, &[lamp], dims);
+        // The flash on: the same as building both from scratch.
+        let patch = ll.update(&occ, &[lamp, flash], usize::MAX).unwrap().expect("a patch");
+        apply(&ll, &mut shown, &patch);
+        let both = local_lights_dims(&occ, &[lamp, flash], dims);
+        assert!(max_diff(&shown, &both) < 0.02, "on: {}", max_diff(&shown, &both));
+        assert!(decode(&shown, [3, 5, 5]) > 0.5, "the flash lights its voxels");
+        // Moved a voxel and a bit (the camera turned): still the same.
+        flash.pos_range[0] += 5.0;
+        let patch = ll.update(&occ, &[lamp, flash], usize::MAX).unwrap().expect("a patch");
+        apply(&ll, &mut shown, &patch);
+        let moved = local_lights_dims(&occ, &[lamp, flash], dims);
+        assert!(max_diff(&shown, &moved) < 0.02, "moved: {}", max_diff(&shown, &moved));
+        // Off again: back to the lamp alone, nothing left behind.
+        let patch = ll.update(&occ, &[lamp], usize::MAX).unwrap().expect("a patch");
+        apply(&ll, &mut shown, &patch);
+        let lamp_only = local_lights_dims(&occ, &[lamp], dims);
+        assert!(max_diff(&shown, &lamp_only) < 0.02, "off: {}", max_diff(&shown, &lamp_only));
+        assert_eq!(decode(&shown, [3, 5, 5]), 0.0, "the flash is gone where only it reached");
+        // The same lights: nothing to do.
+        assert!(ll.update(&occ, &[lamp], usize::MAX).unwrap().is_none());
+        // All off: the whole channel is dark again, exactly.
+        let patch = ll.update(&occ, &[], usize::MAX).unwrap().expect("a patch");
+        apply(&ll, &mut shown, &patch);
+        assert_eq!(shown, local_lights_dims(&occ, &[], dims));
+    }
+    #[test]
+    fn local_update_past_its_budget_leaves_everything() {
+        let occ = wall_occ();
+        let a = light(12.0);
+        let (mut ll, _) = LocalLights::build_dims(&occ, &[a], [16; 3]);
+        let mut b = a;
+        b.pos_range[0] += 4.0;
+        assert!(ll.update(&occ, &[b], 10).is_err());
+        assert_eq!(bytemuck::bytes_of(&ll.lights[0]), bytemuck::bytes_of(&a), "kept as it was");
     }
     #[test]
     fn spot_cone_and_surface_rectangle() {

@@ -785,6 +785,11 @@ enum Cfg {
 /// xorshift64*: cheap, and seeded per emitter so runs repeat.
 struct Rng(u64);
 
+/// An emitter's generator, taken out to spawn with (`spawn` puts it back).
+fn rng_of(slot: &mut Option<Rng>, r: Ref) -> Rng {
+    slot.take().unwrap_or_else(|| Rng::seeded(r))
+}
+
 impl Rng {
     fn seeded(r: Ref) -> Rng {
         let mut h = std::collections::hash_map::DefaultHasher::new();
@@ -968,7 +973,6 @@ impl EmitterState {
     /// `wind`: Workspace.GlobalWind.
     #[allow(clippy::too_many_arguments)]
     fn step(&mut self, c: &EmitterCfg, r: Ref, xf: &Xform, size: Vec3, dt: f32, emit: u32, moving: Option<Vec3>, wind: Vec3) {
-        let rng = self.rng.get_or_insert_with(|| Rng::seeded(r));
         // VelocityInheritance takes the host's physics velocity: an anchored
         // part moved by CFrame passes on none (calibration s: Rate 10 off a
         // part slid 4 studs in 1 s leaves a 4-stud line at Inheritance 1
@@ -980,7 +984,7 @@ impl EmitterState {
         };
         self.last = Some(xf.pos);
         let dts = dt * c.time_scale;
-        let mut n = emit as usize;
+        let mut n = 0usize;
         if c.enabled && c.rate > 0.0 {
             // (Studio makes at most FX_MAX_RATE a second: effects-lanes)
             self.carry += c.rate.min(mech::FX_MAX_RATE) * dts;
@@ -988,10 +992,42 @@ impl EmitterState {
             self.carry -= k;
             n += k as usize;
         }
+        // Rate's particles were born over the step and age with it.
+        let rng = rng_of(&mut self.rng, r);
+        self.spawn(c, xf, size, n, host_vel, rng);
+        // Motion: Acceleration (world, or the part's frame when
+        // LockedToPart: calibration s, +X on a part turned 90° about Z
+        // moves the particle up), Drag (speed halves every 1 / Drag s,
+        // toward GlobalWind with WindAffectsDrag).
+        let accel = c.accel;
+        let wind = if !c.wind { Vec3::ZERO } else if c.locked { xf.rot.transpose() * wind } else { wind };
+        let keep = 0.5f32.powf(c.drag * dts);
+        for p in &mut self.particles {
+            p.age += dts;
+            p.vel += accel * dts;
+            if c.drag != 0.0 {
+                p.vel = wind + (p.vel - wind) * keep;
+            }
+            p.pos += p.vel * dts;
+            // (RotSpeed turns the other way from Rotation: calibration f,
+            // +10°/s turns a particle clockwise on screen, Rotation +30 is
+            // counter-clockwise)
+            p.rot -= p.spin * dts;
+        }
+        self.particles.retain(|p| p.age < p.life);
+        // Emit()'s come from scripts just before this frame is drawn: they
+        // show at age 0, not a frame old (a gun's muzzle flash lives 35-50 ms,
+        // two or three frames: aged at birth it showed one faded frame, at
+        // 40 fps none; Studio shows it from its first frame).
+        let rng = rng_of(&mut self.rng, r);
+        self.spawn(c, xf, size, emit as usize, host_vel, rng);
+    }
+
+    fn spawn(&mut self, c: &EmitterCfg, xf: &Xform, size: Vec3, n: usize, host_vel: Vec3, mut rng: Rng) {
         let n = n.min(mech::FX_PARTICLES_PER_EMITTER.saturating_sub(self.particles.len()));
         let frames = (c.grid.0 * c.grid.1).max(1) as f32;
         for _ in 0..n {
-            let (p, dir) = spawn_local(c, size, rng);
+            let (p, dir) = spawn_local(c, size, &mut rng);
             let speed = rng.in_range(c.speed);
             let (pos, vel) = if c.locked {
                 (p, dir * speed)
@@ -1015,26 +1051,7 @@ impl EmitterState {
                 seed: rng.next() as u32,
             });
         }
-        // Motion: Acceleration (world, or the part's frame when
-        // LockedToPart: calibration s, +X on a part turned 90° about Z
-        // moves the particle up), Drag (speed halves every 1 / Drag s,
-        // toward GlobalWind with WindAffectsDrag).
-        let accel = c.accel;
-        let wind = if !c.wind { Vec3::ZERO } else if c.locked { xf.rot.transpose() * wind } else { wind };
-        let keep = 0.5f32.powf(c.drag * dts);
-        for p in &mut self.particles {
-            p.age += dts;
-            p.vel += accel * dts;
-            if c.drag != 0.0 {
-                p.vel = wind + (p.vel - wind) * keep;
-            }
-            p.pos += p.vel * dts;
-            // (RotSpeed turns the other way from Rotation: calibration f,
-            // +10°/s turns a particle clockwise on screen, Rotation +30 is
-            // counter-clockwise)
-            p.rot -= p.spin * dts;
-        }
-        self.particles.retain(|p| p.age < p.life);
+        self.rng = Some(rng);
     }
 }
 
@@ -2211,6 +2228,39 @@ mod tests {
             st.step(&c, Ref::new(), &xf, Vec3::ZERO, 0.1, 0, None, Vec3::ZERO);
         }
         assert!(st.particles.is_empty());
+    }
+
+    #[test]
+    fn emitted_particles_show_from_age_zero() {
+        // A gun's muzzle flash: Rate 0, Emit(1), Lifetime 0.035 s.
+        let mut c = emitter_test_cfg();
+        c.enabled = false;
+        c.rate = 0.0;
+        c.speed = (0.0, 0.0);
+        c.life = (0.035, 0.035);
+        let xf = Xform { pos: Vec3::ZERO, rot: Mat3::IDENTITY };
+        // At 40 fps: drawn once, fresh, then gone.
+        let mut st = EmitterState::default();
+        st.step(&c, Ref::new(), &xf, Vec3::ZERO, 0.025, 1, None, Vec3::ZERO);
+        assert_eq!(st.particles.len(), 1);
+        assert_eq!(st.particles[0].age, 0.0, "the frame it was emitted in shows it new");
+        st.step(&c, Ref::new(), &xf, Vec3::ZERO, 0.025, 0, None, Vec3::ZERO);
+        assert_eq!(st.particles[0].age, 0.025);
+        st.step(&c, Ref::new(), &xf, Vec3::ZERO, 0.025, 0, None, Vec3::ZERO);
+        assert!(st.particles.is_empty());
+        // At 144 fps: five frames (0 .. 28 ms).
+        let mut st = EmitterState::default();
+        let dt = 1.0 / 144.0;
+        st.step(&c, Ref::new(), &xf, Vec3::ZERO, dt, 1, None, Vec3::ZERO);
+        let mut frames = 1;
+        loop {
+            st.step(&c, Ref::new(), &xf, Vec3::ZERO, dt, 0, None, Vec3::ZERO);
+            if st.particles.is_empty() {
+                break;
+            }
+            frames += 1;
+        }
+        assert_eq!(frames, 6);
     }
 
     #[test]

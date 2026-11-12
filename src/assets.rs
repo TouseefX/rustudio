@@ -904,6 +904,20 @@ impl MeshCache {
         store: &mut AssetStore,
         upload: &mut MeshUpload,
     ) -> Option<LoadedMesh> {
+        if let Some(spec) = id.strip_prefix("rustudio-truss:") {
+            if let Some(cached) = self.entries.get(id) { return *cached; }
+            let fields: Vec<_> = spec.split(':').collect();
+            if fields.len() != 4 { return None; }
+            let size = Vec3::new(
+                f32::from_bits(u32::from_str_radix(fields[0], 16).ok()?),
+                f32::from_bits(u32::from_str_radix(fields[1], 16).ok()?),
+                f32::from_bits(u32::from_str_radix(fields[2], 16).ok()?),
+            );
+            let (p, n, uv) = crate::truss::generate(size, fields[3].parse().ok()?);
+            let mesh = LoadedMesh { index: upload(&p, &n, &uv, &[], &[]), extent: size };
+            self.entries.insert(id.to_owned(), Some(mesh));
+            return Some(mesh);
+        }
         if !store.allows(id) {
             return None;
         }

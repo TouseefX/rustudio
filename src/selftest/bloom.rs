@@ -290,7 +290,7 @@ impl SelfTest {
         ed.show_grid = true;
         ed.view_render_size = None;
         ed.new_place();
-        self.r4.phase = 116;
+        self.r4.phase = 117;
         false
     }
 }
