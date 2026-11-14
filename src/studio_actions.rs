@@ -103,6 +103,10 @@ impl Editor {
             "unlock_all" | "select_all" => (edit, None),
             "zoom_in" | "zoom_out" => (true, None),
             "full_screen" => (true, Some(self.ui.fullscreen)),
+            "render_scale_100" => (true, Some((self.render_scale - 1.0).abs() < 0.01)),
+            "render_scale_70" => (true, Some((self.render_scale - 0.7).abs() < 0.01)),
+            "render_scale_50" => (true, Some((self.render_scale - 0.5).abs() < 0.01)),
+            "ambient_occlusion" => (true, Some(self.ssao)),
             "show_grid" => (true, Some(self.show_grid)),
             "grid_2" => (self.show_grid, Some(self.ui.grid_size == 2.0)),
             "grid_4" => (self.show_grid, Some(self.ui.grid_size == 4.0)),
@@ -281,6 +285,7 @@ impl Editor {
             "render_scale_100" => self.render_scale = 1.0,
             "render_scale_70" => self.render_scale = 0.7,
             "render_scale_50" => self.render_scale = 0.5,
+            "ambient_occlusion" => self.ssao = !self.ssao,
             "full_screen" => {
                 self.ui.fullscreen = !self.ui.fullscreen;
                 ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(self.ui.fullscreen));

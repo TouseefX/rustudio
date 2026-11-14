@@ -99,6 +99,9 @@ pub struct Layout {
     /// The 3D view's render scale (View > Render Scale).
     #[serde(default)]
     pub render_scale: Option<f32>,
+    /// View > Ambient Occlusion.
+    #[serde(default)]
+    pub ssao: Option<bool>,
     pub ribbon_tab: Option<String>,
     pub run_type: Option<String>,
     pub show_grid: Option<bool>,
@@ -207,6 +210,9 @@ impl Layout {
         }
         if let Some(r) = self.render_scale.and_then(finite) {
             ed.render_scale = r.clamp(0.25, 1.0);
+        }
+        if let Some(on) = self.ssao {
+            ed.ssao = on;
         }
         if let Some(t) = &self.ribbon_tab {
             if let Some(t) = RibbonTab::ALL.into_iter().find(|r| format!("{r:?}") == *t) {
@@ -371,6 +377,7 @@ impl Saver {
             homes: panels.homes.clone(),
             zoom: Some(ed.ui.zoom),
             render_scale: Some(ed.render_scale),
+            ssao: Some(ed.ssao),
             ribbon_tab: Some(format!("{:?}", ed.ui.tab)),
             run_type: Some(format!("{:?}", ed.ui.run_type)),
             show_grid: Some(ed.show_grid),

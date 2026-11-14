@@ -356,6 +356,11 @@ fn take_sections() -> Vec<(&'static str, f64, u64)> {
     SECTIONS.with(|s| std::mem::take(&mut *s.borrow_mut()))
 }
 
+/// The sections gathered since they were last taken (src/perf_log.rs).
+pub fn drain_sections() -> Vec<(&'static str, f64, u64)> {
+    take_sections()
+}
+
 /// CPU time this thread has used, in ms (not the time it waited for a core:
 /// on a busy machine frame times stretch, this much less so).
 fn thread_cpu_ms() -> f64 {

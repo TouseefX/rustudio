@@ -11,6 +11,7 @@ mod account_ui;
 #[cfg(target_os = "android")]
 pub mod android;
 pub mod touch_input;
+pub mod perf_log;
 mod ribbon_quick;
 mod cmeta;
 mod studio_content;

@@ -332,6 +332,13 @@ pub struct Editor {
     /// layout: android::touch::auto_zoom).
     #[cfg_attr(not(target_os = "android"), allow(dead_code))]
     pub auto_zoom: bool,
+    /// Screen-space ambient occlusion in the 3D view (View > Ambient
+    /// Occlusion; RUSTUDIO_SSAO=0|1). Off on phones by default: five
+    /// passes a small screen shows little of.
+    pub ssao: bool,
+    /// The last 3D frame shown again while nothing in it changed
+    /// (viewport.rs; RUSTUDIO_VIEW_REUSE=0|1, on by default on phones).
+    pub view_reuse: crate::viewport::ViewReuse,
     /// CPU time of the last frame's update + draw submission (ms).
     pub last_work_ms: f32,
     /// Local lights, sky faces and the sky-visibility map.
@@ -374,6 +381,8 @@ pub enum PendingAction {
 
 pub struct RustudioApp {
     watchdog: crate::frame_watchdog::Watchdog,
+    /// Frame times to the log every few seconds (src/perf_log.rs).
+    perf: crate::perf_log::PerfLog,
     pub dock: DockState<Tab>,
     pub ed: Editor,
     /// Keeps the dock, window and view settings (src/layout_store.rs).
@@ -497,6 +506,10 @@ impl RustudioApp {
             render_scale: std::env::var("RUSTUDIO_RENDER_SCALE").ok().and_then(|v| v.parse().ok()).map_or(1.0, |v: f32| v.clamp(0.25, 1.0)),
             touch: Default::default(),
             auto_zoom: false,
+            ssao: std::env::var("RUSTUDIO_SSAO").map_or(true, |v| v != "0"),
+            view_reuse: crate::viewport::ViewReuse::new(
+                std::env::var("RUSTUDIO_VIEW_REUSE").map_or(cfg!(target_os = "android"), |v| v != "0"),
+            ),
             last_work_ms: 0.0,
             lighting: Default::default(),
             project: None,
@@ -583,6 +596,7 @@ impl RustudioApp {
         // `--play` starts once the 3D view has its size (Camera.ViewportSize).
         RustudioApp {
             watchdog: crate::frame_watchdog::Watchdog::new(cc.egui_ctx.clone()),
+            perf: Default::default(),
             dock,
             ed,
             layout,
@@ -1854,6 +1868,12 @@ impl eframe::App for RustudioApp {
         // paste brings the system clipboard's text.
         #[cfg(target_os = "android")]
         {
+            // The Start Page is plain egui (lists that scroll by drag,
+            // cards that are taps, long presses for menus): the finger
+            // layer is for the editor's chrome and 3D view, once a place
+            // is open.
+            let start_page = self.ed.start.visible && self.ed.doc.id == self.ed.start.doc_id;
+            self.ed.touch.set_enabled(!start_page, raw);
             self.ed.touch.filter(_ctx, raw, self.ed.frame_no);
             crate::android::clipboard::before_frame(raw);
             crate::android::lifecycle::back_pressed(_ctx, raw);
@@ -2217,6 +2237,34 @@ impl eframe::App for RustudioApp {
         // Text copied this frame goes to the system clipboard too.
         #[cfg(target_os = "android")]
         crate::android::clipboard::after_frame(&ctx);
+        if crate::perf_log::on() {
+            let (render_scale, ssao) = (self.ed.render_scale, self.ed.ssao);
+            let (renderer, render_state) = (&self.ed.renderer, &self.ed.render_state);
+            let view_reuse = &mut self.ed.view_reuse;
+            self.perf.frame(
+                work_ms,
+                _frame.info().cpu_usage,
+                || {
+                    let r = ctx.content_rect();
+                    let ppp = ctx.pixels_per_point();
+                    let view = renderer.as_ref().and_then(|r| r.target_size()).unwrap_or([0, 0]);
+                    let (drawn, reused) = view_reuse.take_counts();
+                    format!(
+                        "window {}x{} px at {ppp:.2} px/pt, 3D view {}x{} px (scale {render_scale:.2}, AO {}), 3D frames drawn {drawn} / shown again {reused}",
+                        (r.width() * ppp).round(),
+                        (r.height() * ppp).round(),
+                        view[0],
+                        view[1],
+                        if ssao { "on" } else { "off" },
+                    )
+                },
+                || {
+                    let rs = render_state.as_ref()?;
+                    let i = rs.adapter.get_info();
+                    Some(format!("GPU {} ({:?}, {} {}), {:?}", i.name, i.backend, i.driver, i.driver_info, i.device_type))
+                },
+            );
+        }
         self.watchdog.complete();
     }
 }

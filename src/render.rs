@@ -339,6 +339,46 @@ pub struct Frame<'a> {
     pub sky: bool,
     /// Terrain water's waves, animation and clearness (water.rs).
     pub water: crate::water::WaterLook,
+    /// Screen-space ambient occlusion (five passes a phone's GPU can do
+    /// without; View > Ambient Occlusion).
+    pub ssao: bool,
+}
+
+/// What a frame draws, hashed: the viewport draws again only when this,
+/// [`Renderer::generation`] or the size changed (or time has to show: water,
+/// a game running). The animated material clock is left out (it only
+/// shows on the few materials that move).
+pub fn frame_key(size: [u32; 2], frame: &Frame) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    size.hash(&mut h);
+    h.write(bytemuck::bytes_of(&frame.globals));
+    for v in frame.cull_view_proj.to_cols_array() {
+        v.to_bits().hash(&mut h);
+    }
+    frame.fov_y.to_bits().hash(&mut h);
+    h.write(bytemuck::cast_slice(frame.lights));
+    frame.shadows.hash(&mut h);
+    for c in &frame.sun_cascades {
+        for v in [c.centre.to_array(), c.right.to_array(), c.up.to_array(), c.travel.to_array()].concat() {
+            v.to_bits().hash(&mut h);
+        }
+        c.radius.to_bits().hash(&mut h);
+        c.test_radius.to_bits().hash(&mut h);
+        (c.level, c.tile, c.origin).hash(&mut h);
+    }
+    for d in frame.overlay {
+        h.write(bytemuck::bytes_of(&to_raw(d, 0.0)));
+        d.cast_shadow.hash(&mut h);
+    }
+    h.write(bytemuck::cast_slice(frame.lines));
+    frame.sky.hash(&mut h);
+    frame.ssao.hash(&mut h);
+    let w = frame.water;
+    for v in [w.wave_size, w.wave_speed, w.transparency] {
+        v.to_bits().hash(&mut h);
+    }
+    h.finish()
 }
 
 /// Studs per side of the cells static parts are grouped into.
@@ -860,6 +900,12 @@ pub struct Renderer {
     line_cap: usize,
     target: Option<Target>,
     pub texture_id: Option<egui::TextureId>,
+    /// Counts what changes the picture besides the frame's own inputs
+    /// (meshes, textures, items, terrain, sky, grids): the viewport shows
+    /// the last frame again while this and [`frame_key`] stand still.
+    generation: u64,
+    /// The last frame drew terrain water (its waves move with time).
+    water_drawn: bool,
 }
 
 impl Renderer {
@@ -1881,6 +1927,8 @@ impl Renderer {
             line_cap,
             target: None,
             texture_id: None,
+            generation: 0,
+            water_drawn: false,
         };
         r.add_texture(device, queue, 1, 1, &[255, 255, 255, 255]);
         r
@@ -2030,6 +2078,7 @@ impl Renderer {
         width: u32, height: u32, rgba: &[u8],
         mask: Option<(u32, u32, &[u8])>, surface: Option<(u32, u32, &[u8])>,
     ) -> u32 {
+        self.generation += 1;
         let (sw, sh, sp) = surface.unwrap_or((1, 1, &[128, 128, 255, 0]));
         let surface_view = device.create_texture_with_data(queue, &wgpu::TextureDescriptor {
             label: Some("SurfaceAppearance normal roughness metalness"),
@@ -2269,6 +2318,7 @@ impl Renderer {
     /// Sets Studio's indoor environment cube (textures/sky/indoor512, faces
     /// in wgpu's cube order like `set_sky`).
     pub fn set_indoor(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, size: u32, faces: &[Vec<u8>; 6]) {
+        self.generation += 1;
         self.indoor_view = Self::cube_view(device, queue, size, faces);
         self.rebind_globals(device);
     }
@@ -2383,6 +2433,7 @@ impl Renderer {
         h: u32,
         rgba: &[u8],
     ) {
+        self.generation += 1;
         self.studs_view = Self::studs_texture(device, queue, w, h, rgba);
         self.rebind_globals(device);
     }
@@ -2394,6 +2445,7 @@ impl Renderer {
         key: [i32; 3],
         verts: &[crate::terrain::TerrainVertex],
     ) {
+        self.generation += 1;
         // (the sun's cascades and the lights' shadow maps hold the terrain)
         self.static_gen += 1;
         if verts.is_empty() {
@@ -2423,6 +2475,7 @@ impl Renderer {
 
     /// Drops every terrain chunk (another place, or no terrain).
     pub fn clear_terrain(&mut self) {
+        self.generation += 1;
         self.terrain_chunks.clear();
         self.terrain_grass.clear();
         self.static_gen += 1;
@@ -2457,7 +2510,8 @@ impl Renderer {
 
     /// The terrain shader's per-palette parameters (4 vec4s per entry, see
     /// shader.wgsl TerrainParams).
-    pub fn set_terrain_params(&self, queue: &wgpu::Queue, params: &[[f32; 4]]) {
+    pub fn set_terrain_params(&mut self, queue: &wgpu::Queue, params: &[[f32; 4]]) {
+        self.generation += 1;
         let n = params.len().min(TERRAIN_PALETTE * 4);
         queue.write_buffer(&self.terrain_params_buf, 0, bytemuck::cast_slice(&params[..n]));
     }
@@ -2473,6 +2527,7 @@ impl Renderer {
         if let Some(l) = self.materials.layers.get(&maps.pack) {
             return *l as i32;
         }
+        self.generation += 1;
         let layer = self.materials.cpu.len() as u32;
         self.materials.cpu.push(maps.clone());
         self.materials.layers.insert(maps.pack, layer);
@@ -2496,6 +2551,7 @@ impl Renderer {
     /// Studio's material constants for the parts drawn with material layer
     /// `layer` (see `MaterialArrays`): written when they change.
     pub fn set_material_params(&mut self, queue: &wgpu::Queue, layer: i32, p: [[f32; 4]; 2]) {
+        self.generation += 1;
         let Ok(l) = usize::try_from(layer) else {
             return;
         };
@@ -2525,6 +2581,7 @@ impl Renderer {
         size: u32,
         mipped: Option<&[u8]>,
     ) {
+        self.generation += 1;
         match mipped {
             Some(f) if size > 0 => {
                 self.sky_view = Self::cube_view_mipped(device, queue, size, f);
@@ -2537,6 +2594,7 @@ impl Renderer {
 
     /// Uploads the light grid (lightgrid.rs: skylight and sun bytes, X, then Z, then Y).
     pub fn set_lightgrid(&mut self, queue: &wgpu::Queue, data: &[u8]) {
+        self.generation += 1;
         let [nx, ny, nz] = crate::lightgrid::dims().map(|n| n as u32);
         if data.len() != (2 * nx * ny * nz) as usize {
             return;
@@ -2563,6 +2621,7 @@ impl Renderer {
     }
 
     pub fn set_localgrid(&mut self, queue: &wgpu::Queue, data: &[u8]) {
+        self.generation += 1;
         let [nx, ny, nz] = crate::lightgrid::dims().map(|n| n as u32);
         if data.len() != (nx * ny * nz * 4) as usize { return; }
         queue.write_texture(wgpu::TexelCopyTextureInfo {
@@ -2574,6 +2633,7 @@ impl Renderer {
 
     /// Uploads part of the local light channel (lightgrid::LocalPatch).
     pub fn set_localgrid_region(&mut self, queue: &wgpu::Queue, p: &crate::lightgrid::LocalPatch) {
+        self.generation += 1;
         let size = [0, 1, 2].map(|k| (p.hi[k] - p.lo[k] + 1) as u32);
         if p.data.len() != (size[0] * size[1] * size[2] * 4) as usize { return; }
         queue.write_texture(wgpu::TexelCopyTextureInfo {
@@ -2586,6 +2646,7 @@ impl Renderer {
 
     /// Uploads the parts' light occupancy (lightocc.rs: X, then Y, then Z).
     pub fn set_lightocc(&mut self, queue: &wgpu::Queue, data: &[u8]) {
+        self.generation += 1;
         let [nx, ny, nz] = crate::lightocc::dims().map(|n| n as u32);
         if data.len() != (nx * ny * nz) as usize {
             return;
@@ -2838,8 +2899,8 @@ impl Renderer {
         batches: &[crate::world_gui::GuiBatch],
         fx: Option<&crate::world_gui::FxFrame>,
         tone_curve: Option<[f32; 5]>,
-    ) {
-        let Some(t) = self.target.as_ref() else { return };
+    ) -> bool {
+        let Some(t) = self.target.as_ref() else { return false };
         let pass = self
             .world_gui
             .get_or_insert_with(|| crate::world_gui::WorldGuiPass::new(&rs.device, &rs.queue, DISPLAY_FORMAT));
@@ -2851,9 +2912,27 @@ impl Renderer {
         // (effects light themselves from the frame's local lights)
         pass.lights = self.lights_buf.clone();
         pass.n_lights = self.gui_n_lights;
-        if pass.effects(rs, &t.hdr_view, t.size, &t.depth, batches, fx, tone_curve, self.gui_fog.0, self.gui_fog.1) {
+        let drew = pass.effects(rs, &t.hdr_view, t.size, &t.depth, batches, fx, tone_curve, self.gui_fog.0, self.gui_fog.1);
+        if drew {
             self.finish_again(rs);
         }
+        drew
+    }
+
+    /// See the `generation` field: bumped by everything that changes what
+    /// a frame would draw other than the frame's own inputs.
+    pub fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    /// Whether the last frame drew terrain water (which moves with time).
+    pub fn water_drawn(&self) -> bool {
+        self.water_drawn
+    }
+
+    /// The 3D target's size in pixels, once drawn.
+    pub fn target_size(&self) -> Option<[u32; 2]> {
+        self.target.as_ref().map(|t| t.size)
     }
 
     /// The bloom and the final image again, from the HDR image as it is now
@@ -2948,6 +3027,9 @@ impl Renderer {
         // cam_pos.w is unused by the camera math. Keep material animation
         // continuous across scene rebuilds, independently of lighting time.
         let mut globals = frame.globals;
+        if !frame.ssao {
+            globals.ssao[3] = 0.0;
+        }
         self.post_bloom_size = globals.bloom[1];
         self.post_dof = globals.dof[2] > 0.0 || globals.dof[3] > 0.0;
         globals.cam_pos[3] = self.material_epoch.elapsed().as_secs_f32();
@@ -3325,6 +3407,7 @@ impl Renderer {
         // which looks through it; then decals and see-through parts.
         let has_glass = blended.iter().any(|e| (e.2.extra[0] as u32 & 7) == 3);
         let split = !water_runs.is_empty() || has_glass;
+        self.water_drawn = !water_runs.is_empty();
         let mut calls = 0usize;
         // One instanced draw per run of (mesh, texture).
         let draw = |pass: &mut wgpu::RenderPass,
@@ -3507,7 +3590,9 @@ impl Renderer {
         stats.draw_calls = calls;
         // Bloom: bright pass, blur across, blur down (half resolution).
         // SSAO (Studio's passes), then its multiply into the scene.
-        {
+        // (Off: nothing reads its textures; the post passes take only the
+        // scene's depth from that bind group.)
+        if frame.ssao {
             let steps: [(&str, &wgpu::RenderPipeline, usize, &wgpu::TextureView, bool); 5] = [
                 ("ssao depth", &self.ssao_down, 0, &target.ssao_depth_view, true),
                 ("ssao", &self.ssao_main, 1, &target.ssao_views[0], true),
@@ -3644,6 +3729,7 @@ impl Renderer {
         &mut self, device: &wgpu::Device, positions: &[Vec3], normals: &[Vec3],
         uvs: &[glam::Vec2], colors: &[glam::Vec4], planes: &[glam::Vec4],
     ) -> u32 {
+        self.generation += 1;
         let verts: Vec<Vertex> = positions
             .iter()
             .zip(normals)
@@ -3675,6 +3761,7 @@ impl Renderer {
         &mut self, device: &wgpu::Device, queue: &wgpu::Queue, index: Option<u32>,
         positions: &[Vec3], normals: &[Vec3], uvs: &[glam::Vec2], colors: &[glam::Vec4],
     ) -> u32 {
+        self.generation += 1;
         let slot = index.map(|i| i as usize + BUILTIN_MESHES);
         match slot.and_then(|s| self.meshes.get(s)) {
             Some(m) if m.count as usize == positions.len() => {
@@ -3725,6 +3812,7 @@ impl Renderer {
     /// Adds or updates one part's draws. Parts that keep changing place move
     /// to the per-frame list; colour-only changes update the static slot.
     pub fn set_item(&mut self, r: Ref, mut draws: Vec<PartDraw>) {
+        self.generation += 1;
         // Studio seeds material offsets from an allocation address. A DOM
         // referent supplies the equivalent stable per-instance identity here.
         let identity = u64::from_str_radix(&r.to_string()[16..], 16).unwrap_or(0);
@@ -3828,6 +3916,7 @@ impl Renderer {
     }
 
     pub fn remove_item(&mut self, r: Ref) {
+        self.generation += 1;
         let Some(item) = self.items.remove(&r) else {
             return;
         };
@@ -3848,6 +3937,7 @@ impl Renderer {
     }
 
     pub fn clear_items(&mut self) {
+        self.generation += 1;
         self.items.clear();
         self.per_frame.clear();
         self.st = StaticLayout::default();

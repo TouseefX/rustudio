@@ -188,6 +188,12 @@ pub struct Touch {
     /// Frames since the last touch: a mouse's own events pass when fingers
     /// have been away for a while.
     pub last_touch: Option<Instant>,
+    /// Switched off ([`Touch::set_enabled`]): events pass as they come.
+    off: bool,
+    /// Fingers that landed while switched off (or were down when it was
+    /// switched off): egui's, with the pointer events winit makes for
+    /// them, until they lift.
+    foreign: BTreeSet<TouchId>,
 }
 
 fn key_event(key: Key, pressed: bool) -> Event {
@@ -219,6 +225,27 @@ impl Touch {
     /// the editor's frame counter, to tell fresh zones from stale ones.
     pub fn filter(&mut self, ctx: &egui::Context, raw: &mut egui::RawInput, frame_no: u64) {
         let now = Instant::now();
+        // Switched off, or fingers from then still down: egui gets the
+        // events as winit made them (its own touch rules: drag-to-scroll,
+        // long press menus), until every such finger has lifted.
+        if self.off || !self.foreign.is_empty() {
+            for ev in &raw.events {
+                match ev {
+                    Event::Touch { id, phase: TouchPhase::Start, .. } => {
+                        self.last_touch = Some(now);
+                        self.foreign.insert(*id);
+                    }
+                    Event::Touch { id, phase: TouchPhase::End | TouchPhase::Cancel, .. } => {
+                        self.last_touch = Some(now);
+                        self.foreign.remove(id);
+                    }
+                    Event::Touch { .. } => self.last_touch = Some(now),
+                    Event::WindowFocused(false) => self.foreign.clear(),
+                    _ => {}
+                }
+            }
+            return;
+        }
         let mut out: Vec<Event> = Vec::with_capacity(raw.events.len() + 8);
         // Pointer events in a batch with touch events (or while a finger is
         // down) are egui-winit's stand-ins for the finger: ours replace them.
@@ -228,12 +255,8 @@ impl Touch {
                 Event::WindowFocused(false) => {
                     // No lifts come for fingers down when the activity
                     // pauses: everything lets go.
-                    self.release_all(&mut out);
-                    if self.pointer.take().is_some() {
-                        out.push(Event::PointerGone);
-                    }
+                    self.let_go(&mut out);
                     self.active.clear();
-                    self.fling = None;
                     out.push(ev);
                 }
                 Event::Touch { id, phase, pos, .. } => {
@@ -477,6 +500,58 @@ impl Touch {
         }
     }
 
+    /// Switches the layer off or on. Off, the frame's events reach egui
+    /// as winit made them: the Start Page is plain egui (scroll areas
+    /// that scroll by drag, cards that are taps, long presses for menus)
+    /// with nothing of the editor's to tell a scroll from a drag for.
+    /// Switching off lets go of everything held (the events go in front
+    /// of this frame's); fingers down at a switch stay egui's until they
+    /// lift, so no press is left half delivered.
+    pub fn set_enabled(&mut self, on: bool, raw: &mut egui::RawInput) {
+        if on == !self.off {
+            return;
+        }
+        self.off = !on;
+        if on {
+            return;
+        }
+        let mut out: Vec<Event> = Vec::new();
+        self.let_go(&mut out);
+        let down = std::mem::take(&mut self.active);
+        self.foreign.extend(down);
+        if !out.is_empty() {
+            out.append(&mut raw.events);
+            raw.events = out;
+        }
+    }
+
+    /// Whether the layer is rewriting events (not switched off).
+    pub fn enabled(&self) -> bool {
+        !self.off
+    }
+
+    /// Ends whatever is in progress the way a lift would, without a tap:
+    /// the held keys, a press or look's button, a scroll or fling's wheel.
+    fn let_go(&mut self, out: &mut Vec<Event>) {
+        self.release_all(out);
+        if let Some(p) = self.pointer.take() {
+            match p.mode {
+                Mode::Pending | Mode::Multi => {}
+                Mode::Scroll => out.push(wheel(Vec2::ZERO, TouchPhase::End)),
+                Mode::Look => {
+                    out.push(Event::PointerMoved(p.pos));
+                    out.push(button(p.pos, PointerButton::Secondary, false));
+                }
+                Mode::Press => out.push(button(p.pos, PointerButton::Primary, false)),
+            }
+            out.push(Event::PointerGone);
+        }
+        if self.fling.take().is_some() {
+            out.push(wheel(Vec2::ZERO, TouchPhase::End));
+            out.push(Event::PointerGone);
+        }
+    }
+
     /// Lets go of everything (the window lost focus, Play stopped).
     pub fn release_all(&mut self, out: &mut Vec<Event>) {
         self.stick = None;
@@ -575,6 +650,45 @@ mod tests {
         assert!((wheel_y - 30.0).abs() < 1e-3, "{b:?}");
         let c = run(&mut t, &ctx, vec![touch(1, TouchPhase::End, Pos2::new(100.0, 130.0))]);
         assert!(!c.iter().any(|e| matches!(e, Event::PointerButton { .. })), "{c:?}");
+    }
+
+    #[test]
+    fn switched_off_events_pass_untouched_and_a_finger_down_at_the_switch_stays_egui_s() {
+        let ctx = egui::Context::default();
+        let mut t = Touch::default();
+        let mut raw = egui::RawInput::default();
+        t.set_enabled(false, &mut raw);
+        assert!(raw.events.is_empty());
+        // Off: winit's stand-in pointer events reach egui as they are.
+        let events = vec![touch(1, TouchPhase::Start, Pos2::new(10.0, 10.0)), Event::PointerMoved(Pos2::new(10.0, 10.0)), button(Pos2::new(10.0, 10.0), PointerButton::Primary, true)];
+        let out = run(&mut t, &ctx, events.clone());
+        assert_eq!(format!("{out:?}"), format!("{events:?}"));
+        assert!(!t.any());
+        // Switched on with that finger still down: its events (and the
+        // release winit makes for it) still pass; the next finger is ours.
+        t.set_enabled(true, &mut raw);
+        let events = vec![touch(1, TouchPhase::End, Pos2::new(10.0, 10.0)), button(Pos2::new(10.0, 10.0), PointerButton::Primary, false), Event::PointerGone];
+        let out = run(&mut t, &ctx, events.clone());
+        assert_eq!(format!("{out:?}"), format!("{events:?}"));
+        let out = run(&mut t, &ctx, vec![touch(2, TouchPhase::Start, Pos2::new(10.0, 10.0)), button(Pos2::new(10.0, 10.0), PointerButton::Primary, true)]);
+        assert!(!out.iter().any(|e| matches!(e, Event::PointerButton { .. })), "{out:?}");
+        assert!(t.any());
+    }
+
+    #[test]
+    fn switching_off_lets_go_of_a_press_in_front_of_the_frame() {
+        let ctx = egui::Context::default();
+        let mut t = Touch::default();
+        run(&mut t, &ctx, vec![touch(1, TouchPhase::Start, Pos2::new(10.0, 10.0))]);
+        std::thread::sleep(HOLD + Duration::from_millis(20));
+        let out = run(&mut t, &ctx, vec![]);
+        assert!(out.iter().any(|e| matches!(e, Event::PointerButton { pressed: true, .. })), "{out:?}");
+        let mut raw = egui::RawInput { events: vec![touch(1, TouchPhase::Move, Pos2::new(20.0, 10.0))], ..Default::default() };
+        t.set_enabled(false, &mut raw);
+        assert!(matches!(raw.events[0], Event::PointerButton { button: PointerButton::Primary, pressed: false, .. }), "{:?}", raw.events);
+        assert!(matches!(raw.events[1], Event::PointerGone), "{:?}", raw.events);
+        assert!(matches!(raw.events.last(), Some(Event::Touch { .. })), "{:?}", raw.events);
+        assert!(t.mode().is_none() && !t.any());
     }
 
     #[test]

@@ -13,6 +13,76 @@ use crate::render::{Frame, LineVertex};
 use crate::scene::{self, ScenePart};
 use crate::theme;
 
+/// The last 3D frame kept on screen while nothing it shows has changed:
+/// the editor's chrome then redraws at its own (cheap) pace with the scene
+/// an image, on a phone where each 3D frame is most of the frame time. A
+/// frame is drawn afresh when its inputs ([`crate::render::frame_key`]),
+/// the renderer's contents ([`crate::render::Renderer::generation`]) or
+/// the size changed; when time shows (a game running, terrain water, world
+/// GUIs and effects, the test harness); and at least every [`ViewReuse::MAX_AGE`],
+/// so nothing a signal missed stays behind for long. (An idle editor draws
+/// no frames at all either way: egui repaints on input.)
+pub struct ViewReuse {
+    pub on: bool,
+    key: u64,
+    generation: u64,
+    at: Option<std::time::Instant>,
+    tex: Option<egui::TextureId>,
+    /// The last frame's world GUI pass drew something (it draws each frame).
+    world_fx: bool,
+    /// This frame showed the last one again.
+    pub reused_now: bool,
+    /// Frames shown again / drawn afresh since [`ViewReuse::take_counts`].
+    reused: u64,
+    drawn: u64,
+}
+
+impl ViewReuse {
+    /// A frame shown again is at most this old.
+    pub const MAX_AGE: std::time::Duration = std::time::Duration::from_millis(250);
+
+    pub fn new(on: bool) -> Self {
+        ViewReuse { on, key: 0, generation: 0, at: None, tex: None, world_fx: false, reused_now: false, reused: 0, drawn: 0 }
+    }
+
+    /// The last frame's texture, when it can stand for this frame (`key`
+    /// and `generation` as drawn, young enough, nothing live).
+    fn again(&mut self, key: u64, generation: u64, live: bool) -> Option<egui::TextureId> {
+        let tex = self.tex.filter(|_| {
+            self.on
+                && !live
+                && !self.world_fx
+                && key == self.key
+                && generation == self.generation
+                && self.at.is_some_and(|t| t.elapsed() < Self::MAX_AGE)
+        });
+        self.reused_now = tex.is_some();
+        if tex.is_some() {
+            self.reused += 1;
+        }
+        tex
+    }
+
+    /// A frame was drawn afresh.
+    fn drawn(&mut self, key: u64, generation: u64, tex: Option<egui::TextureId>) {
+        self.key = key;
+        self.generation = generation;
+        self.at = Some(std::time::Instant::now());
+        self.tex = tex;
+        self.reused_now = false;
+        self.drawn += 1;
+    }
+
+    fn world_fx(&mut self, drew: bool) {
+        self.world_fx = drew;
+    }
+
+    /// Frames drawn afresh and shown again since the last call (the perf log).
+    pub fn take_counts(&mut self) -> (u64, u64) {
+        (std::mem::take(&mut self.drawn), std::mem::take(&mut self.reused))
+    }
+}
+
 pub const AXIS_COLORS: [Color32; 3] = [
     Color32::from_rgb(232, 76, 61),
     Color32::from_rgb(98, 204, 92),
@@ -1938,26 +2008,43 @@ impl Editor {
             self.frame_lighting(rrect)
         };
         let vp_render = crate::bench::scope("vp_render");
+        let frame = Frame {
+            globals,
+            cull_view_proj: self.cam.view_proj(rrect),
+            fov_y: self.cam.fov_deg.to_radians(),
+            lights: &lights,
+            shadows,
+            sun_cascades,
+            overlay: &overlay,
+            lines: &lines,
+            sky: self.cam.ortho.is_none(),
+            water: crate::water::WaterLook {
+                time: self.harness.started.elapsed().as_secs_f32(),
+                ..self.water_waves
+            },
+            ssao: self.ssao,
+        };
+        // Time shows in these: every frame is drawn afresh (ViewReuse).
+        let h = &self.harness;
+        let live = self.play.is_some()
+            || h.screenshot.is_some()
+            || h.screenshot_requested
+            || h.selftest.is_some()
+            || h.bench.is_some()
+            || h.ui_shots.is_some()
+            || !h.shots.is_empty();
         let tex = match (self.renderer.as_mut(), self.render_state.as_ref()) {
-            (Some(r), Some(rs)) => r.render(
-                rs,
-                size,
-                &Frame {
-                    globals,
-                    cull_view_proj: self.cam.view_proj(rrect),
-                    fov_y: self.cam.fov_deg.to_radians(),
-                    lights: &lights,
-                    shadows,
-                    sun_cascades,
-                    overlay: &overlay,
-                    lines: &lines,
-                    sky: self.cam.ortho.is_none(),
-                    water: crate::water::WaterLook {
-                        time: self.harness.started.elapsed().as_secs_f32(),
-                        ..self.water_waves
-                    },
-                },
-            ),
+            (Some(r), Some(rs)) => {
+                let key = crate::render::frame_key(size, &frame);
+                match self.view_reuse.again(key, r.generation(), live || r.water_drawn()) {
+                    Some(tex) => Some(tex),
+                    None => {
+                        let tex = r.render(rs, size, &frame);
+                        self.view_reuse.drawn(key, r.generation(), tex);
+                        tex
+                    }
+                }
+            }
             _ => None,
         };
         drop(vp_render);
@@ -2119,7 +2206,18 @@ impl Editor {
             let _g = crate::bench::scope("gui_world_pass");
             // The same tone curve rule as the 3D view (lighting::tone_curve_on).
             let curve = crate::lighting::tone_curve_on(&self.doc).then_some(mech::TONE_CURVE);
-            r.draw_world_gui(rs, &self.gui.world_batches, self.effects.drawn(), curve);
+            // (`effects.drawn` hands this frame's effects over once)
+            let fx = self.effects.drawn();
+            let any = !self.gui.world_batches.is_empty() || fx.is_some();
+            if self.view_reuse.reused_now && any {
+                // On a frame shown again they'd pile on the last frame's:
+                // the next frame is drawn afresh, with them.
+                self.view_reuse.world_fx(true);
+                ctx.request_repaint();
+            } else {
+                let drew = r.draw_world_gui(rs, &self.gui.world_batches, fx, curve);
+                self.view_reuse.world_fx(drew);
+            }
         }
         if let Some(s) = self
             .play

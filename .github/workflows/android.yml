@@ -122,6 +122,10 @@ jobs:
           # format `x`'s --pem takes). Without one xbuild signs with its
           # built-in debug key, which installs fine with adb.
           SIGNING_PEM: ${{ secrets.ANDROID_SIGNING_PEM }}
+          # The release APK's code: thin LTO across the crates (phones
+          # are CPU-bound sooner than desktops; the workspace's own
+          # release profile is left as it is for desktop builds).
+          CARGO_PROFILE_RELEASE_LTO: thin
         run: |
           set -euo pipefail
           if [ "${{ matrix.profile }}" = "release" ] && [ -n "${SIGNING_PEM:-}" ]; then

@@ -244,6 +244,11 @@ pub mod touch {
         if saved.as_ref().and_then(|l| l.render_scale).is_none() && std::env::var_os("RUSTUDIO_RENDER_SCALE").is_none() {
             app.ed.render_scale = DEFAULT_RENDER_SCALE;
         }
+        // Studio's SSAO costs five passes over the view for a subtle
+        // darkening in corners a phone's screen barely shows.
+        if saved.as_ref().and_then(|l| l.ssao).is_none() && std::env::var_os("RUSTUDIO_SSAO").is_none() {
+            app.ed.ssao = false;
+        }
         ctx.options_mut(|o| {
             // A finger lands less precisely than a pointer: a press that
             // drifts this far is still a tap.

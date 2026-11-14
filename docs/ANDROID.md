@@ -162,7 +162,56 @@ chrome's egui settings for fingers are in `android::touch::setup`. The
 tuning numbers (hold 320 ms, slop 8 pt, fling, stick and button sizes)
 are `mech::TOUCH_*` with their rows in docs/MECHANICS.md ("Touch
 screens") and mechanics.json. The module has no Android dependency, so
-its seven tests run on the desktop (`cargo test touch_input`).
+its nine tests run on the desktop (`cargo test touch_input`).
+
+The layer is **off on the Start Page** (`Touch::set_enabled` from
+`raw_input_hook`, while `start_page_ui` would draw): that page is plain
+egui — lists that scroll by drag (`ScrollArea`'s own touch rule), cards
+that are taps, long presses for its menus — and has none of the editor's
+reasons to tell a scroll from a drag. Switching off lets go of anything
+held; a finger down at a switch stays egui's until it lifts, so no press
+is left half delivered. Once a place opens, the layer is on.
+
+## Frame time on a phone
+
+Every few seconds the editor logs a line like
+
+```
+perf: 143 frames in 5.0 s: 34.9 ms apart (p95 51.2, worst 88); editor 9.4 ms + egui 6.1 ms on the CPU, 19.4 ms GPU/vsync wait; window 2400x1080 px at 2.20 px/pt, 3D view 1078x462 px (scale 0.70, AO off), 3D frames drawn 61 / shown again 82; sections (ms/frame): vp_render 4.1, dock_panels 2.8, lighting 0.9
+```
+
+(`src/perf_log.rs`; `adb logcat -s rustudio`, or `RUSTUDIO_PERF_LOG=1` on
+a desktop). "editor" is `App::ui`'s own time, "egui" the layout and
+painting eframe adds, the "wait" what is left of the interval (the GPU,
+vsync). The first line names the GPU and the wgpu backend (Vulkan is the
+one wanted; a GL fallback is slow). An idle editor logs nothing: no
+input, no frames.
+
+What the port does about it:
+
+- **Render scale** (View > Render Scale; `RUSTUDIO_RENDER_SCALE`): the 3D
+  view at 0.7 of the panel's pixels on a first run.
+- **Ambient occlusion off** (View > Ambient Occlusion; `RUSTUDIO_SSAO`):
+  Studio's SSAO is five passes over the view for a darkening in corners
+  a phone's screen barely shows.
+- **The last 3D frame shown again** while nothing in it changed
+  (`viewport::ViewReuse`; `RUSTUDIO_VIEW_REUSE=0|1`, on by default on
+  Android only): the frame's inputs are hashed (`render::frame_key`), the
+  renderer counts its own changes (`Renderer::generation`, bumped by
+  every mesh, texture, item, terrain, sky and grid upload), and a frame
+  is drawn afresh when either moved, when time shows (a game running,
+  terrain water, world GUIs and effects, the test harness) and at least
+  every 250 ms. With a still camera the chrome then redraws at egui's
+  own pace — taps and scrolls in the Explorer and Properties no longer
+  wait for a 3D frame each.
+- The release APK is built with thin LTO (`CARGO_PROFILE_RELEASE_LTO` in
+  android.yml; the workspace profile is unchanged for desktops).
+
+Still to do, with measurements from the line above: a phone tier for the
+sun's shadow tiles (all four cascades are redrawn, with their EVSM
+blurs, whenever the camera moves) and for the light grid's size, and a
+leaner default layout for small screens (every panel open at once is
+most of the CPU time on a phone).
 
 ## Device-run notes (first APKs)
 
@@ -205,6 +254,11 @@ and here:
   API 30+, the runtime permission below). "Open with rustudio" from a
   Files app needs nothing.
 - **Panels didn't scroll, no camera on touch.** `src/touch_input.rs`.
+- **Start Page lists wouldn't scroll / taps misfired.** The finger layer
+  ran there too, with no viewport to publish its zones, over a page that
+  is plain egui; it is off until a place opens (see "Fingers").
+- **Lag on a Baseplate with a release APK.** The chrome redrew the 3D
+  view every frame it drew itself; see "Frame time on a phone".
 
 ## Later steps (in order)
 

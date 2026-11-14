@@ -260,6 +260,8 @@ pub const VIEW: &[M] = &[
         I("70%", "", "render_scale_70"),
         I("50%", "", "render_scale_50"),
     ]),
+    // Studio's SSAO: five passes over the view; phones start without.
+    I("Ambient Occlusion", "", "ambient_occlusion"),
     S,
     I("Show View Selector", "", "view_selector"),
     I("Show Wind Direction", "", "wind_direction"),
