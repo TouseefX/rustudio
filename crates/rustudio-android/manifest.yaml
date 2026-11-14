@@ -24,7 +24,7 @@ android:
       - name: android.permission.VIBRATE
     uses_feature:
       # wgpu: Vulkan first, OpenGL ES 3.0 as the fallback (src/lib.rs
-      # wgpu_options), so neither is required on its own.
+      # wgpu_options), so Vulkan is declared but not required.
       - name: android.hardware.vulkan.level
         version: 0
         required: false
@@ -32,7 +32,13 @@ android:
         # 0x400003 = Vulkan 1.0.3, the lowest wgpu drives.
         version: 4194307
         required: false
-      - opengles_version: [3, 0]
+      # No `opengles_version: [3, 0]` (android:glEsVersion) here: xbuild
+      # e67b501 writes it as the hex string 0x00030000 but its manifest
+      # compiler parses integer attributes as decimal, so `x build` fails
+      # at "[3/3] Create apk" with "invalid digit found in string"
+      # (apk/src/compiler/attributes.rs). The declaration is only a store
+      # filter; every API 26+ device has GLES 3.0, and the GLES fallback
+      # is picked at run time anyway. Put it back once xbuild accepts hex.
       - name: android.hardware.touchscreen.multitouch
         required: false
       # UserInputService.AccelerometerEnabled / GyroscopeEnabled: optional.
@@ -54,7 +60,12 @@ android:
           intent_filters:
             # Open a place or model from a file manager / share sheet: the
             # Intent's content: URI is read through ContentResolver at
-            # start (src/android/storage.rs).
+            # start (src/android/storage.rs). The patterns are written for
+            # xbuild's manifest compiler, which stores attribute strings as
+            # they are (no aapt backslash unescaping): one backslash makes
+            # PatternMatcher's literal dot. The second pattern per extension
+            # covers one more dot in the name ("my.place.rbxl"): ".*" stops
+            # at the first match of what follows it.
             - actions: [android.intent.action.VIEW]
               categories: [android.intent.category.DEFAULT, android.intent.category.BROWSABLE]
               data:
@@ -63,21 +74,41 @@ android:
                   path_pattern: ".*\\.rbxl"
                 - scheme: content
                   mime_type: "*/*"
+                  path_pattern: ".*\\..*\\.rbxl"
+                - scheme: content
+                  mime_type: "*/*"
                   path_pattern: ".*\\.rbxlx"
+                - scheme: content
+                  mime_type: "*/*"
+                  path_pattern: ".*\\..*\\.rbxlx"
                 - scheme: content
                   mime_type: "*/*"
                   path_pattern: ".*\\.rbxm"
                 - scheme: content
                   mime_type: "*/*"
+                  path_pattern: ".*\\..*\\.rbxm"
+                - scheme: content
+                  mime_type: "*/*"
                   path_pattern: ".*\\.rbxmx"
+                - scheme: content
+                  mime_type: "*/*"
+                  path_pattern: ".*\\..*\\.rbxmx"
                 - scheme: file
                   path_pattern: ".*\\.rbxl"
                 - scheme: file
+                  path_pattern: ".*\\..*\\.rbxl"
+                - scheme: file
                   path_pattern: ".*\\.rbxlx"
+                - scheme: file
+                  path_pattern: ".*\\..*\\.rbxlx"
                 - scheme: file
                   path_pattern: ".*\\.rbxm"
                 - scheme: file
+                  path_pattern: ".*\\..*\\.rbxm"
+                - scheme: file
                   path_pattern: ".*\\.rbxmx"
+                - scheme: file
+                  path_pattern: ".*\\..*\\.rbxmx"
   # api-dump.json ships in the APK's assets/ and is copied to the app's
   # files dir at first start (src/android/assets.rs), where
   # paths::resource finds it.

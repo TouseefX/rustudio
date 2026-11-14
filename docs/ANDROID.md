@@ -40,6 +40,19 @@ Without a device, `cargo check` for the target works with the same
 environment xbuild uses (sysroot, `--target=aarch64-linux-android33`, clang
 and lld) — see the `Build APK` step of the workflow for the variables.
 
+xbuild quirks worth knowing (commit e67b501):
+
+- A workspace member list must not contain `"."`: xbuild walks
+  `workspace.members` and rejects a member whose manifest has a
+  `[workspace]` table (*Did not expect a `[workspace]`*). Cargo adds the
+  root package by itself, so the root isn't listed.
+- `opengles_version` in `manifest.yaml` can't be used: it is written as
+  `android:glEsVersion="0x00030000"` but xbuild's own manifest compiler
+  parses integer attributes as decimal and `x build` stops at
+  *[3/3] Create apk — invalid digit found in string*. The GLES fallback
+  doesn't depend on the declaration (wgpu picks it at run time), and every
+  API 26 device has GLES 3.0, so the manifest declares Vulkan only.
+
 ## What is where
 
 | Concern | Desktop | Android |
