@@ -2244,6 +2244,7 @@ impl eframe::App for RustudioApp {
             self.perf.frame(
                 work_ms,
                 _frame.info().cpu_usage,
+                renderer.as_ref().and_then(|r| r.gpu_totals()),
                 || {
                     let r = ctx.content_rect();
                     let ppp = ctx.pixels_per_point();

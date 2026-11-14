@@ -39,7 +39,7 @@ pub struct ViewReuse {
 
 impl ViewReuse {
     /// A frame shown again is at most this old.
-    pub const MAX_AGE: std::time::Duration = std::time::Duration::from_millis(250);
+    pub const MAX_AGE: std::time::Duration = std::time::Duration::from_millis(500);
 
     pub fn new(on: bool) -> Self {
         ViewReuse { on, key: 0, generation: 0, at: None, tex: None, world_fx: false, reused_now: false, reused: 0, drawn: 0 }
@@ -2003,10 +2003,20 @@ impl Editor {
             }
             None => rect,
         };
-        let (globals, lights, shadows, sun_cascades) = {
+        let (mut globals, lights, mut shadows, sun_cascades) = {
             let _l = crate::bench::scope("lighting");
             self.frame_lighting(rrect)
         };
+        {
+            // RUSTUDIO_SUN_SHADOWS=0: the sun's shadow maps off, as with
+            // Lighting.GlobalShadows false (a device run's comparison;
+            // perf_log::env_switch). bloom.z is the shader's switch.
+            static SUN: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+            if !crate::perf_log::env_switch(&SUN, "RUSTUDIO_SUN_SHADOWS", true) {
+                shadows = false;
+                globals.bloom[2] = 0.0;
+            }
+        }
         let vp_render = crate::bench::scope("vp_render");
         let frame = Frame {
             globals,
@@ -2208,7 +2218,9 @@ impl Editor {
             let curve = crate::lighting::tone_curve_on(&self.doc).then_some(mech::TONE_CURVE);
             // (`effects.drawn` hands this frame's effects over once)
             let fx = self.effects.drawn();
-            let any = !self.gui.world_batches.is_empty() || fx.is_some();
+            // (the same test as WorldGuiPass::upload: a frame's effects
+            // come as a FxFrame whether or not it holds any draws)
+            let any = self.gui.world_batches.iter().any(|b| !b.indices.is_empty()) || fx.is_some_and(|f| !f.draws.is_empty());
             if self.view_reuse.reused_now && any {
                 // On a frame shown again they'd pile on the last frame's:
                 // the next frame is drawn afresh, with them.

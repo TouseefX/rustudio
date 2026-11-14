@@ -785,6 +785,120 @@ struct Target {
     display_view: wgpu::TextureView,
 }
 
+/// GPU time of a drawn frame's sections, by timestamp queries (when the
+/// device has them — lib.rs `wgpu_options` asks while the perf log is on;
+/// src/perf_log.rs reads the totals): the sun's and the lights' shadow
+/// maps, the scene passes, SSAO + bloom + DoF, post. The readings come
+/// back a frame or two later.
+pub struct GpuTimer {
+    set: wgpu::QuerySet,
+    resolve: wgpu::Buffer,
+    /// Read-back buffers and their state: 0 free, 1 map asked, 2 mapped,
+    /// 3 the map failed.
+    ring: Vec<(wgpu::Buffer, std::sync::Arc<std::sync::atomic::AtomicU8>)>,
+    slot: Option<usize>,
+    period_ns: f32,
+    /// Milliseconds summed over the frames read so far: shadows, scene,
+    /// SSAO + bloom + DoF, post, whole; and how many frames.
+    sum: [f64; 5],
+    frames: u32,
+}
+
+impl GpuTimer {
+    const MARKS: u32 = 5;
+
+    pub fn new(device: &wgpu::Device, queue: &wgpu::Queue) -> Option<Self> {
+        let want = wgpu::Features::TIMESTAMP_QUERY | wgpu::Features::TIMESTAMP_QUERY_INSIDE_ENCODERS;
+        if !device.features().contains(want) {
+            return None;
+        }
+        let bytes = Self::MARKS as u64 * 8;
+        let set = device.create_query_set(&wgpu::QuerySetDescriptor {
+            label: Some("frame timestamps"),
+            ty: wgpu::QueryType::Timestamp,
+            count: Self::MARKS,
+        });
+        let resolve = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("frame timestamps"),
+            size: bytes.max(wgpu::QUERY_RESOLVE_BUFFER_ALIGNMENT),
+            usage: wgpu::BufferUsages::QUERY_RESOLVE | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+        let ring = (0..3)
+            .map(|_| {
+                let buf = device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some("frame timestamps read"),
+                    size: bytes,
+                    usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+                    mapped_at_creation: false,
+                });
+                (buf, std::sync::Arc::new(std::sync::atomic::AtomicU8::new(0)))
+            })
+            .collect();
+        Some(GpuTimer { set, resolve, ring, slot: None, period_ns: queue.get_timestamp_period(), sum: [0.0; 5], frames: 0 })
+    }
+
+    /// Timestamp `i` at this point of the encoder's work.
+    pub fn mark(&self, encoder: &mut wgpu::CommandEncoder, i: u32) {
+        if i < Self::MARKS {
+            encoder.write_timestamp(&self.set, i);
+        }
+    }
+
+    /// Before the submit: the marks copied to a free read buffer (none
+    /// free: this frame goes unmeasured).
+    pub fn resolve(&mut self, encoder: &mut wgpu::CommandEncoder) {
+        use std::sync::atomic::Ordering;
+        self.slot = self.ring.iter().position(|(_, s)| s.load(Ordering::Acquire) == 0);
+        if let Some(i) = self.slot {
+            encoder.resolve_query_set(&self.set, 0..Self::MARKS, &self.resolve, 0);
+            encoder.copy_buffer_to_buffer(&self.resolve, 0, &self.ring[i].0, 0, Self::MARKS as u64 * 8);
+        }
+    }
+
+    /// After the submit: asks for this frame's read and takes in the
+    /// readings that have arrived (their callbacks run from the queue's
+    /// submits and `device.poll`).
+    pub fn after_submit(&mut self, device: &wgpu::Device) {
+        use std::sync::atomic::Ordering;
+        if let Some(i) = self.slot.take() {
+            let (buf, state) = &self.ring[i];
+            state.store(1, Ordering::Release);
+            let s = state.clone();
+            buf.slice(..).map_async(wgpu::MapMode::Read, move |r| s.store(if r.is_ok() { 2 } else { 3 }, Ordering::Release));
+        }
+        let _ = device.poll(wgpu::PollType::Poll);
+        let period = self.period_ns as f64;
+        for (buf, state) in &self.ring {
+            match state.load(Ordering::Acquire) {
+                2 => {
+                    if let Ok(data) = buf.slice(..).get_mapped_range() {
+                        let t: Vec<u64> = data.chunks_exact(8).map(|c| u64::from_le_bytes(c.try_into().unwrap())).collect();
+                        if t.len() >= Self::MARKS as usize {
+                            let ms = |a: u64, b: u64| b.saturating_sub(a) as f64 * period / 1e6;
+                            self.sum[0] += ms(t[0], t[1]);
+                            self.sum[1] += ms(t[1], t[2]);
+                            self.sum[2] += ms(t[2], t[3]);
+                            self.sum[3] += ms(t[3], t[4]);
+                            self.sum[4] += ms(t[0], t[4]);
+                            self.frames += 1;
+                        }
+                    }
+                    buf.unmap();
+                    state.store(0, Ordering::Release);
+                }
+                3 => state.store(0, Ordering::Release),
+                _ => {}
+            }
+        }
+    }
+
+    /// The sums so far (ms per section) and the frames in them.
+    pub fn totals(&self) -> ([f64; 5], u32) {
+        (self.sum, self.frames)
+    }
+}
+
 pub struct Renderer {
     /// SurfaceGuis / BillboardGuis tested against the scene's depth (round 23).
     world_gui: Option<crate::world_gui::WorldGuiPass>,
@@ -906,6 +1020,8 @@ pub struct Renderer {
     generation: u64,
     /// The last frame drew terrain water (its waves move with time).
     water_drawn: bool,
+    /// GPU time per section, when the device can tell (the perf log).
+    gpu_timer: Option<GpuTimer>,
 }
 
 impl Renderer {
@@ -1929,6 +2045,7 @@ impl Renderer {
             texture_id: None,
             generation: 0,
             water_drawn: false,
+            gpu_timer: GpuTimer::new(device, queue),
         };
         r.add_texture(device, queue, 1, 1, &[255, 255, 255, 255]);
         r
@@ -2935,6 +3052,13 @@ impl Renderer {
         self.target.as_ref().map(|t| t.size)
     }
 
+    /// GPU milliseconds summed over the frames measured so far (shadows,
+    /// scene, SSAO + bloom + DoF, post, whole) and their count; None when
+    /// the device has no timestamp queries (see [`GpuTimer`]).
+    pub fn gpu_totals(&self) -> Option<([f64; 5], u32)> {
+        self.gpu_timer.as_ref().map(|t| t.totals())
+    }
+
     /// The bloom and the final image again, from the HDR image as it is now
     /// (effects drawn into it after `render`; the frame's globals still
     /// bound).
@@ -3231,6 +3355,9 @@ impl Renderer {
         let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
             label: Some("viewport"),
         });
+        if let Some(t) = &self.gpu_timer {
+            t.mark(&mut encoder, 0);
+        }
         for (ci, cascade) in frame.sun_cascades.iter().enumerate() {
             if !sun_due[ci] {
                 continue;
@@ -3401,6 +3528,9 @@ impl Renderer {
                     }
                 }
             }
+        }
+        if let Some(t) = &self.gpu_timer {
+            t.mark(&mut encoder, 1);
         }
         // With terrain water in view the scene is drawn in three passes:
         // the opaque scene; then (after copying its colour) the water,
@@ -3588,6 +3718,9 @@ impl Renderer {
             see_through(&mut pass, &mut calls);
         }
         stats.draw_calls = calls;
+        if let Some(t) = &self.gpu_timer {
+            t.mark(&mut encoder, 2);
+        }
         // Bloom: bright pass, blur across, blur down (half resolution).
         // SSAO (Studio's passes), then its multiply into the scene.
         // (Off: nothing reads its textures; the post passes take only the
@@ -3660,6 +3793,9 @@ impl Renderer {
             fullscreen("dof across", &self.dof_h, &target.dof_bgs[0], &[&target.dof_views[0]]);
             fullscreen("dof down", &self.dof_v, &target.dof_bgs[1], &[&target.dof_views[1]]);
         }
+        if let Some(t) = &self.gpu_timer {
+            t.mark(&mut encoder, 3);
+        }
         {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("post"),
@@ -3683,7 +3819,14 @@ impl Renderer {
             pass.set_bind_group(2, &target.ssao_bgs[0], &[]);
             pass.draw(0..3, 0..1);
         }
+        if let Some(t) = self.gpu_timer.as_mut() {
+            t.mark(&mut encoder, 4);
+            t.resolve(&mut encoder);
+        }
         queue.submit([encoder.finish()]);
+        if let Some(t) = self.gpu_timer.as_mut() {
+            t.after_submit(device);
+        }
         self.stats = stats;
         crate::runtime::domains::services::perf::end_frame(svc_t0.elapsed().as_secs_f64(), 0.0);
         self.texture_id

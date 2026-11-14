@@ -177,15 +177,35 @@ is left half delivered. Once a place opens, the layer is on.
 Every few seconds the editor logs a line like
 
 ```
-perf: 143 frames in 5.0 s: 34.9 ms apart (p95 51.2, worst 88); editor 9.4 ms + egui 6.1 ms on the CPU, 19.4 ms GPU/vsync wait; window 2400x1080 px at 2.20 px/pt, 3D view 1078x462 px (scale 0.70, AO off), 3D frames drawn 61 / shown again 82; sections (ms/frame): vp_render 4.1, dock_panels 2.8, lighting 0.9
+perf: 136 frames in 5.0 s: 36.9 ms apart (p95 72.3, worst 89); editor 5.2 ms + egui 1.2 ms on the CPU, 30.5 ms GPU/vsync wait; 3D GPU 9.8 ms per drawn frame = shadows 3.1 + scene 4.2 + ssao/bloom/dof 1.5 + post 1.0 (68 measured); window 1550x720 px at 1.40 px/pt, 3D view 816x310 px (scale 0.70, AO off), 3D frames drawn 68 / shown again 68; sections (ms/frame): dock_panels 4.3, viewport 3.4, vp_render 3.0
 ```
 
 (`src/perf_log.rs`; `adb logcat -s rustudio`, or `RUSTUDIO_PERF_LOG=1` on
 a desktop). "editor" is `App::ui`'s own time, "egui" the layout and
 painting eframe adds, the "wait" what is left of the interval (the GPU,
-vsync). The first line names the GPU and the wgpu backend (Vulkan is the
-one wanted; a GL fallback is slow). An idle editor logs nothing: no
+vsync, the loop). "3D GPU" is the renderer's own GPU time by timestamp
+queries (`render::GpuTimer`, where the device has them), per frame drawn
+afresh and by section; what the wait holds beyond it is egui's own GPU
+pass and vsync. The first line names the GPU and the wgpu backend (Vulkan
+is the one wanted; a GL fallback is slow). An idle editor logs nothing: no
 input, no frames.
+
+Switches for a device, which has no shell environment to launch from:
+
+```
+adb shell setprop debug.rustudio.env "RUSTUDIO_SUN_SHADOWS=0 RUSTUDIO_VIEW_REUSE=0"
+```
+
+then relaunch (`setprop debug.rustudio.env ""` clears). Space-separated
+`RUSTUDIO_*=value` pairs, 91 characters at most (`android::export_env`,
+`perf_log::env_switch`): `RUSTUDIO_SSAO`, `RUSTUDIO_VIEW_REUSE`,
+`RUSTUDIO_RENDER_SCALE`, `RUSTUDIO_SUN_SHADOWS` (the sun's shadow maps,
+as Lighting.GlobalShadows false).
+
+First measurements (S20 Ultra, Adreno 650 on Vulkan, release APK, the
+window 1550 × 720 px, the 3D view 816 × 310): ~6 ms of CPU a frame and
+~31 ms waited on the GPU whether the camera moved or not, 21–27 fps; the
+"3D GPU" figure above is what the next run has to show.
 
 What the port does about it:
 
@@ -201,9 +221,16 @@ What the port does about it:
   every mesh, texture, item, terrain, sky and grid upload), and a frame
   is drawn afresh when either moved, when time shows (a game running,
   terrain water, world GUIs and effects, the test harness) and at least
-  every 250 ms. With a still camera the chrome then redraws at egui's
+  every 500 ms. With a still camera the chrome then redraws at egui's
   own pace — taps and scrolls in the Explorer and Properties no longer
-  wait for a 3D frame each.
+  wait for a 3D frame each. (The first device run showed exactly every
+  other frame reused: the effects system hands over a frame of effects
+  whether or not it holds any, and an empty one counted as "effects on a
+  reused frame", which asks for a fresh one.)
+- **No cursor commands in Play.** `mouse_lock::note_window` took the
+  Android window for one that can't lock the cursor, so a game's
+  LockCenter grab fell back to Confined and sent a cursor position every
+  frame, which winit rejected with a warning logged each time.
 - The release APK is built with thin LTO (`CARGO_PROFILE_RELEASE_LTO` in
   android.yml; the workspace profile is unchanged for desktops).
 

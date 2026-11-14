@@ -145,6 +145,42 @@ fn export_env() {
     set("XDG_DATA_HOME", &data_dir());
     set("TMPDIR", &d.cache.join("tmp"));
     let _ = std::fs::create_dir_all(d.cache.join("tmp"));
+    // The editor's RUSTUDIO_* switches, for a device that has no shell
+    // environment to launch from:
+    //   adb shell setprop debug.rustudio.env "RUSTUDIO_SSAO=1 RUSTUDIO_VIEW_REUSE=0"
+    // (space-separated KEY=VALUE pairs, 91 characters at most; read at
+    // start, so relaunch after; `setprop debug.rustudio.env ""` clears).
+    for pair in system_property("debug.rustudio.env").split_whitespace() {
+        if let Some((k, v)) = pair.split_once('=') {
+            if k.starts_with("RUSTUDIO_") {
+                log::info!("env from debug.rustudio.env: {k}={v}");
+                // SAFETY: as above, before any other thread.
+                #[allow(unused_unsafe)]
+                unsafe {
+                    std::env::set_var(k, v)
+                };
+            }
+        }
+    }
+}
+
+/// An Android system property (`adb shell getprop`), or "".
+fn system_property(name: &str) -> String {
+    extern "C" {
+        fn __system_property_get(name: *const std::os::raw::c_char, value: *mut std::os::raw::c_char) -> std::os::raw::c_int;
+    }
+    let Ok(name) = std::ffi::CString::new(name) else {
+        return String::new();
+    };
+    // PROP_VALUE_MAX, the NUL included.
+    let mut buf = [0u8; 92];
+    // SAFETY: bionic's getter writes at most PROP_VALUE_MAX bytes into
+    // `buf` and returns the value's length.
+    let n = unsafe { __system_property_get(name.as_ptr(), buf.as_mut_ptr() as *mut std::os::raw::c_char) };
+    if n <= 0 {
+        return String::new();
+    }
+    String::from_utf8_lossy(&buf[..(n as usize).min(buf.len())]).into_owned()
 }
 
 /// `android_main`: the editor in this activity, until it is destroyed.

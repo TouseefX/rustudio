@@ -32,6 +32,8 @@ pub struct PerfLog {
     cpu: Vec<f32>,
     /// (ms, calls) per section over the period.
     sections: Vec<(&'static str, f64, u64)>,
+    /// The renderer's GPU totals at the last line (render::GpuTimer).
+    gpu_last: ([f64; 5], u32),
     said_device: bool,
 }
 
@@ -41,12 +43,33 @@ pub fn on() -> bool {
     *ON.get_or_init(|| cfg!(target_os = "android") || std::env::var_os("RUSTUDIO_PERF_LOG").is_some())
 }
 
+/// An on/off switch from the environment, read once: `RUSTUDIO_<X>=0`
+/// (or false/off/no) is off, anything else on, unset is `default`. The
+/// caller keeps the cell:
+/// `static S: OnceLock<bool> = OnceLock::new(); env_switch(&S, "RUSTUDIO_X", true)`.
+/// (On a device: `adb shell setprop debug.rustudio.env "RUSTUDIO_X=0"`,
+/// src/android/mod.rs `export_env`.)
+pub fn env_switch(cell: &'static std::sync::OnceLock<bool>, name: &str, default: bool) -> bool {
+    *cell.get_or_init(|| match std::env::var(name) {
+        Ok(v) => !matches!(v.trim().to_ascii_lowercase().as_str(), "0" | "false" | "off" | "no"),
+        Err(_) => default,
+    })
+}
+
 impl PerfLog {
     /// Once per frame, at its end: `work_ms` the editor's own time this
     /// frame, `cpu_ms` eframe's for the previous one (`Frame::info().cpu_usage`),
+    /// `gpu` the renderer's GPU totals so far (`Renderer::gpu_totals`),
     /// `extra` the line's tail (view sizes, counters), `device` the GPU
     /// (said once).
-    pub fn frame(&mut self, work_ms: f32, cpu_ms: Option<f32>, extra: impl FnOnce() -> String, device: impl FnOnce() -> Option<String>) {
+    pub fn frame(
+        &mut self,
+        work_ms: f32,
+        cpu_ms: Option<f32>,
+        gpu: Option<([f64; 5], u32)>,
+        extra: impl FnOnce() -> String,
+        device: impl FnOnce() -> Option<String>,
+    ) {
         let now = Instant::now();
         let since = *self.since.get_or_insert(now);
         if let Some(last) = self.last_frame {
@@ -95,8 +118,26 @@ impl PerfLog {
         let mut top: Vec<(&'static str, f64)> = self.sections.iter().map(|(name, ms, _)| (*name, *ms / n as f64)).collect();
         top.sort_by(|a, b| b.1.total_cmp(&a.1));
         let top: Vec<String> = top.iter().take(8).filter(|(_, ms)| *ms >= 0.05).map(|(name, ms)| format!("{name} {ms:.1}")).collect();
+        // The 3D frames' GPU time since the last line, per measured frame.
+        let gpu_line = match gpu {
+            None => "no GPU timestamps".to_string(),
+            Some((sum, frames)) => {
+                let (last_sum, last_n) = self.gpu_last;
+                self.gpu_last = (sum, frames);
+                let k = frames.saturating_sub(last_n);
+                if k == 0 {
+                    "3D GPU: no frame measured".to_string()
+                } else {
+                    let per: Vec<f64> = (0..5).map(|i| (sum[i] - last_sum[i]) / k as f64).collect();
+                    format!(
+                        "3D GPU {:.1} ms per drawn frame = shadows {:.1} + scene {:.1} + ssao/bloom/dof {:.1} + post {:.1} ({k} measured)",
+                        per[4], per[0], per[1], per[2], per[3]
+                    )
+                }
+            }
+        };
         say(format!(
-            "perf: {n} frames in {:.1} s: {interval:.1} ms apart (p95 {p95:.1}, worst {worst:.0}); editor {work:.1} ms + egui {:.1} ms on the CPU, {wait:.1} ms GPU/vsync wait; {}; sections (ms/frame): {}",
+            "perf: {n} frames in {:.1} s: {interval:.1} ms apart (p95 {p95:.1}, worst {worst:.0}); editor {work:.1} ms + egui {:.1} ms on the CPU, {wait:.1} ms GPU/vsync wait; {gpu_line}; {}; sections (ms/frame): {}",
             elapsed.as_secs_f32(),
             (cpu - work).max(0.0),
             extra(),

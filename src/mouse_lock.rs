@@ -30,7 +30,10 @@ static LOCKS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
 /// failed Wayland connection falls back to X11).
 pub fn note_window(wayland: Option<bool>) {
     if let Some(w) = wayland {
-        let _ = LOCKS.set(w || cfg!(target_os = "macos"));
+        // (Android: no cursor at all; detect_locks' answer stands, else a
+        // game grab would fall back to Confined and send a cursor position
+        // every frame, which winit rejects with a logged warning each)
+        let _ = LOCKS.set(w || cfg!(target_os = "macos") || cfg!(target_os = "android"));
     }
 }
 

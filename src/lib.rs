@@ -339,6 +339,12 @@ pub(crate) fn wgpu_options(bench_mode: bool) -> egui_wgpu::WgpuConfiguration {
             setup.device_descriptor = std::sync::Arc::new(move |adapter| {
                 let mut d = descriptor(adapter);
                 d.required_limits.max_sampled_textures_per_shader_stage = 24;
+                // GPU timestamps for the perf log's line (render::GpuTimer),
+                // where the device has them.
+                if crate::perf_log::on() {
+                    let want = egui_wgpu::wgpu::Features::TIMESTAMP_QUERY | egui_wgpu::wgpu::Features::TIMESTAMP_QUERY_INSIDE_ENCODERS;
+                    d.required_features |= adapter.features() & want;
+                }
                 d
             });
             egui_wgpu::WgpuSetup::CreateNew(setup)
