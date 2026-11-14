@@ -4,20 +4,25 @@
 //! Windows `%LOCALAPPDATA%` for data, state and cache, `%APPDATA%` for
 //! config; on macOS `~/Library/Application Support` for data, config and
 //! state, `~/Library/Caches` for caches), the same config folder
-//! rustudio-account uses.
+//! rustudio-account uses. Android has no home folder: the app's own
+//! folders stand in (`Context.getFilesDir()` for config and state,
+//! `getExternalFilesDir()` for data, `getCacheDir()` for caches;
+//! src/android/mod.rs).
 
 use std::path::PathBuf;
 
 /// The user's home folder ("." when it can't be found).
 pub fn home() -> PathBuf {
-    #[cfg(unix)]
-    let home = std::env::var_os("HOME").map(PathBuf::from);
+    #[cfg(target_os = "android")]
+    return crate::android::files_dir();
+    #[cfg(all(unix, not(target_os = "android")))]
+    return std::env::var_os("HOME").map(PathBuf::from).unwrap_or_else(|| PathBuf::from("."));
     #[cfg(not(unix))]
-    let home = dirs::home_dir();
-    home.unwrap_or_else(|| PathBuf::from("."))
+    return dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
 }
 
-#[cfg(all(unix, not(target_os = "macos")))]
+/// Linux and the other XDG Unixes (not macOS, not Android).
+#[cfg(all(unix, not(any(target_os = "macos", target_os = "android"))))]
 fn xdg(var: &str, fallback: &str) -> PathBuf {
     std::env::var_os(var)
         .filter(|v| !v.is_empty())
@@ -29,7 +34,9 @@ fn xdg(var: &str, fallback: &str) -> PathBuf {
 /// rustudio already put there (the content link, the Studio download) keep
 /// being found.
 pub fn data() -> PathBuf {
-    #[cfg(all(unix, not(target_os = "macos")))]
+    #[cfg(target_os = "android")]
+    return crate::android::data_dir();
+    #[cfg(all(unix, not(any(target_os = "macos", target_os = "android"))))]
     return home().join(".local/share");
     #[cfg(not(all(unix, not(target_os = "macos"))))]
     return dirs::data_local_dir().unwrap_or_else(home);
@@ -37,7 +44,9 @@ pub fn data() -> PathBuf {
 
 /// Settings: `$XDG_CONFIG_HOME` or `~/.config` on Linux.
 pub fn config() -> PathBuf {
-    #[cfg(all(unix, not(target_os = "macos")))]
+    #[cfg(target_os = "android")]
+    return crate::android::config_dir();
+    #[cfg(all(unix, not(any(target_os = "macos", target_os = "android"))))]
     return xdg("XDG_CONFIG_HOME", ".config");
     #[cfg(not(all(unix, not(target_os = "macos"))))]
     return dirs::config_dir().unwrap_or_else(home);
@@ -45,7 +54,9 @@ pub fn config() -> PathBuf {
 
 /// State that outlives a run: `$XDG_STATE_HOME` or `~/.local/state` on Linux.
 pub fn state() -> PathBuf {
-    #[cfg(all(unix, not(target_os = "macos")))]
+    #[cfg(target_os = "android")]
+    return crate::android::state_dir();
+    #[cfg(all(unix, not(any(target_os = "macos", target_os = "android"))))]
     return xdg("XDG_STATE_HOME", ".local/state");
     #[cfg(not(all(unix, not(target_os = "macos"))))]
     return dirs::data_local_dir().unwrap_or_else(home);
@@ -53,7 +64,9 @@ pub fn state() -> PathBuf {
 
 /// Caches: `$XDG_CACHE_HOME` or `~/.cache` on Linux.
 pub fn cache() -> PathBuf {
-    #[cfg(all(unix, not(target_os = "macos")))]
+    #[cfg(target_os = "android")]
+    return crate::android::cache_dir();
+    #[cfg(all(unix, not(any(target_os = "macos", target_os = "android"))))]
     return xdg("XDG_CACHE_HOME", ".cache");
     #[cfg(not(all(unix, not(target_os = "macos"))))]
     return dirs::cache_dir().unwrap_or_else(std::env::temp_dir);
@@ -61,7 +74,9 @@ pub fn cache() -> PathBuf {
 
 /// Where screenshots go: `~/Pictures` on Linux, the Pictures folder elsewhere.
 pub fn pictures() -> PathBuf {
-    #[cfg(all(unix, not(target_os = "macos")))]
+    #[cfg(target_os = "android")]
+    return crate::android::pictures_dir();
+    #[cfg(all(unix, not(any(target_os = "macos", target_os = "android"))))]
     return home().join("Pictures");
     #[cfg(not(all(unix, not(target_os = "macos"))))]
     return dirs::picture_dir().unwrap_or_else(|| home().join("Pictures"));
@@ -83,9 +98,17 @@ pub fn installed_studio() -> Option<PathBuf> {
 
 /// A data file that ships with rustudio (`api-dump.json`), wherever this
 /// build keeps it: next to the executable, in a macOS app bundle's
-/// `Contents/Resources`, in `../share/rustudio` (an install prefix), else the
-/// source tree it was built from (`cargo run`).
+/// `Contents/Resources`, in `../share/rustudio` (an install prefix), the
+/// Android app's unpacked assets, else the source tree it was built from
+/// (`cargo run`).
 pub fn resource(name: &str) -> PathBuf {
+    #[cfg(target_os = "android")]
+    {
+        let p = crate::android::resource_dir().join(name);
+        if p.is_file() {
+            return p;
+        }
+    }
     let exe_dir = std::env::current_exe()
         .ok()
         .and_then(|e| e.canonicalize().ok())
@@ -112,7 +135,7 @@ mod tests {
             assert_eq!(config(), lib.join("Application Support"));
             assert_eq!(state(), lib.join("Application Support"));
             assert_eq!(cache(), lib.join("Caches"));
-        } else if cfg!(unix) {
+        } else if cfg!(all(unix, not(target_os = "android"))) {
             assert_eq!(data(), home().join(".local/share"));
         }
     }

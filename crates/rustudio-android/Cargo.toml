@@ -1,0 +1,20 @@
+[package]
+name = "rustudio-android"
+description = "The Android app: a cdylib NativeActivity loads, around the rustudio library"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+# xbuild (`x build -p rustudio-android --platform android --arch arm64`)
+# packages target/x/android/<arch>/cargo/<triple>/<profile>/librustudio_android.so
+# into the APK, with manifest.yaml next to this file as its AndroidManifest.
+# On other systems the crate is an empty library, so `cargo check
+# --workspace` keeps passing everywhere.
+[lib]
+name = "rustudio_android"
+crate-type = ["cdylib", "rlib"]
+doctest = false
+
+[target.'cfg(target_os = "android")'.dependencies]
+rustudio = { path = "../.." }

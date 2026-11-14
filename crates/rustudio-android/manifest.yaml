@@ -1,0 +1,85 @@
+# xbuild's manifest (https://github.com/rust-mobile/xbuild, xbuild/src/config.rs):
+# what becomes the APK's AndroidManifest.xml. xbuild fills in what isn't
+# here from Cargo.toml (versionName / versionCode from the package version,
+# the NativeActivity with android.app.lib_name = rustudio_android, the
+# config_changes list that keeps the activity alive across rotation, locale
+# and density changes, minSdkVersion 21 / targetSdkVersion 33).
+icon: ../../assets/icons/rustudio-512.png
+
+android:
+  manifest:
+    package: dev.rustudio.studio
+    sdk:
+      # API 26: VibrationEffect (HapticService); 28: DisplayCutout
+      # (ScreenGui.ScreenInsets); 30: WindowInsets.Type.ime (the keyboard's
+      # size). Older levels are told apart at run time (src/android/jni.rs).
+      min_sdk_version: 26
+      target_sdk_version: 33
+    uses_permission:
+      # HttpService, the Roblox CDN content download, asset fetches, Team Create.
+      - name: android.permission.INTERNET
+      # ConnectivityManager for "is the network up" before a 60 MB download.
+      - name: android.permission.ACCESS_NETWORK_STATE
+      # HapticService:SetMotor / HapticEffect:Play through Vibrator.
+      - name: android.permission.VIBRATE
+    uses_feature:
+      # wgpu: Vulkan first, OpenGL ES 3.0 as the fallback (src/lib.rs
+      # wgpu_options), so neither is required on its own.
+      - name: android.hardware.vulkan.level
+        version: 0
+        required: false
+      - name: android.hardware.vulkan.version
+        # 0x400003 = Vulkan 1.0.3, the lowest wgpu drives.
+        version: 4194307
+        required: false
+      - opengles_version: [3, 0]
+      - name: android.hardware.touchscreen.multitouch
+        required: false
+      # UserInputService.AccelerometerEnabled / GyroscopeEnabled: optional.
+      - name: android.hardware.sensor.accelerometer
+        required: false
+      - name: android.hardware.sensor.gyroscope
+        required: false
+    application:
+      label: rustudio
+      theme: "@android:style/Theme.DeviceDefault.NoActionBar.Fullscreen"
+      activities:
+        - # The editor is a landscape tool; a place's
+          # StarterGui.ScreenOrientation re-requests the orientation while
+          # it plays (Activity.setRequestedOrientation, src/android/jni.rs).
+          orientation: sensorLandscape
+          # The soft keyboard shrinks the window (UserInputService
+          # .OnScreenKeyboardSize) instead of covering it.
+          window_soft_input_mode: adjustResize
+          intent_filters:
+            # Open a place or model from a file manager / share sheet: the
+            # Intent's content: URI is read through ContentResolver at
+            # start (src/android/storage.rs).
+            - actions: [android.intent.action.VIEW]
+              categories: [android.intent.category.DEFAULT, android.intent.category.BROWSABLE]
+              data:
+                - scheme: content
+                  mime_type: "*/*"
+                  path_pattern: ".*\\.rbxl"
+                - scheme: content
+                  mime_type: "*/*"
+                  path_pattern: ".*\\.rbxlx"
+                - scheme: content
+                  mime_type: "*/*"
+                  path_pattern: ".*\\.rbxm"
+                - scheme: content
+                  mime_type: "*/*"
+                  path_pattern: ".*\\.rbxmx"
+                - scheme: file
+                  path_pattern: ".*\\.rbxl"
+                - scheme: file
+                  path_pattern: ".*\\.rbxlx"
+                - scheme: file
+                  path_pattern: ".*\\.rbxm"
+                - scheme: file
+                  path_pattern: ".*\\.rbxmx"
+  # api-dump.json ships in the APK's assets/ and is copied to the app's
+  # files dir at first start (src/android/assets.rs), where
+  # paths::resource finds it.
+  assets:
+    - ../../api-dump.json

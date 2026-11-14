@@ -78,4 +78,6 @@ plays it for 5 s and records the average and 1%-low frame times.
 | `src/gui.rs`, `src/gui_walk.rs`, `src/gui_input.rs` | GUIs: fonts, images, rich text; layout and drawing of one GUI; placing GUIs on screen / surfaces / billboards and the mouse and keyboard |
 | `src/fbx.rs` | binary FBX reader and the Roblox-style import for `LoadAsset` |
 | `crates/rustudio-account` | the Roblox session (cookie, keyring, CSRF), profile and avatar, experiences, downloads, publishing |
+| `src/lib.rs`, `src/main.rs` | the crate is a library with two front ends: the desktop binary (`desktop_main`) and the Android activity |
+| `src/android/`, `crates/rustudio-android` | the Android app: folders, logcat, APK assets, JNI (Vibrator, orientation, insets, connectivity, content URIs), sensors, the file picker; the cdylib `NativeActivity` loads and its `manifest.yaml` — see docs/ANDROID.md |
 

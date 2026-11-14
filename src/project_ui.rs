@@ -135,7 +135,7 @@ impl Editor {
             });
         if let Some(start) = browse {
             use crate::file_dialog::{Kind, Purpose};
-            let fd = rfd::AsyncFileDialog::new().set_directory(&start);
+            let fd = crate::file_dialog::Request::new().set_directory(&start);
             self.dialogs.start(Purpose::ProjectParent, fd, Kind::PickFolder);
         }
         if go {

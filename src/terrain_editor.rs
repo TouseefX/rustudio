@@ -612,7 +612,7 @@ impl Editor {
             return;
         }
         use crate::file_dialog::{Kind, Purpose};
-        let d = rfd::AsyncFileDialog::new().add_filter("Image", &["png", "jpg", "jpeg"]);
+        let d = crate::file_dialog::Request::new().add_filter("Image", &["png", "jpg", "jpeg"]);
         self.dialogs.start(Purpose::TerrainImage { height }, d, Kind::PickFile);
     }
 

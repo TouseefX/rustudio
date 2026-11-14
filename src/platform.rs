@@ -33,7 +33,8 @@ pub fn resident_bytes() -> Option<u64> {
 
 /// The 1-minute load average as text, "?" where unknown.
 pub fn load_average() -> String {
-    #[cfg(unix)]
+    // (Bionic only has getloadavg from API 29, so Android reads nothing.)
+    #[cfg(all(unix, not(target_os = "android")))]
     {
         let mut l = [0f64; 1];
         // SAFETY: getloadavg writes at most the one entry asked for.
@@ -158,7 +159,7 @@ mod tests {
             let rss = resident_bytes().expect("resident memory");
             assert!(rss > 1 << 20, "{rss}");
         }
-        if cfg!(unix) {
+        if cfg!(all(unix, not(target_os = "android"))) {
             assert_ne!(load_average(), "?");
         }
     }

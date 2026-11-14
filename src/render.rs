@@ -375,7 +375,7 @@ mod gpu_tests {
     use super::*;
 
     /// Every pipeline of the 3D view, built on this machine's GPU with the
-    /// limits the app asks for (main.rs): the WGSL through the platform's
+    /// limits the app asks for (lib.rs `wgpu_options`): the WGSL through the platform's
     /// shader compiler (Metal on macOS, Vulkan/SPIR-V on Linux), with wgpu's
     /// validation errors caught. Skipped with a note where there is no GPU.
     #[test]

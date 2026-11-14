@@ -1,5 +1,7 @@
 [workspace]
-members = [".", "crates/rustudio-account", "crates/rustudio-net"]
+# The root package is a member by itself (Cargo adds it); listing it as "."
+# as well makes xbuild refuse the workspace ("Did not expect a [workspace]").
+members = ["crates/rustudio-account", "crates/rustudio-net", "crates/rustudio-android"]
 resolver = "2"
 
 [workspace.package]
@@ -9,11 +11,24 @@ version = "0.1.0"
 
 [package]
 name = "rustudio"
-description = "A native Linux/Windows game editor for Roblox place and model files"
+description = "A native Linux/Windows/macOS/Android game editor for Roblox place and model files"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 default-run = "rustudio"
+
+# The app is a library (src/lib.rs) with two front ends: the desktop binary
+# (src/main.rs) and the Android cdylib (crates/rustudio-android), which is
+# what xbuild packages into the APK. No doctests: the `///` comments quote
+# Luau and shell, not Rust.
+[lib]
+name = "rustudio"
+path = "src/lib.rs"
+doctest = false
+
+[[bin]]
+name = "rustudio"
+path = "src/main.rs"
 
 [dependencies]
 rustudio-account = { path = "crates/rustudio-account" }
@@ -33,7 +48,6 @@ glam = { version = "0.30", features = ["bytemuck"] }
 bytemuck = { version = "1", features = ["derive"] }
 image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
 flate2 = "1"
-rfd = "0.15"
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }
 pollster = "0.4"
@@ -66,6 +80,30 @@ opt-level = 2
 [profile.profiling]
 inherits = "release"
 debug = "line-tables-only"
+
+# Desktop only: rfd 0.15 has no Android backend (its FileDialog traits
+# aren't implemented there). Android's picker is src/android/storage.rs.
+[target.'cfg(not(target_os = "android"))'.dependencies]
+rfd = "0.15"
+
+[target.'cfg(target_os = "android")'.dependencies]
+# NativeActivity glue (android_main, the lifecycle, the soft keyboard) comes
+# through eframe's own winit; the feature must be on for eframe to build at
+# all on Android (NativeOptions::android_app).
+eframe = { version = "0.36", default-features = false, features = ["wgpu", "default_fonts", "android-native-activity"] }
+winit = { version = "0.30", default-features = false, features = ["android-native-activity"] }
+# JNI bridges (src/android/): Vibrator, setRequestedOrientation, WindowInsets,
+# the launch Intent; ndk-context hands over the JavaVM and the Activity.
+jni = "0.22"
+ndk-context = "0.1"
+# AAssetManager (api-dump.json out of the APK), ASensorManager (accelerometer
+# / gyroscope / rotation for UserInputService), ALooper.
+ndk = "0.9"
+ndk-sys = "0.6"
+# log → logcat (eframe, wgpu and rustudio's own lines; stdout / stderr are
+# piped there too, see src/android/logcat.rs).
+log = "0.4"
+android_logger = "0.15"
 
 [target.'cfg(windows)'.dependencies]
 # The Recycle Bin (platform.rs).

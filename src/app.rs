@@ -150,6 +150,38 @@ pub struct Harness {
 }
 
 impl Harness {
+    /// A plain interactive run: no screenshots, tests or timed actions (the
+    /// Android app, which has no command line; `desktop_main` fills the
+    /// fields from its options).
+    pub fn interactive() -> Self {
+        Harness {
+            shot_after: None,
+            log_out: None,
+            actions: Vec::new(),
+            started: Instant::now(),
+            screenshot: None,
+            selftest: None,
+            ui_shots: None,
+            screenshot_requested: false,
+            start_play: false,
+            bench: None,
+            camera: None,
+            shift: false,
+            shots: Vec::new(),
+            shot_next: 0,
+            shot_lines: Vec::new(),
+            from_play: false,
+            play_started: None,
+            frame_ms: Vec::new(),
+            last_frame: None,
+            open_roblox: None,
+            team_create: None,
+            roblox_picker: None,
+            roblox_settings: false,
+            ui_due: Vec::new(),
+        }
+    }
+
     /// Seconds on the harness clock (None before Play when --from-play).
     pub fn now(&self) -> Option<f32> {
         if self.from_play {
@@ -792,7 +824,7 @@ impl Editor {
 
     pub fn open_folder_dialog(&mut self) {
         use crate::file_dialog::{Kind, Purpose};
-        self.dialogs.start(Purpose::OpenFolder, rfd::AsyncFileDialog::new(), Kind::PickFolder);
+        self.dialogs.start(Purpose::OpenFolder, crate::file_dialog::Request::new(), Kind::PickFolder);
     }
 
     /// A file dialog closed: act on its answer.
@@ -832,7 +864,7 @@ impl Editor {
 
     pub fn open_dialog(&mut self) {
         use crate::file_dialog::{Kind, Purpose};
-        let d = rfd::AsyncFileDialog::new().add_filter("Roblox place or model", &["rbxl", "rbxlx", "rbxm", "rbxmx"]);
+        let d = crate::file_dialog::Request::new().add_filter("Roblox place or model", &["rbxl", "rbxlx", "rbxm", "rbxmx"]);
         self.dialogs.start(Purpose::OpenPlace, d, Kind::PickFile);
     }
 
@@ -867,7 +899,7 @@ impl Editor {
             DocKind::Model => "model.rbxm",
         };
         use crate::file_dialog::{Kind, Purpose};
-        let d = rfd::AsyncFileDialog::new().add_filter(name, exts).set_file_name(default);
+        let d = crate::file_dialog::Request::new().add_filter(name, exts).set_file_name(default);
         self.dialogs.start(Purpose::SaveAs, d, Kind::SaveFile);
     }
 
@@ -880,7 +912,7 @@ impl Editor {
 
     pub fn insert_from_file(&mut self) {
         use crate::file_dialog::{Kind, Purpose};
-        let d = rfd::AsyncFileDialog::new().add_filter("Roblox model", &["rbxm", "rbxmx"]);
+        let d = crate::file_dialog::Request::new().add_filter("Roblox model", &["rbxm", "rbxmx"]);
         self.dialogs.start(Purpose::InsertModel, d, Kind::PickFile);
     }
 
@@ -906,7 +938,7 @@ impl Editor {
             return;
         }
         use crate::file_dialog::{Kind, Purpose};
-        let d = rfd::AsyncFileDialog::new().add_filter("Roblox model", &["rbxm", "rbxmx"]).set_file_name("model.rbxm");
+        let d = crate::file_dialog::Request::new().add_filter("Roblox model", &["rbxm", "rbxmx"]).set_file_name("model.rbxm");
         self.dialogs.start(Purpose::SaveSelection(self.doc.selection.clone()), d, Kind::SaveFile);
     }
 
