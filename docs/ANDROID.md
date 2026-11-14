@@ -57,7 +57,7 @@ xbuild quirks worth knowing (commit e67b501):
 
 | Concern | Desktop | Android |
 |---|---|---|
-| Entry point | `src/main.rs` → `rustudio::desktop_main()` | `crates/rustudio-android/src/lib.rs` `android_main` → `rustudio::android::run()` |
+| Entry point | `src/main.rs` → `rustudio::desktop_main()` | `crates/rustudio-android/src/lib.rs`: `rustudio_on_create` (the manifest's `android.app.func_name`) → android-activity's `ANativeActivity_onCreate` + the destroy hook; `android_main` → `rustudio::android::run()` |
 | Window / GPU | eframe + winit (Wayland, X11, Windows, macOS) | eframe + winit on `NativeActivity` (`android-native-activity`); wgpu Vulkan, GLES 3 fallback (`wgpu_options` in src/lib.rs) |
 | Lifecycle | — | eframe's wgpu backend drops the window + surface in `suspended()` and recreates them in `resumed()`; a rotation is a resize and reconfigures the swapchain |
 | Folders (`src/paths.rs`) | `~/.local/share`, `~/.config`, `~/.local/state`, `~/.cache`, `~/Pictures` | `getExternalFilesDir()` for data (Studio content, places), `getFilesDir()/config`, `/state`, `getCacheDir()`, `<external>/Pictures` (`src/android/mod.rs`); `HOME` and the `XDG_*` variables are set to the same so `dirs` (rustudio-account) agrees |
@@ -180,6 +180,12 @@ and here:
   the API 33 android.jar knows; the first three seconds request repaints
   so an early lost redraw can't leave the splash up; `App::save` keeps the
   layout at eframe's save moments (the surface going away).
+  The hook gets the `ANativeActivity` from the library's own entry point
+  (`rustudio_on_create`, named by `android.app.func_name` in
+  manifest.yaml), not from `AndroidApp::activity_as_ptr()`, which is the
+  Java `Activity`'s JNI reference: the first phase-2 APK read that as the
+  struct and crashed at start (`SIGSEGV` at a small address in
+  `lifecycle::hook`).
 - **Heavy lag.** The 3D view rendered at the panel's full pixel size — a
   phone's 2–3× density screen is more pixels than a laptop's — plus debug
   builds. First run now renders the view at 0.7 scale (View > Render

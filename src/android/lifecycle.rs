@@ -13,6 +13,14 @@
 //! leaves the process otherwise. [`run`](super::run) leaves the process
 //! after the loop too, so `android_main` never runs twice in one process
 //! (the statics here and in [`super`] are per activity).
+//!
+//! The hook needs the `ANativeActivity` itself, which android-activity's
+//! `AndroidApp` doesn't give out (`activity_as_ptr` is the Java `Activity`
+//! reference, a JNI handle: reading it as the struct was the first APK's
+//! crash at start). The library's entry point has it: manifest.yaml names
+//! `rustudio_on_create` (crates/rustudio-android) as the activity's
+//! `android.app.func_name`, and that calls the glue's
+//! `ANativeActivity_onCreate` and then [`hook`].
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
@@ -32,26 +40,37 @@ pub fn note_context(ctx: &egui::Context) {
     *CTX.lock().unwrap() = Some(ctx.clone());
 }
 
-/// Puts [`on_destroy`] in front of the glue's `onDestroy` callback.
+/// Puts [`on_destroy`] in front of the glue's `onDestroy` callback. Called
+/// on the Java main thread by the library's entry point, right after the
+/// glue's `ANativeActivity_onCreate` returned.
 ///
 /// # Safety
-/// `app` must be the live activity's handle (its `ANativeActivity` stays
-/// valid until `onDestroy` returns, and the hook is the one that returns).
-pub unsafe fn hook(app: &super::AndroidApp) {
-    let activity = app.activity_as_ptr().cast::<ndk_sys::ANativeActivity>();
+/// `activity` must be the `ANativeActivity` the framework passed to the
+/// entry point (it stays valid until `onDestroy` returns, and the hook is
+/// the one that returns from it), with the glue's callbacks installed.
+pub unsafe fn hook(activity: *mut std::ffi::c_void) {
+    let activity = activity.cast::<ndk_sys::ANativeActivity>();
     if activity.is_null() {
+        log::error!("destroy hook: no ANativeActivity");
         return;
     }
-    // SAFETY: a live ANativeActivity; `callbacks` is set by the system
-    // before any callback runs and the glue has already filled it.
+    // SAFETY: the live ANativeActivity; `callbacks` points at the
+    // framework's own struct (NativeCode::callbacks) for its lifetime, and
+    // nothing else writes it after onCreate.
     unsafe {
         let callbacks = (*activity).callbacks;
         if callbacks.is_null() {
+            log::error!("destroy hook: no callbacks");
             return;
         }
-        *ORIGINAL.lock().unwrap() = (*callbacks).onDestroy;
+        let original = (*callbacks).onDestroy;
+        if original.is_none() {
+            log::warn!("destroy hook: the glue installed no onDestroy");
+        }
+        *ORIGINAL.lock().unwrap() = original;
         (*callbacks).onDestroy = Some(on_destroy);
     }
+    log::info!("destroy hook installed");
 }
 
 unsafe extern "C" fn on_destroy(activity: *mut ndk_sys::ANativeActivity) {

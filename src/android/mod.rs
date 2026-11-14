@@ -152,8 +152,6 @@ pub fn run(app: AndroidApp) {
     logcat::install();
     log::info!("rustudio {} starting (Android API {})", env!("CARGO_PKG_VERSION"), AndroidApp::sdk_version());
     let _ = APP.set(app.clone());
-    // SAFETY: the live activity's handle, before its loop starts.
-    unsafe { lifecycle::hook(&app) };
     export_env();
     log::info!(
         "files {} / data {} / cache {}",

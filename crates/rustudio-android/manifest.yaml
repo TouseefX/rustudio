@@ -79,6 +79,14 @@ android:
           # The soft keyboard shrinks the window (UserInputService
           # .OnScreenKeyboardSize) instead of covering it.
           window_soft_input_mode: adjustResize
+          meta_data:
+            # NativeActivity calls this symbol of the library instead of
+            # ANativeActivity_onCreate: crates/rustudio-android/src/lib.rs,
+            # which runs android-activity's entry and then wraps the
+            # activity's onDestroy (src/android/lifecycle.rs). xbuild adds
+            # android.app.lib_name itself.
+            - name: android.app.func_name
+              value: rustudio_on_create
           intent_filters:
             # Open a place or model from a file manager / share sheet: the
             # Intent's content: URI is read through ContentResolver at
