@@ -79,5 +79,6 @@ plays it for 5 s and records the average and 1%-low frame times.
 | `src/fbx.rs` | binary FBX reader and the Roblox-style import for `LoadAsset` |
 | `crates/rustudio-account` | the Roblox session (cookie, keyring, CSRF), profile and avatar, experiences, downloads, publishing |
 | `src/lib.rs`, `src/main.rs` | the crate is a library with two front ends: the desktop binary (`desktop_main`) and the Android activity |
-| `src/android/`, `crates/rustudio-android` | the Android app: folders, logcat, APK assets, JNI (Vibrator, orientation, insets, connectivity, content URIs), sensors, the file picker; the cdylib `NativeActivity` loads and its `manifest.yaml` — see docs/ANDROID.md |
+| `src/android/`, `crates/rustudio-android` | the Android app: folders, logcat, APK assets, JNI (Vibrator, orientation, insets, connectivity, content URIs, clipboard, browser, storage permission), sensors, the file picker, the system clipboard, the activity's end and the Back button (`lifecycle.rs`); the cdylib `NativeActivity` loads and its `manifest.yaml` — see docs/ANDROID.md |
+| `src/touch_input.rs` | fingers → scroll / tap / hold-to-drag / camera look, the Play movement stick and jump button (platform-neutral; its tests run on the desktop) |
 

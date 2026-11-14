@@ -315,6 +315,16 @@ pub const CHARACTER_SHIRT: [u8; 3] = [13, 105, 172]; // torso (offline Studio: U
 pub const CHARACTER_PANTS: [u8; 3] = [164, 189, 71]; // legs (offline Studio: RightUpperLeg / LeftLowerLeg.Color)
 pub const WAIT_MIN_S: f64 = 0.0333; // legacy wait(): shortest wait (Roblox docs: about 1/30 s)
 pub const WHEEL_POINTS_PER_NOTCH: f32 = 40.0; // egui's line scroll size
+pub const PINCH_NOTCHES_PER_DOUBLING: f32 = 4.0; // touch screens: a pinch that doubles the distance between the fingers zooms like 4 wheel notches (estimated; Roblox's touch camera zooms about the same distance for that pinch)
+pub const TOUCH_HOLD_MS: u64 = 320; // touch screens: a finger still this long is a press, then a drag (estimated; Android's own long-press timeout is 400 ms)
+pub const TOUCH_SLOP_POINTS: f32 = 8.0; // touch screens: moved this far before the hold, the finger scrolls / turns the camera instead (estimated; Android's touch slop is 8 dp)
+pub const TOUCH_FLING_STOP_POINTS_PER_S: f32 = 40.0; // touch screens: a fling slower than this stops (estimated)
+pub const TOUCH_FLING_DECAY_PER_S: f32 = 2.8; // touch screens: fling speed decays by e^-2.8 per second, halving about every 0.25 s (estimated)
+pub const TOUCH_FLING_WINDOW_MS: u64 = 100; // touch screens: the lift's speed is averaged over the finger's last 100 ms (estimated)
+pub const TOUCH_STICK_RADIUS_POINTS: f32 = 56.0; // touch screens, Play: the movement stick's knob moves this far from where the finger landed (estimated; Roblox's dynamic thumbstick is about this size)
+pub const TOUCH_STICK_DEAD_POINTS: f32 = 10.0; // touch screens, Play: the stick does nothing inside this radius (estimated)
+pub const TOUCH_JUMP_SIZE_POINTS: f32 = 72.0; // touch screens, Play: the jump button's side (estimated; Roblox's is 70 × 70)
+pub const TOUCH_JUMP_MARGIN_POINTS: f32 = 28.0; // touch screens, Play: the jump button's distance from the view's bottom-right corner (estimated)
 pub const R15_HIP_HEIGHT: f32 = 2.0; // Humanoid.HipHeight of Studio's default R15 body (content/avatar/characterR15DynamicHeadV2.rbxm)
 #[cfg_attr(not(test), allow(dead_code))] // checked by rig::hip_tests
 pub const R15_PLAY_HIP_HEIGHT: f32 = 2.192423; // HipHeight of Studio's own Play character with default scales (tools/fidelity physics capture, control place); the body file's legs scaled to R15_DEFAULT_PART_SIZES give the same

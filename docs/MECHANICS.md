@@ -177,6 +177,16 @@ by id.
 | New / Open / Save / Save as | Ctrl+N / Ctrl+O / Ctrl+S / Ctrl+Shift+S | estimated |
 | Multi-select | Ctrl or Shift click (viewport), Ctrl toggle / Shift range (Explorer), drag box | request (multi-select) |
 
+## Touch screens (Android, src/touch_input.rs)
+
+| Rule | What the code does | Source |
+|---|---|---|
+| Hold before drag | a finger still for 320 ms becomes a press and drags from then on; one that moves more than 8 pt before that scrolls the panel under it (or turns the camera on the 3D view); lifted still, it is a tap | estimated (Android's own long-press timeout is 400 ms) |
+| Fling | a scroll keeps going after the lift at the finger's speed over its last 100 ms, halving about every 0.25 s, stopping under 40 pt/s | estimated |
+| Pinch zoom | a pinch that doubles the distance between two fingers zooms like 4 wheel notches (`PINCH_NOTCHES_PER_DOUBLING`), toward the point between the fingers; in Play it is the game's wheel input | estimated (Roblox's touch camera zooms about that far for that pinch) |
+| Movement stick | in Play a finger landing in the bottom-left 35% × 50% of the view is the stick; its knob moves up to 56 pt from where the finger landed, nothing within 10 pt, and a direction counts past ~22° off the other axis (eight directions, W/A/S/D held) | estimated (Roblox's dynamic thumbstick appears under the finger the same way) |
+| Jump button | a 72 pt square 28 pt from the bottom-right corner holds Space | estimated (Roblox's is 70 × 70) |
+
 ## New objects and the starter place
 
 | Value | Number | Source |

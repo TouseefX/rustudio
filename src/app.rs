@@ -153,6 +153,7 @@ impl Harness {
     /// A plain interactive run: no screenshots, tests or timed actions (the
     /// Android app, which has no command line; `desktop_main` fills the
     /// fields from its options).
+    #[cfg_attr(not(target_os = "android"), allow(dead_code))]
     pub fn interactive() -> Self {
         Harness {
             shot_after: None,
@@ -320,6 +321,17 @@ pub struct Editor {
     /// (camera aspect from it; drawn scaled into the panel): self-test
     /// steps that compare with a Studio capture at Studio's view size.
     pub view_render_size: Option<[u32; 2]>,
+    /// The 3D view rendered at this fraction of the panel's pixels and
+    /// drawn scaled up (View > Render Scale; 1 on desktops, less on phones,
+    /// whose screens have more pixels than their GPUs like at 60 Hz).
+    pub render_scale: f32,
+    /// Fingers (Android): what the viewport laid out for them and the
+    /// movement stick's state (src/touch_input.rs).
+    pub touch: crate::touch_input::Touch,
+    /// The first frame picks the UI zoom from the screen (Android, a fresh
+    /// layout: android::touch::auto_zoom).
+    #[cfg_attr(not(target_os = "android"), allow(dead_code))]
+    pub auto_zoom: bool,
     /// CPU time of the last frame's update + draw submission (ms).
     pub last_work_ms: f32,
     /// Local lights, sky faces and the sky-visibility map.
@@ -482,6 +494,9 @@ impl RustudioApp {
             game_cursor_hidden: false,
             cursor_log: Vec::new(),
             view_render_size: None,
+            render_scale: std::env::var("RUSTUDIO_RENDER_SCALE").ok().and_then(|v| v.parse().ok()).map_or(1.0, |v: f32| v.clamp(0.25, 1.0)),
+            touch: Default::default(),
+            auto_zoom: false,
             last_work_ms: 0.0,
             lighting: Default::default(),
             project: None,
@@ -1824,7 +1839,25 @@ impl eframe::App for RustudioApp {
             s.save(&self.dock, &self.panels, &self.ed);
         }
     }
+    /// eframe's own save moments (every 30 s, the activity losing its
+    /// surface): on Android the loop can end without `on_exit` (a destroyed
+    /// activity leaves the process, src/android/lifecycle.rs), so the layout
+    /// goes to disk here too.
+    #[cfg(target_os = "android")]
+    fn save(&mut self, _storage: &mut dyn eframe::Storage) {
+        if let Some(s) = self.layout.as_mut() {
+            s.save(&self.dock, &self.panels, &self.ed);
+        }
+    }
     fn raw_input_hook(&mut self, _ctx: &egui::Context, raw: &mut egui::RawInput) {
+        // Fingers: scroll / tap / hold / look, before egui sees them; a
+        // paste brings the system clipboard's text.
+        #[cfg(target_os = "android")]
+        {
+            self.ed.touch.filter(_ctx, raw, self.ed.frame_no);
+            crate::android::clipboard::before_frame(raw);
+            crate::android::lifecycle::back_pressed(_ctx, raw);
+        }
         if let Some(t) = self.ed.harness.selftest.as_mut() {
             t.inject(raw);
         }
@@ -1845,6 +1878,17 @@ impl eframe::App for RustudioApp {
         #[cfg(target_os = "macos")]
         for p in crate::macos::take_opened() {
             ed.request(PendingAction::Open(Some(p)));
+        }
+        // The first frames after the activity's surface came up are drawn
+        // whatever the event loop says: a redraw request that arrives while
+        // the first frame is still being set up has been seen to go
+        // missing, leaving the window black until the next resume.
+        #[cfg(target_os = "android")]
+        {
+            if ed.harness.started.elapsed() < std::time::Duration::from_secs(3) {
+                ctx.request_repaint();
+            }
+            crate::android::touch::auto_zoom(ed, &ctx);
         }
         ed.poll_file_dialogs();
         ed.frame_no += 1;
@@ -2170,6 +2214,9 @@ impl eframe::App for RustudioApp {
         {
             ctx.request_repaint();
         }
+        // Text copied this frame goes to the system clipboard too.
+        #[cfg(target_os = "android")]
+        crate::android::clipboard::after_frame(&ctx);
         self.watchdog.complete();
     }
 }

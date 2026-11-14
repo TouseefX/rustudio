@@ -1768,6 +1768,12 @@ impl Editor {
         let painter = ui.painter_at(rect);
         let now = self.play.as_ref().map(|s| s.time).unwrap_or(0.0);
 
+        // Touch screens: the movement stick and the jump button
+        // (src/touch_input.rs holds the keys they stand for).
+        if ctx.input(|i| i.has_touch_screen()) {
+            self.touch.paint(&painter);
+        }
+
         // Explosion flashes.
         let flashes: Vec<(Vec3, f32, f64)> = self
             .play

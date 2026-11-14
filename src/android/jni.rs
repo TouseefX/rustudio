@@ -451,3 +451,193 @@ pub fn launch_intent_uri() -> Result<Option<String>> {
         Ok(Some((*s).to_string()))
     })
 }
+
+// ---------------------------------------------------------- main thread
+
+/// Runs `f` on the Java main thread and waits up to `wait` for its answer.
+/// Some framework objects (ClipboardManager, for one) want to be made on a
+/// thread with a Looper, which the editor's thread isn't.
+fn on_main_thread<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static, wait: std::time::Duration) -> Result<T> {
+    let app = super::app().ok_or("no AndroidApp yet")?;
+    let (tx, rx) = std::sync::mpsc::channel();
+    app.run_on_java_main_thread(Box::new(move || {
+        let _ = tx.send(f());
+    }));
+    rx.recv_timeout(wait).map_err(|_| "the main thread didn't answer in time".to_string())
+}
+
+// ---------------------------------------------------------- browser
+
+/// `startActivity(new Intent(ACTION_VIEW, Uri.parse(url)))`: the default
+/// browser (the Quick Sign-in confirm page, the documentation links).
+pub fn open_url(url: &str) -> Result<()> {
+    with_activity(|env, activity| {
+        let jurl = env.new_string(url)?;
+        let uri = env
+            .call_static_method(jni_str!("android/net/Uri"), jni_str!("parse"), jni_sig!("(Ljava/lang/String;)Landroid/net/Uri;"), &[JValue::Object(&jurl)])?
+            .l()?;
+        let action = env.new_string("android.intent.action.VIEW")?;
+        let intent = env.new_object(
+            jni_str!("android/content/Intent"),
+            jni_sig!("(Ljava/lang/String;Landroid/net/Uri;)V"),
+            &[JValue::Object(&action), JValue::Object(&uri)],
+        )?;
+        // FLAG_ACTIVITY_NEW_TASK: the browser in its own task, the editor
+        // stays where it is in the back stack.
+        env.call_method(&intent, jni_str!("addFlags"), jni_sig!("(I)Landroid/content/Intent;"), &[JValue::Int(0x1000_0000)])?;
+        env.call_method(activity, jni_str!("startActivity"), jni_sig!("(Landroid/content/Intent;)V"), &[JValue::Object(&intent)])?;
+        Ok(())
+    })
+}
+
+// ---------------------------------------------------------- clipboard
+
+/// Puts `text` on the system clipboard (ClipboardManager.setPrimaryClip),
+/// so a copy in the editor pastes in other apps.
+pub fn clipboard_set(text: &str) -> Result<()> {
+    let text = text.to_string();
+    on_main_thread(
+        move || {
+            with_activity(|env, activity| {
+                let cm = system_service(env, activity, "clipboard")?;
+                if cm.is_null() {
+                    return Err(jni::errors::Error::NullPtr("ClipboardManager"));
+                }
+                let label = env.new_string("rustudio")?;
+                let jtext = env.new_string(&text)?;
+                let clip = env
+                    .call_static_method(
+                        jni_str!("android/content/ClipData"),
+                        jni_str!("newPlainText"),
+                        jni_sig!("(Ljava/lang/CharSequence;Ljava/lang/CharSequence;)Landroid/content/ClipData;"),
+                        &[JValue::Object(&label), JValue::Object(&jtext)],
+                    )?
+                    .l()?;
+                env.call_method(&cm, jni_str!("setPrimaryClip"), jni_sig!("(Landroid/content/ClipData;)V"), &[JValue::Object(&clip)])?;
+                Ok(())
+            })
+        },
+        std::time::Duration::from_millis(400),
+    )?
+}
+
+/// The system clipboard's text (the first item of the primary clip, coerced
+/// to text), if any. Android 10+ only answers the app with input focus,
+/// which the editor has when a paste is asked for.
+pub fn clipboard_get() -> Result<Option<String>> {
+    on_main_thread(
+        || {
+            with_activity(|env, activity| {
+                let cm = system_service(env, activity, "clipboard")?;
+                if cm.is_null() {
+                    return Ok(None);
+                }
+                let clip = env.call_method(&cm, jni_str!("getPrimaryClip"), jni_sig!("()Landroid/content/ClipData;"), &[])?.l()?;
+                if clip.is_null() {
+                    return Ok(None);
+                }
+                let n = env.call_method(&clip, jni_str!("getItemCount"), jni_sig!("()I"), &[])?.i()?;
+                if n <= 0 {
+                    return Ok(None);
+                }
+                let item = env
+                    .call_method(&clip, jni_str!("getItemAt"), jni_sig!("(I)Landroid/content/ClipData$Item;"), &[JValue::Int(0)])?
+                    .l()?;
+                let cs = env
+                    .call_method(&item, jni_str!("coerceToText"), jni_sig!("(Landroid/content/Context;)Ljava/lang/CharSequence;"), &[JValue::Object(activity)])?
+                    .l()?;
+                if cs.is_null() {
+                    return Ok(None);
+                }
+                let s = env.call_method(&cs, jni_str!("toString"), jni_sig!("()Ljava/lang/String;"), &[])?.l()?;
+                let s = env.as_cast::<jni::objects::JString>(&s)?;
+                Ok(Some((*s).to_string()))
+            })
+        },
+        std::time::Duration::from_millis(400),
+    )?
+}
+
+// ---------------------------------------------------------- storage access
+
+/// Whether the app may read shared storage by path: "All files access"
+/// (`Environment.isExternalStorageManager`) on API 30+, the storage
+/// permission below that.
+pub fn has_storage_access() -> bool {
+    if sdk_int() >= 30 {
+        with_env(|env| {
+            env.call_static_method(jni_str!("android/os/Environment"), jni_str!("isExternalStorageManager"), jni_sig!("()Z"), &[])?.z()
+        })
+        .unwrap_or(false)
+    } else {
+        has_permission("android.permission.READ_EXTERNAL_STORAGE")
+    }
+}
+
+/// `checkSelfPermission(name) == PERMISSION_GRANTED`.
+pub fn has_permission(name: &str) -> bool {
+    with_activity(|env, activity| {
+        let jname = env.new_string(name)?;
+        let r = env
+            .call_method(activity, jni_str!("checkSelfPermission"), jni_sig!("(Ljava/lang/String;)I"), &[JValue::Object(&jname)])?
+            .i()?;
+        Ok(r == 0)
+    })
+    .unwrap_or(false)
+}
+
+/// Asks for shared-storage access: API 30+ opens the app's "All files
+/// access" settings page (ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION);
+/// below that, the runtime permission dialog. NativeActivity doesn't
+/// forward the result; the caller asks [`has_storage_access`] again later
+/// (storage.rs does while its picker is open).
+pub fn request_storage_access() -> Result<()> {
+    if sdk_int() >= 30 {
+        return with_activity(|env, activity| {
+            let pkg = env.call_method(activity, jni_str!("getPackageName"), jni_sig!("()Ljava/lang/String;"), &[])?.l()?;
+            let pkg = env.as_cast::<jni::objects::JString>(&pkg)?;
+            let juri = env.new_string(format!("package:{}", &*pkg))?;
+            let uri = env
+                .call_static_method(jni_str!("android/net/Uri"), jni_str!("parse"), jni_sig!("(Ljava/lang/String;)Landroid/net/Uri;"), &[JValue::Object(&juri)])?
+                .l()?;
+            let action = env.new_string("android.settings.MANAGE_APP_ALL_FILES_ACCESS_PERMISSION")?;
+            let intent = env.new_object(
+                jni_str!("android/content/Intent"),
+                jni_sig!("(Ljava/lang/String;Landroid/net/Uri;)V"),
+                &[JValue::Object(&action), JValue::Object(&uri)],
+            )?;
+            env.call_method(activity, jni_str!("startActivity"), jni_sig!("(Landroid/content/Intent;)V"), &[JValue::Object(&intent)])?;
+            Ok(())
+        });
+    }
+    on_main_thread(
+        || {
+            with_activity(|env, activity| {
+                let read = env.new_string("android.permission.READ_EXTERNAL_STORAGE")?;
+                let write = env.new_string("android.permission.WRITE_EXTERNAL_STORAGE")?;
+                let names = env.new_object_array(2, jni_str!("java/lang/String"), &read)?;
+                names.set_element(env, 1, &write)?;
+                env.call_method(activity, jni_str!("requestPermissions"), jni_sig!("([Ljava/lang/String;I)V"), &[JValue::Object(&names), JValue::Int(1)])?;
+                Ok(())
+            })
+        },
+        std::time::Duration::from_millis(400),
+    )?
+}
+
+// ---------------------------------------------------------- back
+
+/// Sends the task to the background (`Activity.moveTaskToBack(true)`): the
+/// Back button on the editor itself, with nothing open over it. The
+/// activity stays alive and comes back where it was.
+pub fn move_task_to_back() -> Result<()> {
+    on_main_thread(
+        || {
+            with_activity(|env, activity| {
+                env.call_method(activity, jni_str!("moveTaskToBack"), jni_sig!("(Z)Z"), &[JValue::Bool(true)])?;
+                Ok(())
+            })
+        },
+        std::time::Duration::from_millis(400),
+    )?
+}

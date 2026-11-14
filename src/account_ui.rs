@@ -869,7 +869,7 @@ impl Editor {
                         });
                     if code.is_some() && !q.opened {
                         q.opened = true;
-                        ui.ctx().open_url(egui::OpenUrl::new_tab(rustudio_account::quick_login::CONFIRM_URL));
+                        crate::platform::open_url(ui.ctx(), rustudio_account::quick_login::CONFIRM_URL);
                     }
                     ui.ctx().request_repaint_after(std::time::Duration::from_millis(300));
                 } else {

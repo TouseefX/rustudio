@@ -65,7 +65,7 @@ impl_from!(
     serde_json::Error,
     toml::de::Error,
     toml::ser::Error,
-    keyring::Error
+    store::KeyringError
 );
 
 pub type Result<T> = std::result::Result<T, Error>;

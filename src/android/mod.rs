@@ -21,7 +21,9 @@
 //!   picker / share sheet).
 
 mod assets;
+pub mod clipboard;
 pub mod jni;
+pub mod lifecycle;
 mod logcat;
 pub mod sensors;
 pub mod storage;
@@ -150,6 +152,8 @@ pub fn run(app: AndroidApp) {
     logcat::install();
     log::info!("rustudio {} starting (Android API {})", env!("CARGO_PKG_VERSION"), AndroidApp::sdk_version());
     let _ = APP.set(app.clone());
+    // SAFETY: the live activity's handle, before its loop starts.
+    unsafe { lifecycle::hook(&app) };
     export_env();
     log::info!(
         "files {} / data {} / cache {}",
@@ -196,6 +200,7 @@ pub fn run(app: AndroidApp) {
         "rustudio",
         options,
         Box::new(move |cc| {
+            lifecycle::note_context(&cc.egui_ctx);
             let mut app = crate::app::RustudioApp::new(cc, open, crate::app::Harness::interactive(), false);
             touch::setup(&mut app, &cc.egui_ctx);
             Ok(Box::new(app))
@@ -204,15 +209,43 @@ pub fn run(app: AndroidApp) {
     if let Err(e) = result {
         log::error!("eframe: {e}");
     }
-    log::info!("rustudio: android_main returned");
+    lifecycle::LOOP_DONE.store(true, std::sync::atomic::Ordering::SeqCst);
+    // The next launch gets a fresh process: the handles kept in this one's
+    // statics (APP, the folders, the destroy hook's context) belong to this
+    // activity, and android-activity may run android_main again in the same
+    // process otherwise.
+    log::info!("rustudio: editor closed, leaving the process");
+    std::process::exit(0);
 }
 
-/// Touch-first settings for the egui chrome: bigger hit targets, kinetic
-/// scrolling, a wider click slop. Points per pixel comes from the display
-/// density (winit reports it as the window's scale factor), so nothing is
-/// scaled by hand here.
-mod touch {
-    pub fn setup(_app: &mut crate::app::RustudioApp, ctx: &egui::Context) {
+/// Touch-first settings for the egui chrome: bigger hit targets, a wider
+/// click slop, and the device defaults for the UI zoom and the 3D view's
+/// render scale (both kept by the layout store once changed from View >
+/// Zoom In / Out and View > Render Scale).
+///
+/// Points per pixel comes from the display density (winit reports it as
+/// the window's scale factor), which a phone's screen turns into too few
+/// points across for the editor's ribbon and panels, and a big tablet's
+/// into controls smaller than a fingertip. The first run's zoom (of the
+/// density) is the one that gives the window about [`touch::FIT_POINTS`]
+/// points across, within [`touch::ZOOM_RANGE`]: a 1080p phone lands near
+/// 0.8, a 10" tablet near 1.2.
+pub mod touch {
+    /// The window width (points) the first-run zoom aims for: a small
+    /// laptop's worth of editor.
+    pub const FIT_POINTS: f32 = 1100.0;
+    pub const ZOOM_RANGE: std::ops::RangeInclusive<f32> = 0.8..=1.6;
+    /// The 3D view's first-run render scale: about half the pixels (phone
+    /// GPUs at their screens' full resolution fell well under 60 Hz).
+    const DEFAULT_RENDER_SCALE: f32 = 0.7;
+
+    pub fn setup(app: &mut crate::app::RustudioApp, ctx: &egui::Context) {
+        let saved = crate::layout_store::load();
+        // (the window's size isn't known until the first frame: auto_zoom)
+        app.ed.auto_zoom = saved.as_ref().and_then(|l| l.zoom).is_none();
+        if saved.as_ref().and_then(|l| l.render_scale).is_none() && std::env::var_os("RUSTUDIO_RENDER_SCALE").is_none() {
+            app.ed.render_scale = DEFAULT_RENDER_SCALE;
+        }
         ctx.options_mut(|o| {
             // A finger lands less precisely than a pointer: a press that
             // drifts this far is still a tap.
@@ -231,5 +264,25 @@ mod touch {
             // Tooltips can't be hovered for; a long press shows one.
             s.interaction.tooltip_delay = 0.6;
         });
+    }
+
+    /// The first frame with a window: the zoom that fits [`FIT_POINTS`]
+    /// across the longer side of the screen (landscape), once per fresh
+    /// layout.
+    pub fn auto_zoom(ed: &mut crate::app::Editor, ctx: &egui::Context) {
+        if !ed.auto_zoom {
+            return;
+        }
+        let rect = ctx.content_rect();
+        if !rect.is_positive() {
+            return;
+        }
+        let native = ctx.native_pixels_per_point().unwrap_or(1.0).max(0.5);
+        let longer_px = rect.width().max(rect.height()) * ctx.pixels_per_point();
+        let zoom = (longer_px / (native * FIT_POINTS)).clamp(*ZOOM_RANGE.start(), *ZOOM_RANGE.end());
+        let zoom = (zoom * 20.0).round() / 20.0;
+        log::info!("first run: {longer_px:.0} px across at density {native:.2}: zoom {zoom:.2}");
+        ed.ui.zoom = zoom;
+        ed.auto_zoom = false;
     }
 }

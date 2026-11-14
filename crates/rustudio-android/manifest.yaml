@@ -22,6 +22,20 @@ android:
       - name: android.permission.ACCESS_NETWORK_STATE
       # HapticService:SetMotor / HapticEffect:Play through Vibrator.
       - name: android.permission.VIBRATE
+      # The in-app file picker (src/android/storage.rs) listing shared
+      # storage (Download, Documents, …) for places and models. NativeActivity
+      # gets no onActivityResult, so the system document picker (Storage
+      # Access Framework) can't hand a choice back; "Open with rustudio"
+      # from a Files app (the VIEW intent filter below, a content: URI copied
+      # in) works without any of these. API 30+: "All files access", asked
+      # for with a settings page the picker opens; API 26–29: the runtime
+      # storage permission (requestPermissions; read-only on API 29 under
+      # scoped storage, where the app's own folder is still writable).
+      - name: android.permission.MANAGE_EXTERNAL_STORAGE
+      - name: android.permission.READ_EXTERNAL_STORAGE
+        max_sdk_version: 32
+      - name: android.permission.WRITE_EXTERNAL_STORAGE
+        max_sdk_version: 29
     uses_feature:
       # wgpu: Vulkan first, OpenGL ES 3.0 as the fallback (src/lib.rs
       # wgpu_options), so Vulkan is declared but not required.
@@ -54,6 +68,14 @@ android:
           # StarterGui.ScreenOrientation re-requests the orientation while
           # it plays (Activity.setRequestedOrientation, src/android/jni.rs).
           orientation: sensorLandscape
+          # Every configuration change the activity can be told about
+          # instead of being recreated for (xbuild's default list plus the
+          # keyboard / touch screen, the SIM, colour mode and bold text):
+          # a recreation destroys the activity under a running editor,
+          # which winit 0.30 never passes on (src/android/lifecycle.rs).
+          # grammaticalGender (API 34) is left out: the flag isn't in the
+          # API 33 android.jar xbuild compiles the manifest against.
+          config_changes: orientation|keyboardHidden|keyboard|screenSize|smallestScreenSize|locale|layoutDirection|fontScale|screenLayout|density|uiMode|touchscreen|navigation|mcc|mnc|colorMode|fontWeightAdjustment
           # The soft keyboard shrinks the window (UserInputService
           # .OnScreenKeyboardSize) instead of covering it.
           window_soft_input_mode: adjustResize

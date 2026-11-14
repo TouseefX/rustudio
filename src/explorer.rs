@@ -629,9 +629,7 @@ impl Editor {
             }
             ui.separator();
             if item(ui, "Help", true) {
-                ui.ctx().open_url(egui::OpenUrl::new_tab(format!(
-                    "https://create.roblox.com/docs/reference/engine/classes/{class}"
-                )));
+                crate::platform::open_url(ui.ctx(), &format!("https://create.roblox.com/docs/reference/engine/classes/{class}"));
                 ui.close();
             }
         });

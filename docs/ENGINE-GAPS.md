@@ -318,3 +318,11 @@ camera 75 → 100 with the 2° tolerance unchanged.
 4. ~~GuiService.MenuOpened / MenuClosed with an in-game Esc menu~~ (round 13).
 5. Gamepad input (GamepadConnected / Disconnected, gamepad KeyCodes).
 6. The rest of `missing_game_members_by_class` in the coverage report.
+7. Touch for games (Android, docs/ANDROID.md): `UserInputService.TouchEnabled`
+   / `PreferredInput` still answer desktop values and `TouchStarted / Moved /
+   Ended`, `TouchTap`, `TouchPan`, `TouchPinch`, … are declared but never
+   fired. The device port's finger layer (src/touch_input.rs) drives the
+   game through the keyboard-and-mouse path for now: a one-finger drag on
+   the view is the right-button camera orbit, the editor's own movement
+   stick and jump button hold W / A / S / D / Space, a pinch is the wheel
+   (mech `PINCH_NOTCHES_PER_DOUBLING`). `ModalEnabled` doesn't hide them yet.

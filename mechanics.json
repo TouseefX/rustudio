@@ -585,6 +585,84 @@
    "source": "Studio (offline Studio): one Qt wheel event of −3/+2/−1 notches zoomed 12.5 → 23.375 → 14.917 → 19.146 studs (ZoomController step at 0.5 per notch)"
   },
   {
+   "name": "pinch zoom notches per doubling",
+   "group": "camera",
+   "value": 4,
+   "unit": "notches",
+   "estimated": true,
+   "source": "touch screens: a pinch that doubles the finger distance zooms like 4 wheel notches, in either camera"
+  },
+  {
+   "name": "touch hold before press",
+   "group": "controls",
+   "value": 320,
+   "unit": "ms",
+   "estimated": true,
+   "source": "touch screens: a finger still this long is a press, then a drag; Android's own long-press timeout is 400 ms"
+  },
+  {
+   "name": "touch slop",
+   "group": "controls",
+   "value": 8,
+   "unit": "points",
+   "estimated": true,
+   "source": "touch screens: moved this far before the hold, the finger scrolls or turns the camera; Android's touch slop is 8 dp"
+  },
+  {
+   "name": "touch fling stop speed",
+   "group": "controls",
+   "value": 40,
+   "unit": "points/s",
+   "estimated": true
+  },
+  {
+   "name": "touch fling decay",
+   "group": "controls",
+   "value": 2.8,
+   "unit": "1/s",
+   "estimated": true,
+   "source": "fling speed halves about every 0.25 s"
+  },
+  {
+   "name": "touch fling speed window",
+   "group": "controls",
+   "value": 100,
+   "unit": "ms",
+   "estimated": true,
+   "source": "the lift's speed is averaged over the finger's last 100 ms"
+  },
+  {
+   "name": "touch stick radius",
+   "group": "controls",
+   "value": 56,
+   "unit": "points",
+   "estimated": true,
+   "source": "Play: the movement stick's knob moves this far from where the finger landed (Roblox's dynamic thumbstick is about this size)"
+  },
+  {
+   "name": "touch stick dead zone",
+   "group": "controls",
+   "value": 10,
+   "unit": "points",
+   "estimated": true
+  },
+  {
+   "name": "touch jump button size",
+   "group": "controls",
+   "value": 72,
+   "unit": "points",
+   "estimated": true,
+   "source": "Play: Roblox's jump button is 70 × 70"
+  },
+  {
+   "name": "touch jump button margin",
+   "group": "controls",
+   "value": 28,
+   "unit": "points",
+   "estimated": true,
+   "source": "Play: distance from the view's bottom-right corner"
+  },
+  {
    "name": "game camera right-drag turn",
    "group": "camera",
    "value": 0.5,

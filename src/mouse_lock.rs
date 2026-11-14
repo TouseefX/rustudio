@@ -38,6 +38,12 @@ fn detect_locks() -> bool {
     if cfg!(target_os = "macos") {
         return true;
     }
+    // Android: no cursor to lock or confine; a finger's travel must never
+    // be taken for a lock that failed (the look would end up Confined and
+    // re-centring a pointer that isn't there).
+    if cfg!(target_os = "android") {
+        return true;
+    }
     if cfg!(all(unix, not(target_os = "macos"))) {
         return wayland_session(
             std::env::var_os("WAYLAND_DISPLAY").is_some_and(|v| !v.is_empty()),

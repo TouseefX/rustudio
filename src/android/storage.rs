@@ -8,9 +8,14 @@
 //! The system document picker (Storage Access Framework) needs
 //! `startActivityForResult` and an `onActivityResult`, which `NativeActivity`
 //! doesn't pass on to native code; this in-app picker covers the same files
-//! without a Java class in the APK.
+//! without a Java class in the APK. Shared storage outside the app's folder
+//! (Download, Documents, …) is listed once the app has storage access:
+//! "All files access" on API 30+ (MANAGE_EXTERNAL_STORAGE, granted on a
+//! settings page the picker opens), the storage permission below that
+//! ([`super::jni::request_storage_access`]).
 
 use std::path::{Path, PathBuf};
+use std::time::Instant;
 
 use crate::file_dialog::{Kind, Request};
 
@@ -20,18 +25,39 @@ struct Root {
     path: PathBuf,
 }
 
-fn roots() -> Vec<Root> {
+/// The primary shared storage (`/storage/emulated/0`): the app's external
+/// folder is `<shared>/Android/data/<package>/files`.
+fn shared_storage() -> PathBuf {
+    let mut p = super::data_dir();
+    for _ in 0..4 {
+        if let Some(parent) = p.parent() {
+            p = parent.to_path_buf();
+        }
+    }
+    if p.as_os_str().is_empty() || p == Path::new("/") {
+        PathBuf::from("/storage/emulated/0")
+    } else {
+        p
+    }
+}
+
+fn roots(storage_access: bool) -> Vec<Root> {
     let mut v = vec![Root { label: "rustudio", path: super::data_dir() }];
     if super::data_dir() != super::files_dir() {
         v.push(Root { label: "App data", path: super::files_dir() });
     }
-    // The shared Download folder is readable for files this app made and,
-    // on older systems, for everything; shown when it can be listed.
-    for (label, p) in [("Download", "/storage/emulated/0/Download"), ("Documents", "/storage/emulated/0/Documents")] {
-        let p = PathBuf::from(p);
+    // Shared folders: the usual ones when they can be listed (files this
+    // app made are always readable; everything with storage access), and
+    // the whole shared storage once access was granted.
+    let shared = shared_storage();
+    for (label, sub) in [("Download", "Download"), ("Documents", "Documents")] {
+        let p = shared.join(sub);
         if std::fs::read_dir(&p).is_ok() {
             v.push(Root { label, path: p });
         }
+    }
+    if storage_access && std::fs::read_dir(&shared).is_ok() {
+        v.push(Root { label: "Shared storage", path: shared });
     }
     v
 }
@@ -78,6 +104,10 @@ pub struct Picker {
     name: String,
     new_folder: Option<String>,
     error: Option<String>,
+    /// Shared storage may be read (asked again now and then while the
+    /// dialog is open: the grant happens on a system page).
+    storage_access: bool,
+    access_checked: Instant,
 }
 
 impl Picker {
@@ -103,6 +133,24 @@ impl Picker {
             name,
             new_folder: None,
             error: None,
+            storage_access: super::jni::has_storage_access(),
+            access_checked: Instant::now(),
+        }
+    }
+
+    /// Re-asks the system about storage access about once a second.
+    fn poll_access(&mut self, ctx: &egui::Context) {
+        if self.access_checked.elapsed().as_secs_f32() > 1.0 {
+            self.access_checked = Instant::now();
+            let now = super::jni::has_storage_access();
+            if now && !self.storage_access {
+                // Folders that were unreadable list now.
+                self.go(&self.listing.dir.clone());
+            }
+            self.storage_access = now;
+        }
+        if !self.storage_access {
+            ctx.request_repaint_after(std::time::Duration::from_secs(1));
         }
     }
 
@@ -123,6 +171,8 @@ impl Picker {
             }
             .to_string()
         });
+        self.poll_access(ctx);
+        let roots = roots(self.storage_access);
         let screen = ctx.content_rect();
         let size = egui::vec2((screen.width() - 32.0).min(720.0), (screen.height() - 32.0).min(560.0));
         let mut result: Option<Option<PathBuf>> = None;
@@ -139,16 +189,32 @@ impl Picker {
                 ui.spacing_mut().button_padding = egui::vec2(10.0, 8.0);
                 // Roots and the path.
                 ui.horizontal_wrapped(|ui| {
-                    for r in roots() {
+                    for r in &roots {
                         let here = self.listing.dir.starts_with(&r.path);
                         if ui.selectable_label(here, r.label).clicked() {
                             self.go(&r.path);
                         }
                     }
                 });
+                if !self.storage_access {
+                    ui.horizontal_wrapped(|ui| {
+                        ui.label(
+                            egui::RichText::new("Files in Download, Documents or elsewhere in shared storage need file access.")
+                                .weak()
+                                .size(12.0),
+                        );
+                        let label = if super::jni::sdk_int() >= 30 { "Allow all files access…" } else { "Allow file access…" };
+                        if ui.small_button(label).clicked() {
+                            if let Err(e) = super::jni::request_storage_access() {
+                                self.error = Some(format!("Could not open the permission page: {e}"));
+                            }
+                        }
+                        ui.label(egui::RichText::new("Or open the file from a Files app with rustudio.").weak().size(12.0));
+                    });
+                }
                 ui.horizontal(|ui| {
                     let up = self.listing.dir.parent().map(Path::to_path_buf);
-                    let at_root = roots().iter().any(|r| r.path == self.listing.dir);
+                    let at_root = roots.iter().any(|r| r.path == self.listing.dir);
                     if ui.add_enabled(up.is_some() && !at_root, egui::Button::new("⬆ Up")).clicked() {
                         if let Some(u) = up {
                             self.go(&u);
@@ -275,7 +341,7 @@ fn safe_name(s: &str) -> String {
 
 /// A path with the app's folder prefix replaced by its label.
 fn shorten(p: &Path) -> String {
-    for r in roots() {
+    for r in roots(true) {
         if let Ok(rest) = p.strip_prefix(&r.path) {
             let rest = rest.display().to_string();
             return if rest.is_empty() { r.label.to_string() } else { format!("{} / {}", r.label, rest.replace('/', " / ")) };

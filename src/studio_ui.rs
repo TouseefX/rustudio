@@ -253,6 +253,13 @@ pub const VIEW: &[M] = &[
     I("Zoom In", "Ctrl+=", "zoom_in"),
     I("Zoom Out", "Ctrl+-", "zoom_out"),
     I("Full Screen", "F11", "full_screen"),
+    // The 3D view at fewer pixels than its panel, drawn scaled up: for
+    // screens with more pixels than their GPU keeps up with (phones).
+    Sub("Render Scale", &[
+        I("100%", "", "render_scale_100"),
+        I("70%", "", "render_scale_70"),
+        I("50%", "", "render_scale_50"),
+    ]),
     S,
     I("Show View Selector", "", "view_selector"),
     I("Show Wind Direction", "", "wind_direction"),

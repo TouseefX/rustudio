@@ -96,6 +96,9 @@ pub struct Layout {
     /// Where each panel sat last in the main window.
     pub homes: HashMap<String, Home>,
     pub zoom: Option<f32>,
+    /// The 3D view's render scale (View > Render Scale).
+    #[serde(default)]
+    pub render_scale: Option<f32>,
     pub ribbon_tab: Option<String>,
     pub run_type: Option<String>,
     pub show_grid: Option<bool>,
@@ -201,6 +204,9 @@ impl Layout {
     pub fn apply(&self, ed: &mut Editor) {
         if let Some(z) = self.zoom.and_then(finite) {
             ed.ui.zoom = z.clamp(0.5, 3.0);
+        }
+        if let Some(r) = self.render_scale.and_then(finite) {
+            ed.render_scale = r.clamp(0.25, 1.0);
         }
         if let Some(t) = &self.ribbon_tab {
             if let Some(t) = RibbonTab::ALL.into_iter().find(|r| format!("{r:?}") == *t) {
@@ -364,6 +370,7 @@ impl Saver {
             popped: saved_popped(panels),
             homes: panels.homes.clone(),
             zoom: Some(ed.ui.zoom),
+            render_scale: Some(ed.render_scale),
             ribbon_tab: Some(format!("{:?}", ed.ui.tab)),
             run_type: Some(format!("{:?}", ed.ui.run_type)),
             show_grid: Some(ed.show_grid),

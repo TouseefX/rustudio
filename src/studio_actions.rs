@@ -277,7 +277,10 @@ impl Editor {
                 }
             }
             "zoom_in" => self.ui.zoom = (self.ui.zoom + 0.1).min(2.0),
-            "zoom_out" => self.ui.zoom = (self.ui.zoom - 0.1).max(0.6),
+            "zoom_out" => self.ui.zoom = (self.ui.zoom - 0.1).max(0.5),
+            "render_scale_100" => self.render_scale = 1.0,
+            "render_scale_70" => self.render_scale = 0.7,
+            "render_scale_50" => self.render_scale = 0.5,
             "full_screen" => {
                 self.ui.fullscreen = !self.ui.fullscreen;
                 ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(self.ui.fullscreen));
@@ -321,9 +324,9 @@ impl Editor {
             "reset_layout" => {
                 ctx.data_mut(|d| d.insert_temp(egui::Id::new("reset_dock"), true));
             }
-            "documentation" => ctx.open_url(egui::OpenUrl::new_tab("https://create.roblox.com/docs")),
-            "tutorials" => ctx.open_url(egui::OpenUrl::new_tab("https://create.roblox.com/docs/tutorials")),
-            "developer_forum" => ctx.open_url(egui::OpenUrl::new_tab("https://devforum.roblox.com")),
+            "documentation" => crate::platform::open_url(ctx, "https://create.roblox.com/docs"),
+            "tutorials" => crate::platform::open_url(ctx, "https://create.roblox.com/docs/tutorials"),
+            "developer_forum" => crate::platform::open_url(ctx, "https://devforum.roblox.com"),
             "transform" => self.tool = self.tool.toggle(Tool::Transform),
             "tool_select" => self.tool = self.tool.toggle(Tool::Select),
             "tool_move" => self.tool = self.tool.toggle(Tool::Move),

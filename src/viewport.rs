@@ -141,6 +141,16 @@ impl Editor {
         if std::env::var_os("RUSTUDIO_CURSOR_LOG").is_some() {
             eprintln!("[cursor] {label} {cmd:?}");
         }
+        // Android has no cursor: winit answers every grab / move with
+        // NotSupported (and egui-winit logs each), so the commands stay here;
+        // the grab's state above still tells the game the mouse is locked.
+        #[cfg(target_os = "android")]
+        {
+            let _ = ctx;
+            drop(cmd);
+            return;
+        }
+        #[cfg(not(target_os = "android"))]
         ctx.send_viewport_cmd(cmd);
     }
 
@@ -1761,6 +1771,33 @@ impl Editor {
                 self.cam.orbit(delta.x, delta.y);
             }
         }
+        // Two fingers on the view (touch screens): a pinch zooms toward the
+        // fingers (the game's camera through its wheel while playing) and
+        // moving both pans, as the middle button does.
+        if let Some(mt) = ctx.input(|i| i.multi_touch()) {
+            let on_view = rect.contains(mt.center_pos)
+                && ctx.layer_id_at(mt.center_pos).is_none_or(|l| l.order == egui::Order::Background);
+            if on_view && mt.num_touches == 2 {
+                let notches = mt.zoom_delta.max(1e-3).ln() / std::f32::consts::LN_2 * mech::PINCH_NOTCHES_PER_DOUBLING;
+                if driving {
+                    if let Some(s) = self.play.as_mut() {
+                        s.wheel += notches * mech::WHEEL_INPUT_PER_NOTCH;
+                    }
+                } else {
+                    if notches.abs() > 1e-4 {
+                        let ray = self.cam.ray(rect, mt.center_pos);
+                        let hit = self.ray_distance(&ray);
+                        self.cam.zoom_toward(ray.dir, notches, shift);
+                        self.last_zoom = Some((ray.dir, hit));
+                    }
+                    let t = mt.translation_delta;
+                    if t != Vec2::ZERO {
+                        self.cam.pan(t.x, t.y);
+                    }
+                }
+                ctx.request_repaint();
+            }
+        }
         // WASD / Q / E fly the camera wherever the mouse is (Studio), except
         // while a text field or the script editor has the keyboard, a game
         // TextBox is focused, the game has the input (Play), or Ctrl is held.
@@ -1822,6 +1859,20 @@ impl Editor {
         } else {
             None
         };
+        // Where fingers land this frame (src/touch_input.rs): the view, the
+        // movement stick and jump button while the game has the input, a
+        // handle under the pointer (dragged at once, no hold).
+        {
+            let (stick, jump) = if driving { crate::touch_input::play_zones(rect) } else { (None, None) };
+            self.touch.zones = crate::touch_input::Zones {
+                viewport: rect,
+                playing: driving,
+                stick,
+                jump,
+                handle_hover: hover_handle.is_some() || self.drag.is_some(),
+                frame: self.frame_no,
+            };
+        }
         // (No hover outline while playing the game, as in Studio.)
         let in_play = self
             .play
@@ -1869,7 +1920,7 @@ impl Editor {
         // WireframeHandleAdornments (domains/world_misc.rs).
         let (wire_lines, wire_texts) = crate::runtime::domains::world::misc::wire_geometry(&self.doc);
         lines.extend(wire_lines.into_iter().map(|(pos, color)| LineVertex { pos, color }));
-        let ppp = ctx.pixels_per_point();
+        let ppp = ctx.pixels_per_point() * self.render_scale.clamp(0.25, 1.0);
         let mut size = [
             (rect.width() * ppp).round().max(1.0) as u32,
             (rect.height() * ppp).round().max(1.0) as u32,

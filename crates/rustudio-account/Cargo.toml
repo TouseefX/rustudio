@@ -6,7 +6,6 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
-keyring = "4"
 ureq = { version = "3", features = ["json"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -16,4 +15,18 @@ md-5 = "0.10"
 base64 = "0.23"
 dirs = "6"
 flate2 = "1"
-tungstenite = { version = "0.30", features = ["rustls-tls-native-roots"] }
+# The OS's roots where there are any, plus Mozilla's: Android keeps its CA
+# store in a form rustls-native-certs can't read (no OpenSSL directory),
+# which left the MessagingService socket with no roots at all.
+tungstenite = { version = "0.30", features = ["rustls-tls-native-roots", "rustls-tls-webpki-roots"] }
+
+# The login keyring. keyring 4's facade covers macOS, Windows and the
+# Secret Service; it has no Android store (Entry::new fails there), so
+# Android goes straight to keyring-core with the Android Keystore store
+# (src/store.rs).
+[target.'cfg(not(target_os = "android"))'.dependencies]
+keyring = "4"
+
+[target.'cfg(target_os = "android")'.dependencies]
+keyring-core = "1"
+android-native-keyring-store = "1"

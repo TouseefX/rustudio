@@ -62,11 +62,19 @@ xbuild quirks worth knowing (commit e67b501):
 | Lifecycle | — | eframe's wgpu backend drops the window + surface in `suspended()` and recreates them in `resumed()`; a rotation is a resize and reconfigures the swapchain |
 | Folders (`src/paths.rs`) | `~/.local/share`, `~/.config`, `~/.local/state`, `~/.cache`, `~/Pictures` | `getExternalFilesDir()` for data (Studio content, places), `getFilesDir()/config`, `/state`, `getCacheDir()`, `<external>/Pictures` (`src/android/mod.rs`); `HOME` and the `XDG_*` variables are set to the same so `dirs` (rustudio-account) agrees |
 | `api-dump.json` | next to the executable / app bundle / source tree | APK `assets/`, unpacked to `files/resources/` at first start (`src/android/assets.rs`) |
-| File dialogs | rfd (async, on a worker thread) | rustudio's own picker over the app folder (`src/android/storage.rs`); "Open with rustudio" from file managers through the VIEW intent (`content:` URIs copied in via ContentResolver) |
+| File dialogs | rfd (async, on a worker thread) | rustudio's own picker (`src/android/storage.rs`) over the app folder and, once the storage permission is granted from the picker's own button, shared storage (Download, Documents, …); "Open with rustudio" from file managers through the VIEW intent (`content:` URIs copied in via ContentResolver) |
+| Input | mouse + keyboard | fingers through `src/touch_input.rs` (below); hardware mice / keyboards work as on a desktop |
+| Clipboard | egui-winit (arboard) | egui's copies mirrored to `ClipboardManager` after each frame, pastes read from it (`src/android/clipboard.rs`) |
+| Browser links (`platform::open_url`) | `ctx.open_url` (webbrowser) | `ACTION_VIEW` Intent from the activity (`jni::open_url`); eframe's `links` feature isn't built for Android |
+| Back button | — | closes what is open on top (Escape), otherwise `moveTaskToBack` — the activity isn't destroyed (`src/android/lifecycle.rs`) |
+| Activity destroyed | — | `onDestroy` hook: close request, then `process::exit(0)`; `android_main` always leaves the process when the loop ends (`lifecycle.rs`) |
+| UI zoom | 1.0 of the display's scale | first run: the zoom that fits ~1100 points across (0.8 … 1.6 of the density), then View > Zoom In / Out as saved |
+| 3D view render scale | 1.0 | first run 0.7 (View > Render Scale 100 / 70 / 50 %); saved with the layout |
 | Logging | stderr | logcat tag `rustudio` (`log` → android_logger), stdout/stderr forwarded by android-activity |
 | Crash reports | `~/.cache/rustudio/crash/` | `<cache>/rustudio/crash/` (same `src/crash.rs`: panic hook + signal handlers chain to debuggerd) |
 | Studio content download | ureq + rustls (ring) | the same; started only when ConnectivityManager reports a validated network |
-| Login keyring | Secret Service / Keychain / Credential Manager | none (`keyring` returns an error on Android); the session cookie import file under `files/config/rustudio/` is the sign-in path |
+| Login keyring | `keyring` 4 (Secret Service / Keychain / Credential Manager) | `keyring-core` + `android-native-keyring-store` (SharedPreferences + Android Keystore) behind the same `Entry` API (`crates/rustudio-account/src/store.rs`) |
+| TLS roots (`rustudio-account` MessagingService socket) | OS store (`rustls-native-certs`) | Mozilla's (`webpki-roots`, enabled alongside): Android's CA store isn't in a form `rustls-native-certs` reads; `ureq` already used `webpki-roots` |
 
 ## Audit: desktop-only code
 
@@ -98,9 +106,12 @@ ungated so the shared code paths stay one):
 - `src/lib.rs` `rerun_headless` / `restore_parent_fds` — already
   `cfg(target_os = "linux")` only.
 - `src/macos.rs`, `windows-sys` — already cfg'd by OS.
-- `crates/rustudio-account` `keyring` — compiles for Android, `Entry::new`
-  returns an error at run time, which the session code treats as "no
-  keyring" and falls back to the import file.
+- `crates/rustudio-account` `keyring` 4 — not built for Android (no store
+  there: every `Entry::new` failed, which broke the session check and the
+  Quick Sign-in flow on the first device runs). `store.rs` has a
+  `keyring` shim module over `keyring-core` with
+  `android-native-keyring-store` as the default store, so `session.rs` and
+  `store.rs` compile unchanged.
 - `src/domains/media_video.rs` `dlopen` of libvpx / libopus — Android has
   no system copies; the loaders fail gracefully (no video decoding).
 
@@ -125,12 +136,76 @@ provides or still has to.
 | `Player:GetMouse()`, `Mouse` while playing | desktop pointer | **to do**: the first touch stands in (as Roblox does) |
 | `VRService`, gamepads | stubs | unchanged |
 
+## Fingers (`src/touch_input.rs`)
+
+egui-winit makes the first finger the mouse pointer with the left button
+down, which is wrong for most of the editor: a finger laid on an Explorer
+row starts dragging the row instead of scrolling the list, and a finger on
+the 3D view box-selects. `Touch::filter` runs in `App::raw_input_hook`,
+before egui sees the frame's events, and rewrites the `Event::Touch`
+stream (dropping egui-winit's stand-in pointer events):
+
+| Finger | Becomes |
+|---|---|
+| moves at once (> 8 pt before 320 ms) on the chrome | a scroll of the panel under it (`MouseWheel` events in a Start/Move/End phase, applied 1:1), with a fling after the lift |
+| still for 320 ms | a normal press, dragging from then on (Explorer rows, text selection, sliders, splitters, windows); a long press without moving opens egui's context menu (its own long-touch) |
+| lifted without moving | a tap (press + release at the landing point) |
+| moves at once on the 3D view | a right-button drag: the editor camera's look; in Play the game camera (the PlayerModule's right-drag orbit, mouse deltas from the finger) |
+| on a transform handle | a left press at once (drags the handle) |
+| second finger on the 3D view | ends the first one's drag; `InputState::multi_touch` gives the viewport a pinch (zoom toward the fingers; in Play the game's wheel: `mech::PINCH_NOTCHES_PER_DOUBLING`) and a two-finger pan |
+| in Play, lands bottom-left / bottom-right of the view | the movement stick (W/A/S/D held by its deflection, drawn under the finger) / the jump button (Space) — `touch_input::play_zones`; released when Play stops or the window loses focus. A quick tap in the stick zone is still a tap (GUI buttons there keep working). Stick and jump fingers are kept out of egui's touch stream, so a look finger beside them is never read as a pinch |
+
+The viewport publishes where things are each frame (`Zones`: its rect,
+whether the game has the input, the stick and jump areas, a handle under
+the pointer) and draws the stick and button in Play (`Touch::paint`). The
+chrome's egui settings for fingers are in `android::touch::setup`. The
+tuning numbers (hold 320 ms, slop 8 pt, fling, stick and button sizes)
+are `mech::TOUCH_*` with their rows in docs/MECHANICS.md ("Touch
+screens") and mechanics.json. The module has no Android dependency, so
+its seven tests run on the desktop (`cargo test touch_input`).
+
+## Device-run notes (first APKs)
+
+Found on devices with the phase-1 APKs; the fixes are in the table above
+and here:
+
+- **Black window at first start, until leaving and coming back.** winit
+  0.30 drops `MainEvent::Destroy`, so whenever the system destroyed the
+  activity under a running loop (a swipe from Recents followed by a quick
+  relaunch, a configuration change outside `configChanges`), the Java
+  main thread sat in `onDestroy` waiting for `android_main`; the next
+  launch landed in that process and drew nothing. `lifecycle.rs` hooks
+  `onDestroy` and leaves the process; `android_main` exits the process
+  when the loop returns; the manifest declares every configuration change
+  the API 33 android.jar knows; the first three seconds request repaints
+  so an early lost redraw can't leave the splash up; `App::save` keeps the
+  layout at eframe's save moments (the surface going away).
+- **Heavy lag.** The 3D view rendered at the panel's full pixel size — a
+  phone's 2–3× density screen is more pixels than a laptop's — plus debug
+  builds. First run now renders the view at 0.7 scale (View > Render
+  Scale), and `x build --release` (or the `profiling` profile) is the
+  build to judge speed by; `RUSTUDIO_RENDER_SCALE` overrides.
+- **Clipboard.** egui-winit has no Android clipboard; see
+  `android/clipboard.rs`.
+- **Browser sign-in never opened the code page.** Two causes: eframe's
+  `links` feature (and so `ctx.open_url`) isn't in the Android feature
+  set, and `keyring::Entry::new` failed on Android so the session check
+  errored before the code showed. `platform::open_url` and the keyring
+  shim.
+- **Opening a file asked for All-files access.** NativeActivity gets no
+  `onActivityResult`, so the system document picker can't hand a choice
+  back; the in-app picker lists the app's own folder without any
+  permission and offers a button for shared storage (All files access on
+  API 30+, the runtime permission below). "Open with rustudio" from a
+  Files app needs nothing.
+- **Panels didn't scroll, no camera on touch.** `src/touch_input.rs`.
+
 ## Later steps (in order)
 
-1. Touch: winit touch events → egui pointer + `UserInputService` touch
-   events and gestures; default thumbstick / jump button; two-finger
-   orbit / pinch zoom for the editor camera; bigger hit targets in the
-   chrome (`android::touch::setup` has the egui-side settings).
+1. Touch for the game: `UserInputService` touch events and gestures
+   from the same finger stream (`touch_input.rs` already tells fingers
+   apart), `TouchEnabled` / `PreferredInput`, `ModalEnabled` hiding the
+   stick and button (they are the editor's own for now, holding keys).
 2. Device properties and sensors (the `device_prop()` table, the
    `Device*Changed` events from `sensors::latest()` once per new sample).
 3. Haptics (`HapticService`, `HapticEffect`) through `jni::vibrate*`.
