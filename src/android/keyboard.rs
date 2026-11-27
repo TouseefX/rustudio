@@ -471,10 +471,11 @@ impl Keyboard {
         self.height_px as f32 / ctx.pixels_per_point().max(0.1)
     }
 
-    /// The keyboard's height plus, without the input-connection bridge
-    /// (ime.rs), the band of the text bar above it (text_bar.rs: Cut /
-    /// Copy / Paste / Select all), in points: what the window's bottom
-    /// gives up while the keyboard is up (0 while it is down).
+    /// The keyboard's height plus the band of the text bar above it
+    /// (text_bar.rs: Cut / Copy / Paste / Select all), in points: what the
+    /// window's bottom gives up while the keyboard is up (0 while it is
+    /// down). The bar is always up, including with the bridge: a phone's
+    /// keyboard need not offer its own paste actions.
     pub fn room(&self, ctx: &egui::Context) -> f32 {
         let keyboard = self.height(ctx);
         if keyboard <= 0.0 {

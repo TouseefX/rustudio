@@ -257,27 +257,35 @@ unsafe extern "system" fn native_op<'l>(
     composing: jboolean,
     hash: jlong,
 ) {
-    env.with_env(|env| -> jni::errors::Result<()> {
-        let text: String = if text.is_null() { String::new() } else { text.try_to_string(env)? };
-        let sel = (sel_start.max(0) as usize, sel_end.max(0) as usize);
-        let what = match op {
-            1 => What::Replace { a: a.max(0) as usize, b: b.max(0) as usize, text },
-            2 => What::Select,
-            _ => What::Enter,
-        };
-        log::info!(
-            "ime: op {seq} {}{}",
-            match &what {
-                What::Replace { a, b, text } => format!("replace {a}..{b} with {} chars, selection {}..{}", text.chars().count(), sel.0, sel.1),
-                What::Select => format!("select {}..{}", sel.0, sel.1),
-                What::Enter => "enter".to_string(),
-            },
-            if composing { " (composing)" } else { "" }
-        );
-        ops().push_back(Op { seq, what, sel, hash: hash as u64 });
-        Ok(())
-    })
-    .resolve::<jni::errors::LogErrorAndDefault>();
+    // A panic must not cross back into the JVM: that aborts the whole
+    // process. A Vietnamese IME commits many composed replacements in a
+    // row; if one of them upsets a helper, drop that one operation.
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        env.with_env(|env| -> jni::errors::Result<()> {
+            let text: String = if text.is_null() { String::new() } else { text.try_to_string(env)? };
+            let sel = (sel_start.max(0) as usize, sel_end.max(0) as usize);
+            let what = match op {
+                1 => What::Replace { a: a.max(0) as usize, b: b.max(0) as usize, text },
+                2 => What::Select,
+                _ => What::Enter,
+            };
+            log::info!(
+                "ime: op {seq} {}",
+                match &what {
+                    What::Replace { a, b, text } => format!("replace {a}..{b} with {} chars, selection {}..{}", text.chars().count(), sel.0, sel.1),
+                    What::Select => format!("select {}..{}", sel.0, sel.1),
+                    What::Enter => "enter".to_string(),
+                },
+                if composing { " (composing)" } else { "" }
+            );
+            ops().push_back(Op { seq, what, sel, hash: hash as u64 });
+            Ok(())
+        })
+        .resolve::<jni::errors::LogErrorAndDefault>();
+    }));
+    if result.is_err() {
+        log::error!("ime: nativeOp panicked; the keyboard's operation was dropped");
+    }
 }
 
 /// `ImeBridge.nativeCodeFixup`: the keyboard inserted `inserted` into the
@@ -290,23 +298,36 @@ unsafe extern "system" fn native_op<'l>(
 /// is a frame in which the keyboard's next letter would be placed by the
 /// old text).
 unsafe extern "system" fn native_code_fixup<'l>(mut env: EnvUnowned<'l>, _class: JClass<'l>, text: JString<'l>, cursor: jint, inserted: JString<'l>) -> JObject<'l> {
-    env.with_env(|env| -> jni::errors::Result<JObject<'l>> {
-        if text.is_null() || inserted.is_null() {
-            return Ok(JObject::null());
-        }
-        let text: String = text.try_to_string(env)?;
-        let inserted: String = inserted.try_to_string(env)?;
-        let Some(ind) = crate::code_indent::settings() else { return Ok(JObject::null()) };
-        match crate::code_indent::on_insert(&text, cursor.max(0) as usize, &inserted, &ind) {
-            Some(fix) => {
-                log::info!("ime: code fixup: {}..{} becomes {} chars, caret {}", fix.a, fix.b, fix.text.chars().count(), fix.cursor.0);
-                let out = env.new_string(format!("{} {} {}\n{}", fix.a, fix.b, fix.cursor.0, fix.text))?;
-                Ok(out.into())
+    // Called on the Java main thread from inside the keyboard's operation:
+    // a Rust panic here would unwind through JNI and abort the process.
+    // Any language's text can reach this hook (Vietnamese composing first),
+    // so a bad fixup is logged and skipped, not fatal.
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        env.with_env(|env| -> jni::errors::Result<JObject<'l>> {
+            if text.is_null() || inserted.is_null() {
+                return Ok(JObject::null());
             }
-            None => Ok(JObject::null()),
+            let text: String = text.try_to_string(env)?;
+            let inserted: String = inserted.try_to_string(env)?;
+            let Some(ind) = crate::code_indent::settings() else { return Ok(JObject::null()) };
+            match crate::code_indent::on_insert(&text, cursor.max(0) as usize, &inserted, &ind) {
+                Some(fix) => {
+                    log::info!("ime: code fixup: {}..{} becomes {} chars, caret {}", fix.a, fix.b, fix.text.chars().count(), fix.cursor.0);
+                    let out = env.new_string(format!("{} {} {}\n{}", fix.a, fix.b, fix.cursor.0, fix.text))?;
+                    Ok(out.into())
+                }
+                None => Ok(JObject::null()),
+            }
+        })
+        .resolve::<jni::errors::LogErrorAndDefault>()
+    }));
+    match result {
+        Ok(obj) => obj,
+        Err(_) => {
+            log::error!("ime: code fixup panicked; the keyboard's text is used without it");
+            JObject::null()
         }
-    })
-    .resolve::<jni::errors::LogErrorAndDefault>()
+    }
 }
 
 /// Asks the keyboard up for `field`'s current state (keyboard.rs

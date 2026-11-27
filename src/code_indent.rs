@@ -145,7 +145,7 @@ fn closer_typed(chars: &[char], cursor: usize, ind: &Indent) -> Option<Fixup> {
     }
     let closer = is_closer_word(word);
     let ident = word.chars().all(|c| c.is_alphanumeric() || c == '_');
-    let began_as_closer = !closer && ident && ["end", "else", "until"].iter().any(|k| word.starts_with(k) && word.len() > k.len());
+    let began_as_closer = !closer && ident && ["end", "else", "until"].iter().any(|k| word.starts_with(k) && word.chars().count() > k.chars().count());
     if !closer && !began_as_closer {
         return None;
     }

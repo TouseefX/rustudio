@@ -366,6 +366,11 @@ fn byte_of(text: &str, ch: usize) -> usize {
 }
 
 fn char_of(text: &str, byte: usize) -> usize {
+    // An event chain can leave a byte position inside a multi-byte
+    // character (Vietnamese IME text): round down to the boundary rather
+    // than panic on `&text[..byte]`.
+    let byte = byte.min(text.len());
+    let byte = (0..=byte).rev().find(|b| text.is_char_boundary(*b)).unwrap_or(0);
     text[..byte].chars().count()
 }
 
