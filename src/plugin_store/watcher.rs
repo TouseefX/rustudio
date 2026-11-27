@@ -122,6 +122,7 @@ pub enum Level {
     Info,
     Warn,
     Error,
+    System,
 }
 
 /// Acts on folder changes when `reload_on_change` is on (else nothing, as

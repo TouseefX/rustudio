@@ -7,7 +7,7 @@ resolver = "2"
 [workspace.package]
 edition = "2021"
 license = "MIT OR Apache-2.0"
-version = "0.5.2"
+version = "0.6.0"
 
 [package]
 name = "rustudio"
@@ -86,6 +86,17 @@ chrono = { version = "0.4.35", default-features = false, features = ["clock"] }
 
 [profile.dev]
 opt-level = 1
+
+# The shipped build (the APKs: `x build --release`): thin LTO lets the
+# compiler inline across the crates a frame crosses thousands of times
+# (rustudio-engine -> rustudio-core's document and variants, the physics
+# solver's modules, the renderer's) and one codegen unit a crate lets it
+# optimise each crate whole; a phone's CPU shows the difference first.
+# A quicker local release build: CARGO_PROFILE_RELEASE_LTO=off
+# CARGO_PROFILE_RELEASE_CODEGEN_UNITS=16.
+[profile.release]
+lto = "thin"
+codegen-units = 1
 
 [profile.dev.package."*"]
 opt-level = 2

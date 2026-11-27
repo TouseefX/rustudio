@@ -706,6 +706,7 @@ impl Gui {
         self.memo_frames += 1;
         if self.memo_frames % 600 == 0 {
             self.memo.retain(|r, _| d.exists(*r));
+            self.text_fit.retain_drawn(|r| d.exists(r));
         }
         // egui's atlas only grew taller (it doubles): the kept triangles'
         // font UVs are texel × (1 / height), so scaling their V by the

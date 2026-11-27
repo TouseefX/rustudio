@@ -179,6 +179,7 @@ impl Tab {
             Tab::Output => "output",
             Tab::AvatarSettings => "avatar_settings",
             Tab::TerrainEditor => "terrain_editor",
+            Tab::AnimationEditor => "clip_editor",
             Tab::Toolbox => "toolbox",
             Tab::AssetManager => "asset_manager",
             Tab::FileSync => "file_sync",

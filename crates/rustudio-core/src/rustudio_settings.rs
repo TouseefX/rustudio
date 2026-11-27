@@ -105,16 +105,18 @@ pub enum BuiltinTool {
     ViewSelector,
     RigBuilder,
     MaterialPicker,
+    AnimationEditor,
 }
 
 impl BuiltinTool {
-    pub const ALL: [BuiltinTool; 6] = [
+    pub const ALL: [BuiltinTool; 7] = [
         BuiltinTool::Toolbox,
         BuiltinTool::TerrainEditor,
         BuiltinTool::Draggers,
         BuiltinTool::ViewSelector,
         BuiltinTool::RigBuilder,
         BuiltinTool::MaterialPicker,
+        BuiltinTool::AnimationEditor,
     ];
 
     pub fn key(self) -> &'static str {
@@ -125,6 +127,7 @@ impl BuiltinTool {
             BuiltinTool::ViewSelector => "builtin_view_selector",
             BuiltinTool::RigBuilder => "builtin_rig_builder",
             BuiltinTool::MaterialPicker => "builtin_material_picker",
+            BuiltinTool::AnimationEditor => "builtin_animation_editor",
         }
     }
 
@@ -136,6 +139,7 @@ impl BuiltinTool {
             BuiltinTool::ViewSelector => "RUSTUDIO_BUILTIN_VIEW_SELECTOR",
             BuiltinTool::RigBuilder => "RUSTUDIO_BUILTIN_RIG_BUILDER",
             BuiltinTool::MaterialPicker => "RUSTUDIO_BUILTIN_MATERIAL_PICKER",
+            BuiltinTool::AnimationEditor => "RUSTUDIO_BUILTIN_ANIMATION_EDITOR",
         }
     }
 
@@ -160,6 +164,8 @@ impl BuiltinTool {
             Some(BuiltinTool::RigBuilder)
         } else if stem.eq_ignore_ascii_case("MaterialPicker") {
             Some(BuiltinTool::MaterialPicker)
+        } else if stem.eq_ignore_ascii_case("AnimationClipEditor") {
+            Some(BuiltinTool::AnimationEditor)
         } else {
             None
         }
@@ -177,6 +183,7 @@ pub struct BuiltinToolChoices {
     pub view_selector: ToolImpl,
     pub rig_builder: ToolImpl,
     pub material_picker: ToolImpl,
+    pub animation_editor: ToolImpl,
 }
 
 impl BuiltinToolChoices {
@@ -190,6 +197,7 @@ impl BuiltinToolChoices {
             view_selector: builtin_tool_impl(BuiltinTool::ViewSelector),
             rig_builder: builtin_tool_impl(BuiltinTool::RigBuilder),
             material_picker: builtin_tool_impl(BuiltinTool::MaterialPicker),
+            animation_editor: builtin_tool_impl(BuiltinTool::AnimationEditor),
         }
     }
 
@@ -204,6 +212,7 @@ impl BuiltinToolChoices {
             view_selector: ToolImpl::Roblox,
             rig_builder: ToolImpl::Roblox,
             material_picker: ToolImpl::Roblox,
+            animation_editor: ToolImpl::Roblox,
         }
     }
 
@@ -215,6 +224,7 @@ impl BuiltinToolChoices {
             BuiltinTool::ViewSelector => self.view_selector,
             BuiltinTool::RigBuilder => self.rig_builder,
             BuiltinTool::MaterialPicker => self.material_picker,
+            BuiltinTool::AnimationEditor => self.animation_editor,
         }
     }
 
@@ -364,6 +374,14 @@ pub const OPTS: &[Opt] = &[
         label: "Material Picker",
         desc: "Use rustudio's native Material picker or Roblox's built-in MaterialPicker plugin. Applies when opening a place or restarting.",
         env: "RUSTUDIO_BUILTIN_MATERIAL_PICKER",
+        kind: OptKind::Choice(TOOL_IMPLS),
+    },
+    Opt {
+        key: "builtin_animation_editor",
+        cat: "Plugins",
+        label: "Animation Editor",
+        desc: "Use rustudio's native Animation Editor or Roblox's built-in AnimationClipEditor plugin. Applies when opening a place or restarting.",
+        env: "RUSTUDIO_BUILTIN_ANIMATION_EDITOR",
         kind: OptKind::Choice(TOOL_IMPLS),
     },
     Opt {
@@ -853,11 +871,15 @@ fn choice_default(key: &str) -> Option<&'static str> {
 /// Android the 3D resolution starts at 75% — the first phone measurements
 /// fell well under the display's rate at full resolution, and at a phone's
 /// pixel density three quarters reads as sharp — until the dialog says
-/// otherwise.
+/// otherwise — and the frame limit at 60, as Roblox's phone client: a 90
+/// or 120 Hz display would otherwise run the game, its scripts and its
+/// physics at the display's rate, for the CPU, the battery and the heat
+/// that throttles the cores (app.rs `pace_frame`).
 fn choice_default_for(key: &str, weak: bool, android: bool) -> Option<&'static str> {
     match key {
         "quality" if weak => Some("automatic"),
         "resolution" if android => Some("75"),
+        "fps" if android => Some("60"),
         _ => None,
     }
 }
@@ -894,6 +916,7 @@ pub fn shown(o: &Opt) -> Shown {
         "builtin_view_selector" => Shown::Choice(usize::from(builtin_tool_impl(BuiltinTool::ViewSelector) == ToolImpl::Roblox)),
         "builtin_rig_builder" => Shown::Choice(usize::from(builtin_tool_impl(BuiltinTool::RigBuilder) == ToolImpl::Roblox)),
         "builtin_material_picker" => Shown::Choice(usize::from(builtin_tool_impl(BuiltinTool::MaterialPicker) == ToolImpl::Roblox)),
+        "builtin_animation_editor" => Shown::Choice(usize::from(builtin_tool_impl(BuiltinTool::AnimationEditor) == ToolImpl::Roblox)),
         "project_any_path" => Shown::Bool(project_any_path()),
         "classic_death_sound" => Shown::Bool(classic_death_sound_fetch()),
         "update_check" => Shown::Bool(update_check()),
@@ -941,9 +964,12 @@ pub const FPS_PRESETS: &[(&str, &str)] = &[
 ];
 
 /// The Editor frame limit in frames per second (None: Unlimited). A preset
-/// or a typed number, from RUSTUDIO_PERF_FPS or the saved setting.
+/// or a typed number, from RUSTUDIO_PERF_FPS or the saved setting, else
+/// the platform's default (60 on a phone, `choice_default_for`).
 pub fn fps_limit() -> Option<f32> {
-    let v = env("RUSTUDIO_PERF_FPS").or_else(|| saved("fps")?.as_str().map(str::to_owned))?;
+    let v = env("RUSTUDIO_PERF_FPS")
+        .or_else(|| saved("fps")?.as_str().map(str::to_owned))
+        .or_else(|| choice_default("fps").map(str::to_owned))?;
     parse_fps(&v)
 }
 
@@ -979,8 +1005,11 @@ mod tests {
         assert_eq!(choice_default_for("resolution", false, false), None);
         assert_eq!(choice_default_for("resolution", false, true), Some("75"));
         assert_eq!(choice_default_for("detail", true, true), None);
+        assert_eq!(choice_default_for("fps", false, false), None);
+        assert_eq!(choice_default_for("fps", true, false), None);
+        assert_eq!(choice_default_for("fps", false, true), Some("60"));
         // Every default is one of its row's choices.
-        for key in ["quality", "resolution"] {
+        for key in ["quality", "resolution", "fps"] {
             let OptKind::Choice(items) = opt(key).kind else { panic!("{key} is a choice") };
             for (weak, android) in [(false, false), (true, false), (false, true), (true, true)] {
                 if let Some(d) = choice_default_for(key, weak, android) {
@@ -1088,6 +1117,7 @@ mod tests {
             view_selector: ToolImpl::Roblox,
             rig_builder: ToolImpl::Roblox,
             material_picker: ToolImpl::Roblox,
+            animation_editor: ToolImpl::Roblox,
         };
         for tool in BuiltinTool::ALL {
             assert!(!off.use_roblox(tool));

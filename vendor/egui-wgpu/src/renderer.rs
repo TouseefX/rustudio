@@ -706,16 +706,29 @@ impl Renderer {
                     format: wgpu::TextureFormat::Rgba8Unorm,
                     usage,
                 });
-                let texture = prewarmed.unwrap_or_else(|| device.create_texture(&wgpu::TextureDescriptor {
-                    label,
-                    size,
-                    mip_level_count: 1,
-                    sample_count: 1,
-                    dimension: wgpu::TextureDimension::D2,
-                    format: wgpu::TextureFormat::Rgba8Unorm,
-                    usage,
-                    view_formats: &[wgpu::TextureFormat::Rgba8Unorm],
-                }));
+                let texture = match prewarmed {
+                    Some(t) => t,
+                    None => {
+                        let oom = device.push_error_scope(wgpu::ErrorFilter::OutOfMemory);
+                        let t = device.create_texture(&wgpu::TextureDescriptor {
+                            label,
+                            size,
+                            mip_level_count: 1,
+                            sample_count: 1,
+                            dimension: wgpu::TextureDimension::D2,
+                            format: wgpu::TextureFormat::Rgba8Unorm,
+                            usage,
+                            view_formats: &[wgpu::TextureFormat::Rgba8Unorm],
+                        });
+                        if let Some(err) = pop_error_scope(oom) {
+                            log::error!(
+                                "egui_wgpu: out of GPU memory growing texture {label_str} ({width}x{height}): {err}"
+                            );
+                            return;
+                        }
+                        t
+                    }
+                };
                 let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label });
                 encoder.copy_texture_to_texture(
                     old.as_image_copy(),
@@ -844,9 +857,13 @@ impl Renderer {
             )
         } else {
             // allocate a new texture
-            let texture = {
+            let (texture, upload_data, upload_w, upload_h) = {
                 profiling::scope!("create_texture");
-                device.create_texture(&wgpu::TextureDescriptor {
+                let usage = wgpu::TextureUsages::TEXTURE_BINDING
+                    | wgpu::TextureUsages::COPY_DST
+                    | wgpu::TextureUsages::COPY_SRC;
+                let oom = device.push_error_scope(wgpu::ErrorFilter::OutOfMemory);
+                let t = device.create_texture(&wgpu::TextureDescriptor {
                     label,
                     size,
                     mip_level_count: 1,
@@ -854,10 +871,106 @@ impl Renderer {
                     dimension: wgpu::TextureDimension::D2,
                     format: wgpu::TextureFormat::Rgba8Unorm,
                     // (COPY_SRC: rustudio keeps a grown font atlas's rows on the GPU)
-                    usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST | wgpu::TextureUsages::COPY_SRC,
+                    usage,
                     view_formats: &[wgpu::TextureFormat::Rgba8Unorm],
-                })
+                });
+                if let Some(err) = pop_error_scope(oom) {
+                    // Instead of dropping a managed image completely (which would
+                    // blank out particles, beams, trails, and GUI images),
+                    // downsample in-place to <= 64x64 (~16 KiB) and retry.
+                    // Never downsample the font atlas (TextureId::default()) whose
+                    // glyph UVs rely on exact pixel coordinates.
+                    if id != epaint::TextureId::default() && (width > 64 || height > 64) {
+                        let (dw, dh, down) = downsample_rgba8_to_max(data_bytes, width, height, 64);
+                        let small_size = wgpu::Extent3d {
+                            width: dw,
+                            height: dh,
+                            depth_or_array_layers: 1,
+                        };
+                        let oom2 = device.push_error_scope(wgpu::ErrorFilter::OutOfMemory);
+                        let t2 = device.create_texture(&wgpu::TextureDescriptor {
+                            label,
+                            size: small_size,
+                            mip_level_count: 1,
+                            sample_count: 1,
+                            dimension: wgpu::TextureDimension::D2,
+                            format: wgpu::TextureFormat::Rgba8Unorm,
+                            usage,
+                            view_formats: &[wgpu::TextureFormat::Rgba8Unorm],
+                        });
+                        if let Some(err2) = pop_error_scope(oom2) {
+                            log::error!(
+                                "egui_wgpu: out of GPU memory allocating texture {label_str} ({width}x{height} -> {dw}x{dh}): {err2}"
+                            );
+                            return;
+                        }
+                        log::warn!(
+                            "egui_wgpu: GPU memory tight for {label_str} ({width}x{height}); uploaded downscaled {dw}x{dh}"
+                        );
+                        (t2, Some(down), dw, dh)
+                    } else {
+                        log::error!(
+                            "egui_wgpu: out of GPU memory allocating texture {label_str} ({width}x{height}): {err}"
+                        );
+                        return;
+                    }
+                } else {
+                    (t, None, width, height)
+                }
             };
+            if let Some(down) = upload_data {
+                let small_size = wgpu::Extent3d {
+                    width: upload_w,
+                    height: upload_h,
+                    depth_or_array_layers: 1,
+                };
+                let bind_group = {
+                    let sampler = self
+                        .samplers
+                        .entry(image_delta.options)
+                        .or_insert_with(|| create_sampler(image_delta.options, device));
+                    device.create_bind_group(&wgpu::BindGroupDescriptor {
+                        label,
+                        layout: &self.texture_bind_group_layout,
+                        entries: &[
+                            wgpu::BindGroupEntry {
+                                binding: 0,
+                                resource: wgpu::BindingResource::TextureView(
+                                    &texture.create_view(&wgpu::TextureViewDescriptor::default()),
+                                ),
+                            },
+                            wgpu::BindGroupEntry {
+                                binding: 1,
+                                resource: wgpu::BindingResource::Sampler(sampler),
+                            },
+                        ],
+                    })
+                };
+                queue.write_texture(
+                    wgpu::TexelCopyTextureInfo {
+                        texture: &texture,
+                        mip_level: 0,
+                        origin: wgpu::Origin3d::ZERO,
+                        aspect: wgpu::TextureAspect::All,
+                    },
+                    &down,
+                    wgpu::TexelCopyBufferLayout {
+                        offset: 0,
+                        bytes_per_row: Some(4 * upload_w),
+                        rows_per_image: Some(upload_h),
+                    },
+                    small_size,
+                );
+                self.textures.insert(
+                    id,
+                    Texture {
+                        texture: Some(texture),
+                        bind_group,
+                        options: Some(image_delta.options),
+                    },
+                );
+                return;
+            }
             let origin = wgpu::Origin3d::ZERO;
             (texture, origin, None)
         };
@@ -1123,10 +1236,26 @@ impl Renderer {
 
             let required_index_buffer_size = (core::mem::size_of::<u32>() * index_count) as u64;
             if self.index_buffer.capacity < required_index_buffer_size {
-                // Resize index buffer if needed.
-                self.index_buffer.capacity =
-                    (self.index_buffer.capacity * 2).at_least(required_index_buffer_size);
-                self.index_buffer.buffer = create_index_buffer(device, self.index_buffer.capacity);
+                // Resize index buffer if needed; guard against OOM so a failed
+                // resize never replaces a valid buffer with an invalid one.
+                let doubled = (self.index_buffer.capacity * 2).at_least(required_index_buffer_size);
+                let exact = required_index_buffer_size.next_multiple_of(wgpu::COPY_BUFFER_ALIGNMENT);
+                let resized = try_create_buffer(device, doubled, create_index_buffer)
+                    .or_else(|| (exact < doubled).then(|| try_create_buffer(device, exact, create_index_buffer)).flatten());
+                if let Some((cap, buf)) = resized {
+                    self.index_buffer.capacity = cap;
+                    self.index_buffer.buffer = buf;
+                } else {
+                    if !was_failing {
+                        log::error!(
+                            "egui_wgpu: out of GPU memory growing index buffer to {exact} bytes"
+                        );
+                    }
+                    self.upload_failed = true;
+                    self.index_buffer.slices.clear();
+                    self.vertex_buffer.slices.clear();
+                    return Vec::new();
+                }
             }
 
             let index_buffer_staging = queue.write_buffer_with(
@@ -1178,11 +1307,26 @@ impl Renderer {
             let required_vertex_buffer_size =
                 (core::mem::size_of::<Vertex>() * vertex_count) as u64;
             if self.vertex_buffer.capacity < required_vertex_buffer_size {
-                // Resize vertex buffer if needed.
-                self.vertex_buffer.capacity =
-                    (self.vertex_buffer.capacity * 2).at_least(required_vertex_buffer_size);
-                self.vertex_buffer.buffer =
-                    create_vertex_buffer(device, self.vertex_buffer.capacity);
+                // Resize vertex buffer if needed; guard against OOM so a failed
+                // resize never replaces a valid buffer with an invalid one.
+                let doubled = (self.vertex_buffer.capacity * 2).at_least(required_vertex_buffer_size);
+                let exact = required_vertex_buffer_size.next_multiple_of(wgpu::COPY_BUFFER_ALIGNMENT);
+                let resized = try_create_buffer(device, doubled, create_vertex_buffer)
+                    .or_else(|| (exact < doubled).then(|| try_create_buffer(device, exact, create_vertex_buffer)).flatten());
+                if let Some((cap, buf)) = resized {
+                    self.vertex_buffer.capacity = cap;
+                    self.vertex_buffer.buffer = buf;
+                } else {
+                    if !was_failing {
+                        log::error!(
+                            "egui_wgpu: out of GPU memory growing vertex buffer to {exact} bytes"
+                        );
+                    }
+                    self.upload_failed = true;
+                    self.index_buffer.slices.clear();
+                    self.vertex_buffer.slices.clear();
+                    return Vec::new();
+                }
             }
 
             let vertex_buffer_staging = queue.write_buffer_with(
@@ -1342,6 +1486,63 @@ impl ScissorRect {
     }
 }
 
+/// Synchronously poll a `wgpu::ErrorScopeGuard::pop()` future on native backends.
+fn pop_error_scope(scope: wgpu::ErrorScopeGuard) -> Option<wgpu::Error> {
+    let mut fut = std::pin::pin!(scope.pop());
+    let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+    loop {
+        if let std::task::Poll::Ready(v) = std::future::Future::poll(fut.as_mut(), &mut cx) {
+            return v;
+        }
+        std::thread::yield_now();
+    }
+}
+
+fn try_create_buffer(
+    device: &wgpu::Device,
+    size: u64,
+    make: fn(&wgpu::Device, u64) -> wgpu::Buffer,
+) -> Option<(u64, wgpu::Buffer)> {
+    let oom = device.push_error_scope(wgpu::ErrorFilter::OutOfMemory);
+    let buf = make(device, size);
+    pop_error_scope(oom).is_none().then_some((size, buf))
+}
+
+/// Box-filter downscale RGBA8 pixels by powers of two until both dimensions fit
+/// within `max_dim`, used as an OOM fallback so textures keep drawing.
+fn downsample_rgba8_to_max(data: &[u8], width: u32, height: u32, max_dim: u32) -> (u32, u32, Vec<u8>) {
+    let (mut cw, mut ch) = (width.max(1), height.max(1));
+    if data.len() != (cw as usize).saturating_mul(ch as usize).saturating_mul(4) {
+        return (cw, ch, data.to_vec());
+    }
+    let mut cur = data.to_vec();
+    while (cw > max_dim || ch > max_dim) && (cw > 1 || ch > 1) {
+        let (nw, nh) = ((cw / 2).max(1), (ch / 2).max(1));
+        let mut next = vec![0u8; (nw * nh * 4) as usize];
+        for y in 0..nh {
+            for x in 0..nw {
+                let mut acc = [0u32; 4];
+                for dy in 0..2 {
+                    let sy = (y * 2 + dy).min(ch - 1);
+                    for dx in 0..2 {
+                        let sx = (x * 2 + dx).min(cw - 1);
+                        let o = ((sy * cw + sx) * 4) as usize;
+                        for c in 0..4 {
+                            acc[c] += cur[o + c] as u32;
+                        }
+                    }
+                }
+                let o = ((y * nw + x) * 4) as usize;
+                for c in 0..4 {
+                    next[o + c] = ((acc[c] + 2) / 4) as u8;
+                }
+            }
+        }
+        (cw, ch, cur) = (nw, nh, next);
+    }
+    (cw, ch, cur)
+}
+
 // Look at the feature flag for an explanation.
 #[cfg(not(all(
     target_arch = "wasm32",
@@ -1351,4 +1552,13 @@ impl ScissorRect {
 fn renderer_impl_send_sync() {
     fn assert_send_sync<T: Send + Sync>() {}
     assert_send_sync::<Renderer>();
+}
+
+#[test]
+fn downsample_rgba8_to_max_reduces_large_textures() {
+    let data = vec![180u8; 256 * 128 * 4];
+    let (w, h, out) = downsample_rgba8_to_max(&data, 256, 128, 64);
+    assert_eq!((w, h), (64, 32));
+    assert_eq!(out.len(), 64 * 32 * 4);
+    assert!(out.iter().all(|&b| b == 180));
 }

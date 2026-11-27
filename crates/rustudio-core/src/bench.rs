@@ -390,6 +390,12 @@ pub fn take_sections() -> Vec<(&'static str, f64, u64)> {
     SECTIONS.with(|s| std::mem::take(&mut *s.borrow_mut()))
 }
 
+/// The current thread's section totals, left in place (a periodic report
+/// that takes its own differences, beside a bench that drains them).
+pub fn sections_snapshot() -> Vec<(&'static str, f64, u64)> {
+    SECTIONS.with(|s| s.borrow().clone())
+}
+
 /// CPU time this thread has used, in ms (not the time it waited for a core:
 /// on a busy machine frame times stretch, this much less so).
 fn thread_cpu_ms() -> f64 {

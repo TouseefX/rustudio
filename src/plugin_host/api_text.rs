@@ -190,11 +190,7 @@ pub fn call(lua: &Lua, class: &str, name: &str, _this: Ref, args: &MultiValue) -
             };
             let (fam, weight, italic) = match &font {
                 Some(f) => {
-                    let fam = if f.family.ends_with("/GothamSSm.json") {
-                        "rbxasset://fonts/families/Montserrat.json".to_string()
-                    } else {
-                        f.family.clone()
-                    };
+                    let fam = rustudio_engine::font_enum::drawn_family(&f.family);
                     let w = {
                         use rbx_dom_weak::types::FontWeight as W;
                         match f.weight {

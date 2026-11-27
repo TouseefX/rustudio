@@ -4,14 +4,23 @@
 //! the diagnostic log and the crash report.
 
 use egui_wgpu::wgpu;
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::OnceLock;
 
 static ADAPTER: OnceLock<String> = OnceLock::new();
 static LOST: OnceLock<String> = OnceLock::new();
+/// Set once any GPU allocation hits OutOfMemory (uncaptured or caught by a
+/// scoped fallback). Tells the renderer to step down heavy optional features
+/// (4× MSAA, HBAO, DoF, extra mip copies) and compact texture resolution so
+/// particles, beams, trails, world GUIs and `egui_wgpu` keep drawing.
+static OOM_SEEN: AtomicBool = AtomicBool::new(false);
+/// Monotonically bumped on every `OutOfMemory` event so texture/mip/target
+/// caches immediately reclaim optional VRAM instead of shutting down effects.
+static OOM_EPOCH: AtomicU64 = AtomicU64::new(0);
 /// The first GPU error nothing captured (out of memory, validation), for the
 /// editor's Output; taken once.
 static UNCAPTURED: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
-static UNCAPTURED_COUNT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+static UNCAPTURED_COUNT: AtomicUsize = AtomicUsize::new(0);
 
 fn describe(info: &wgpu::AdapterInfo) -> String {
     format!(
@@ -31,10 +40,14 @@ pub fn watch(adapter: &wgpu::Adapter, device: &wgpu::Device) {
     // took the whole editor down. Log it with what failed and keep going;
     // the resource that failed just doesn't draw.
     device.on_uncaptured_error(std::sync::Arc::new(|error: wgpu::Error| {
-        let n = UNCAPTURED_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let n = UNCAPTURED_COUNT.fetch_add(1, Ordering::Relaxed);
         let gpu = ADAPTER.get().map(String::as_str).unwrap_or("unknown GPU");
         let kind = match &error {
-            wgpu::Error::OutOfMemory { .. } => "out of GPU memory",
+            wgpu::Error::OutOfMemory { .. } => {
+                OOM_SEEN.store(true, Ordering::Relaxed);
+                OOM_EPOCH.fetch_add(1, Ordering::Relaxed);
+                "out of GPU memory"
+            }
             wgpu::Error::Validation { .. } => "GPU validation error",
             wgpu::Error::Internal { .. } => "internal GPU error",
         };
@@ -45,9 +58,13 @@ pub fn watch(adapter: &wgpu::Adapter, device: &wgpu::Device) {
         if n == 0 {
             let detail = error.to_string();
             let first = detail.lines().next().unwrap_or("").to_string();
-            *UNCAPTURED.lock().unwrap() = Some(format!(
-                "{kind} on {gpu}: {first}. Some parts or textures may not draw; the diagnostic log has the details."
-            ));
+            if let Ok(mut slot) = UNCAPTURED.lock() {
+                if slot.is_none() {
+                    *slot = Some(format!(
+                        "{kind} on {gpu}: {first}. Some parts or textures may not draw; the diagnostic log has the details."
+                    ));
+                }
+            }
         }
     }));
     device.set_device_lost_callback(|reason, message| {
@@ -59,6 +76,61 @@ pub fn watch(adapter: &wgpu::Adapter, device: &wgpu::Device) {
         log::error!(target: "rustudio::gpu", "{text}");
         let _ = LOST.set(text);
     });
+}
+
+/// True once any GPU allocation has reported `OutOfMemory`.
+/// Used to keep heavy optional features (4× MSAA, HBAO, DoF, extra mip copies)
+/// stepped down so VRAM does not bounce back into OOM — never to stop drawing
+/// particles, beams, trails, or world GUIs.
+pub fn oom_seen() -> bool {
+    OOM_SEEN.load(Ordering::Relaxed)
+}
+
+/// Incremented on every `OutOfMemory` event so caches immediately reclaim
+/// optional GPU memory (mip copies, unused GUI/FX textures, DoF targets).
+pub fn oom_epoch() -> u64 {
+    OOM_EPOCH.load(Ordering::Relaxed)
+}
+
+/// Record an `OutOfMemory` caught by a scoped allocation fallback so the
+/// renderer reclaims optional caches and compacts texture resolution instead
+/// of halting effects or producing black frames.
+pub fn mark_oom(label: &str, detail: &str) {
+    let first = !OOM_SEEN.swap(true, Ordering::Relaxed);
+    OOM_EPOCH.fetch_add(1, Ordering::Relaxed);
+    let gpu = ADAPTER.get().map(String::as_str).unwrap_or("unknown GPU");
+    if first {
+        log::warn!(target: "rustudio::gpu", "GPU memory tight while allocating {label} on {gpu}: {detail}");
+        if let Ok(mut slot) = UNCAPTURED.lock() {
+            if slot.is_none() {
+                *slot = Some(format!(
+                    "GPU memory tight on {gpu} ({label}): compacting textures and trimming optional caches to keep rendering."
+                ));
+            }
+        }
+    }
+}
+
+/// Log once when GUI/FX texture uploads reach their VRAM budget and begin
+/// LRU eviction / resolution compaction.
+pub fn warn_gui_budget(used_bytes: usize, budget_bytes: usize) {
+    log::warn!(
+        target: "rustudio::gpu",
+        "GUI/FX texture VRAM budget reached ({} / {} MiB); evicting unused textures and compacting resolution",
+        used_bytes >> 20,
+        budget_bytes >> 20,
+    );
+}
+
+/// Log when optional VRAM caches are purged to recover from memory pressure.
+pub fn note_vram_reclaimed(label: &str, bytes: usize) {
+    if bytes > 0 {
+        log::info!(
+            target: "rustudio::gpu",
+            "reclaimed {} KiB of GPU memory from {label}",
+            bytes >> 10,
+        );
+    }
 }
 
 /// The first uncaptured GPU error, once (for a warning in Output).
@@ -78,6 +150,21 @@ pub fn lost() -> Option<&'static str> {
 /// (world_gui.rs `stage`).
 pub fn mark_lost(text: String) {
     let _ = LOST.set(text);
+}
+
+/// `device.poll(kind)` unless the device is lost: wgpu makes a poll on a
+/// lost device a fatal error ("Error in Device::poll: Parent device is
+/// lost" — a panic, not a callback), and a frame's per-frame polls
+/// (gpu_timing.rs, clouds.rs, render.rs's upload flush) would end the
+/// process before the loss is handled in order (the Android build saves
+/// the open place and restarts, src/android gpu_watch; the desktop's
+/// `check` at the next frame's top). False when the poll was skipped.
+pub fn poll(device: &wgpu::Device, kind: wgpu::PollType) -> bool {
+    if lost().is_some() {
+        return false;
+    }
+    let _ = device.poll(kind);
+    true
 }
 
 /// Call at the top of a frame: once the device is lost nothing more can be

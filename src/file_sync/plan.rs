@@ -381,6 +381,8 @@ pub struct Applied {
     pub file: Option<PathBuf>,
     /// The instance, for scripts whose Source was set (live commits).
     pub source_set: Option<Ref>,
+    /// Local instances touched by this step (for attributing Team Create failures).
+    pub refs: Vec<Ref>,
     pub error: Option<String>,
 }
 
@@ -397,12 +399,14 @@ pub fn apply(doc: &mut Document, plan: Plan) -> Vec<Applied> {
                     Variant::String(s) if prop == "Source" => format!("Source ({} lines)", s.lines().count()),
                     _ => format!("set {prop}"),
                 };
-                out.push(Applied { path: tree::path(doc, r), what, file, source_set: source, error: None });
+                out.push(Applied { path: tree::path(doc, r), what, file, source_set: source, refs: vec![r], error: None });
                 sets.push((r, ustr(&prop), value));
             }
             Step::Create { parent, snap, replace, file } => {
                 let path = child_path(doc, parent, &snap.name);
+                let mut refs = Vec::new();
                 if let Some(old) = replace {
+                    refs.extend(doc.subtree(old));
                     doc.remove(&[old]);
                 }
                 let n = count(&snap);
@@ -411,15 +415,22 @@ pub fn apply(doc: &mut Document, plan: Plan) -> Vec<Applied> {
                     (false, 1) => format!("created {}", snap.class),
                     (false, n) => format!("created {} with {} inside", snap.class, n - 1),
                 };
-                let error = create(doc, parent, &snap).err();
-                out.push(Applied { path, what, file, source_set: None, error });
+                let error = match create(doc, parent, &snap) {
+                    Ok(r) => {
+                        refs.extend(doc.subtree(r));
+                        None
+                    }
+                    Err(e) => Some(e),
+                };
+                out.push(Applied { path, what, file, source_set: None, refs, error });
             }
             Step::Delete { r, why, file } => {
                 let path = tree::path(doc, r);
-                let n = doc.dom.descendants_of(r).count();
+                let refs = doc.subtree(r);
+                let n = refs.len();
                 let gone = doc.remove(&[r]);
                 let what = format!("deleted ({n} instance(s){})", if why == Why::Unknown { ", no file describes it" } else { ", its file is gone" });
-                out.push(Applied { path, what, file, source_set: None, error: (gone == 0).then(|| "it couldn't be deleted".into()) });
+                out.push(Applied { path, what, file, source_set: None, refs, error: (gone == 0).then(|| "it couldn't be deleted".into()) });
             }
         }
     }
@@ -450,6 +461,8 @@ pub enum Queued {
 pub struct LiveQueue {
     pub items: std::collections::VecDeque<Queued>,
     pub made: Vec<Option<Ref>>,
+    /// Instances touched by the latest batch (including non-top child creates).
+    pub touched: Vec<Ref>,
     /// Instances in the whole queue, and sent so far.
     pub total: usize,
     pub sent: usize,
@@ -458,7 +471,7 @@ pub struct LiveQueue {
 
 impl LiveQueue {
     pub fn new(plan: Plan) -> LiveQueue {
-        let mut q = LiveQueue { items: Default::default(), made: Vec::new(), total: 0, sent: 0, last: None };
+        let mut q = LiveQueue { items: Default::default(), made: Vec::new(), touched: Vec::new(), total: 0, sent: 0, last: None };
         // Sets first (the scripts already there), creates, deletes last.
         let mut later = Vec::new();
         for step in plan.steps {
@@ -517,15 +530,18 @@ impl LiveQueue {
                         Variant::String(s) if prop == "Source" => format!("Source ({} lines)", s.lines().count()),
                         _ => format!("set {prop}"),
                     };
-                    out.push(Applied { path: tree::path(doc, r), what, file, source_set: source, error: None });
+                    self.touched.push(r);
+                    out.push(Applied { path: tree::path(doc, r), what, file, source_set: source, refs: vec![r], error: None });
                     sets.push((r, ustr(&prop), value));
                 }
                 Queued::Delete { r, why, file } => {
                     let path = tree::path(doc, r);
-                    let n = doc.dom.descendants_of(r).count();
+                    let refs = doc.subtree(r);
+                    let n = refs.len();
+                    self.touched.extend(refs.iter().copied());
                     let gone = doc.remove(&[r]);
                     let what = format!("deleted ({n} instance(s){})", if why == Why::Unknown { ", no file describes it" } else { ", its file is gone" });
-                    out.push(Applied { path, what, file, source_set: None, error: (gone == 0).then(|| "it couldn't be deleted".into()) });
+                    out.push(Applied { path, what, file, source_set: None, refs, error: (gone == 0).then(|| "it couldn't be deleted".into()) });
                 }
                 Queued::Create { parent, slot, snap, replace, file, top } => {
                     let parent = match parent {
@@ -533,21 +549,25 @@ impl LiveQueue {
                         Target::Made(i) => self.made.get(i).copied().flatten(),
                     };
                     let Some(parent) = parent.filter(|p| doc.dom.get_by_ref(*p).is_some()) else {
-                        out.push(Applied { path: snap.name.clone(), what: "not created".into(), file, source_set: None, error: Some("its parent wasn't created".into()) });
+                        out.push(Applied { path: snap.name.clone(), what: "not created".into(), file, source_set: None, refs: Vec::new(), error: Some("its parent wasn't created".into()) });
                         continue;
                     };
                     let path = child_path(doc, parent, &snap.name);
+                    let mut refs = Vec::new();
                     if let Some(old) = replace {
+                        refs.extend(doc.subtree(old));
                         doc.remove(&[old]);
                     }
                     match create(doc, parent, &snap) {
                         Ok(r) => {
                             self.made[slot] = Some(r);
+                            refs.extend(doc.subtree(r));
+                            self.touched.extend(refs.iter().copied());
                             if top {
-                                out.push(Applied { path, what: format!("created {}", snap.class), file, source_set: None, error: None });
+                                out.push(Applied { path, what: format!("created {}", snap.class), file, source_set: None, refs, error: None });
                             }
                         }
-                        Err(e) => out.push(Applied { path, what: "not created".into(), file, source_set: None, error: Some(e) }),
+                        Err(e) => out.push(Applied { path, what: "not created".into(), file, source_set: None, refs, error: Some(e) }),
                     }
                 }
             }

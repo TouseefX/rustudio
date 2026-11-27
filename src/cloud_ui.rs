@@ -155,8 +155,50 @@ struct SaveJob {
     place: u64,
     vt: VersionType,
     from_dialog: bool,
+    is_save_as: bool,
     relink: bool,
+    source_place_name: String,
     origin: Option<CloudOrigin>,
+}
+
+/// Formats Studio's exact purple `MESSAGE_SYSTEM` Output line on a successful
+/// Save to Roblox / Publish to Roblox.
+fn format_cloud_save_message(
+    vt: VersionType,
+    place_name: &str,
+    game_name: &str,
+    is_save_as: bool,
+    still_editing: Option<&str>,
+) -> String {
+    let publish = vt == VersionType::Published;
+    if !is_save_as {
+        return if publish {
+            format!("Published new changes in \"{place_name}\" to Roblox.")
+        } else {
+            format!("Saved new changes in \"{place_name}\" to Roblox.")
+        };
+    }
+    let same_name = game_name.is_empty() || place_name == game_name;
+    match (publish, still_editing, same_name) {
+        (true, Some(editing), true) => format!("Published \"{place_name}\" to Roblox, but you are still editing \"{editing}\"."),
+        (true, Some(editing), false) => format!("Published \"{place_name}\" to \"{game_name}\" in Roblox, but you are still editing \"{editing}\"."),
+        (false, Some(editing), true) => format!("Saved \"{place_name}\" to Roblox, but you are still editing \"{editing}\"."),
+        (false, Some(editing), false) => format!("Saved \"{place_name}\" to \"{game_name}\" in Roblox, but you are still editing \"{editing}\"."),
+        (true, None, true) => format!("Published \"{place_name}\" to Roblox."),
+        (true, None, false) => format!("Published \"{place_name}\" to \"{game_name}\" in Roblox."),
+        (false, None, true) => format!("Saved \"{place_name}\" to Roblox."),
+        (false, None, false) => format!("Saved \"{place_name}\" to \"{game_name}\" in Roblox."),
+    }
+}
+
+/// Formats Studio's exact purple `MESSAGE_SYSTEM` Output line when a cloud
+/// publish or save fails.
+fn format_cloud_save_failed(vt: VersionType, place_name: &str) -> String {
+    if vt == VersionType::Published {
+        format!("{place_name} publish failed.")
+    } else {
+        format!("{place_name} save failed.")
+    }
 }
 
 struct LiveSave {
@@ -164,6 +206,13 @@ struct LiveSave {
     vt: VersionType,
     from_dialog: bool,
     sent: Option<std::time::Instant>,
+}
+
+/// One Team Create edit that did not reach the server.
+pub(crate) struct UnsyncedEdit {
+    pub(crate) reference: Option<rbx_types::Ref>,
+    pub(crate) path: Option<String>,
+    pub(crate) message: String,
 }
 
 struct LiveView {
@@ -192,14 +241,14 @@ struct LiveView {
     last_camera: Option<[f32; 5]>,
     /// What each referent sent this session is (by path), for reports.
     labels: HashMap<u64,String>,
-    /// Referents this session deleted: a later server op naming one means
-    /// the server did not apply the delete.
-    deleted: HashMap<u64,String>,
+    /// Referents this session deleted: `(local ref, path, log label)`. A later
+    /// server op naming one means the server did not apply the delete.
+    deleted: HashMap<u64, (rbx_types::Ref, String, String)>,
     /// Document edits queued, newest last: (when, what), for the report a
     /// disconnect gives of edits the server may not have applied.
     sent: std::collections::VecDeque<(std::time::Instant,String)>,
     /// Edits that were not sent at all this session.
-    unsynced: Vec<String>,
+    unsynced: Vec<UnsyncedEdit>,
     collaborators: HashSet<rbx_types::Ref>,
     players: HashMap<u64,u64>,
     selections: HashMap<u64,Vec<u64>>,
@@ -665,6 +714,9 @@ impl CloudUi {
             r
         });
         let snapshot = if encoded.is_none() { Some(doc.save_snapshot()) } else { None };
+        let avatar_type = (job.vt == VersionType::Published)
+            .then(|| doc.explicit_avatar_type())
+            .flatten();
         let cache = self.cache.clone();
         self.spawn(self.factory(client), move |api, tx| {
             let result = (|| {
@@ -692,6 +744,14 @@ impl CloudUi {
                     (origin, SaveOutcome::Saved { version })
                 };
                 if let SaveOutcome::Saved { version } = outcome {
+                    if let Some(av) = avatar_type {
+                        if let Err(err) = api.set_universe_avatar_type(origin.universe_id, av) {
+                            let _ = tx.send(Msg::Log(
+                                Level::Warn,
+                                format!("Place published, but could not update experience Avatar Type: {err}"),
+                            ));
+                        }
+                    }
                     origin.version = version;
                     let _ = cache.store(&origin, &bytes);
                     let _ = cache.remember(&origin);
@@ -1027,42 +1087,48 @@ impl Editor {
         crate::live_sync::renew_shared_script_guids(&mut self.game.doc, &live.model, marks);
         let session = &live.session;
         let plan = crate::live_sync::plan(&self.game.doc, &mut live.model, marks, &mut || session.allocate_id().map_err(|e| e.to_string()));
-        for message in plan.skipped {
+        for (reference, message) in plan.skipped {
+            let path = crate::live_sync::path(&self.game.doc, reference);
             self.warn(format!("Team Create: not synchronized: {message}"));
-            live.unsynced.push(message);
+            live.unsynced.push(UnsyncedEdit { reference: Some(reference), path: Some(path), message });
         }
-        for message in plan.unsynced {
+        for (reference, message) in plan.unsynced {
+            let path = crate::live_sync::path(&self.game.doc, reference);
             live.sync_failed = true;
             self.warn(format!("Team Create: not synchronized: {message}"));
-            live.unsynced.push(message);
+            live.unsynced.push(UnsyncedEdit { reference: Some(reference), path: Some(path), message });
         }
         for op in plan.ops {
-            let (label, result) = match op {
+            let (reference, path, label, result) = match op {
                 LiveOp::Create { reference, id, class, parent, props } => {
-                    let label = format!("created {}", crate::live_sync::path(&self.game.doc, reference));
+                    let path = crate::live_sync::path(&self.game.doc, reference);
+                    let label = format!("created {path}");
                     if let Some((_, rustudio_net::replicator::PropValue::String(source))) = props.iter().find(|(n, _)| n == "Source") {
                         let guid = self.game.doc.prop(reference, "ScriptGuid").and_then(|v| if let rbx_types::Variant::String(g) = v { Some(g) } else { None });
                         if let Err(error) = live.drafts.register(id, guid.as_deref(), source.clone()) { self.warn(error); }
                     }
-                    live.labels.insert(id, crate::live_sync::path(&self.game.doc, reference));
+                    live.labels.insert(id, path.clone());
                     log::info!("Team Create: {label} ({class} {id:#x} under {parent:#x})");
-                    (label, live.session.send_create(id, class, parent, props))
+                    (reference, path, label, live.session.send_create(id, class, parent, props))
                 }
                 LiveOp::Reparent { reference, id, parent } => {
-                    (format!("moved {}", crate::live_sync::path(&self.game.doc, reference)), live.session.send_reparent(id, parent))
+                    let path = crate::live_sync::path(&self.game.doc, reference);
+                    (reference, path.clone(), format!("moved {path}"), live.session.send_reparent(id, parent))
                 }
                 LiveOp::Property { reference, id, class, name, value } => {
-                    (format!("set {}.{name}", crate::live_sync::path(&self.game.doc, reference)), live.session.send_property(id, class, name, value))
+                    let path = crate::live_sync::path(&self.game.doc, reference);
+                    (reference, path.clone(), format!("set {path}.{name}"), live.session.send_property(id, class, name, value))
                 }
                 LiveOp::Source { id, text } => {
                     if let Err(error) = live.drafts.edit(id, text) { self.warn(error); }
                     continue;
                 }
                 LiveOp::Delete { reference, id } => {
-                    let label = format!("deleted {}", live.labels.get(&id).cloned().unwrap_or_else(|| crate::live_sync::path(&self.game.doc, reference)));
+                    let path = live.labels.get(&id).cloned().unwrap_or_else(|| crate::live_sync::path(&self.game.doc, reference));
+                    let label = format!("deleted {path}");
                     log::info!("Team Create: {label} ({id:#x})");
-                    live.deleted.insert(id, label.clone());
-                    (label, live.session.send_delete(id))
+                    live.deleted.insert(id, (reference, path.clone(), label.clone()));
+                    (reference, path, label, live.session.send_delete(id))
                 }
             };
             match result {
@@ -1070,7 +1136,7 @@ impl Editor {
                 Err(error) => {
                     live.sync_failed = true;
                     self.warn(format!("Team Create: {label} was not sent: {error}"));
-                    live.unsynced.push(label);
+                    live.unsynced.push(UnsyncedEdit { reference: Some(reference), path: Some(path), message: label });
                 }
             }
         }
@@ -1102,14 +1168,14 @@ impl Editor {
         };
         let mut message = String::from("Team Create disconnected. Your local copy still has every edit; the server may not.");
         if !live.unsynced.is_empty() {
-            let items: Vec<&String> = live.unsynced.iter().collect();
+            let items: Vec<&String> = live.unsynced.iter().map(|u| &u.message).collect();
             message += &format!("\n{} local edit(s) never reached the server:{}", items.len(), list(&items));
         }
         if !recent.is_empty() {
             message += &format!("\n{} edit(s) sent in the last {} s before the disconnect may not have been applied:{}", recent.len(), UNCONFIRMED_WINDOW.as_secs(), list(&recent));
         }
         message += "\nKeep a local copy (File > Save As), then reopen the live place and compare.";
-        for label in live.unsynced.iter().chain(recent.iter().copied()) { log::warn!("Team Create edit possibly not on the server (place={}): {label}", live.place); }
+        for label in live.unsynced.iter().map(|u| &u.message).chain(recent.iter().copied()) { log::warn!("Team Create edit possibly not on the server (place={}): {label}", live.place); }
         self.error(message);
     }
 
@@ -1141,7 +1207,11 @@ impl Editor {
                 // The journal overflowed: which edits were made is unknown.
                 rustudio_core::doc::Marks::All => {
                     live.sync_failed = true;
-                    live.unsynced.push("a burst of edits too large for the change journal".into());
+                    live.unsynced.push(UnsyncedEdit {
+                        reference: None,
+                        path: None,
+                        message: "a burst of edits too large for the change journal".into(),
+                    });
                     self.error("Team Create: too many edits at once to synchronize; keep a local copy and reopen the live place");
                 }
             }
@@ -1275,12 +1345,12 @@ impl Editor {
                             continue;
                         }
                         if let rustudio_net::replicator::RepOp::NewInstance { id, .. } | rustudio_net::replicator::RepOp::ChangeProperty { id, .. } | rustudio_net::replicator::RepOp::ChangeAttribute { id, .. } | rustudio_net::replicator::RepOp::Reparent { id, .. } = &op {
-                            if let Some(label) = live.deleted.remove(id) {
+                            if let Some((reference, path, label)) = live.deleted.remove(id) {
                                 let message = format!("{label}: the server still has it (it sent a change to it after the delete); delete it again or in Roblox Studio");
                                 log::warn!("Team Create (place={}): {message} ({id:#x})", live.place);
                                 self.error(format!("Team Create: {message}"));
                                 live.sync_failed = true;
-                                live.unsynced.push(message);
+                                live.unsynced.push(UnsyncedEdit { reference: Some(reference), path: Some(path), message });
                             }
                         }
                         if let rustudio_net::replicator::RepOp::Event {id,name,args} = &op {
@@ -1321,7 +1391,37 @@ impl Editor {
                                         self.cloud.last_saved = Some((version, save.vt));
                                     }
                                     self.game.doc.mark_saved_at(save.revision);
-                                    self.info(if save.vt == VersionType::Published { "Team Create server confirmed publication" } else { "Team Create server confirmed the save" });
+                                    let place_name = live.origin.as_ref().map(|o| o.name.as_str())
+                                        .or_else(|| self.game.doc.cloud.as_ref().map(|o| o.name.as_str()))
+                                        .filter(|s| !s.is_empty())
+                                        .unwrap_or_else(|| {
+                                            let t = self.game.doc.title.strip_suffix(" (Live)").unwrap_or(&self.game.doc.title);
+                                            if t.is_empty() { "Place" } else { t }
+                                        })
+                                        .to_string();
+                                    self.system(format_cloud_save_message(save.vt, &place_name, "", false, None));
+                                    if save.vt == VersionType::Published {
+                                        if let (Some(universe_id), Some(av)) = (
+                                            live.origin
+                                                .as_ref()
+                                                .map(|o| o.universe_id)
+                                                .or_else(|| self.game.doc.cloud.as_ref().map(|o| o.universe_id)),
+                                            self.game.doc.explicit_avatar_type(),
+                                        ) {
+                                            let client = self.game.account.shared_client();
+                                            self.cloud.spawn(self.cloud.factory(client), move |api, tx| {
+                                                if let Some(mut api) = api {
+                                                    api.session = api.session.with_timeout(std::time::Duration::from_secs(20));
+                                                    if let Err(err) = api.set_universe_avatar_type(universe_id, av) {
+                                                        let _ = tx.send(Msg::Log(
+                                                            Level::Warn,
+                                                            format!("Place published, but could not update experience Avatar Type: {err}"),
+                                                        ));
+                                                    }
+                                                }
+                                            });
+                                        }
+                                    }
                                     if save.from_dialog && self.cloud_upload_mode().is_some() {
                                         self.cloud.upload_result = Some(Ok(version));
                                     }
@@ -1472,14 +1572,20 @@ impl Editor {
                 }
                 LiveEvent::EditFailed { id, error } => {
                     live.sync_failed = true;
-                    let what = live.labels.get(&id).cloned().unwrap_or_else(|| format!("instance {id:#x}"));
+                    let reference = live.model.reference(id);
+                    let path = live.labels.get(&id).cloned()
+                        .or_else(|| reference.map(|r| crate::live_sync::path(&self.game.doc, r)));
+                    let what = path.clone().unwrap_or_else(|| format!("instance {id:#x}"));
                     self.error(format!("Team Create: {what} did not reach the server: {error}"));
-                    live.unsynced.push(format!("{what}: {error}"));
+                    live.unsynced.push(UnsyncedEdit { reference, path, message: format!("{what}: {error}") });
                 }
                 LiveEvent::PropertySkipped { id, name, reason } => {
-                    let what = live.labels.get(&id).cloned().unwrap_or_else(|| format!("instance {id:#x}"));
+                    let reference = live.model.reference(id);
+                    let path = live.labels.get(&id).cloned()
+                        .or_else(|| reference.map(|r| crate::live_sync::path(&self.game.doc, r)));
+                    let what = path.clone().unwrap_or_else(|| format!("instance {id:#x}"));
                     self.warn(format!("Team Create: {what} was created without {name}: {reason}"));
-                    live.unsynced.push(format!("{what}.{name}: {reason}"));
+                    live.unsynced.push(UnsyncedEdit { reference, path, message: format!("{what}.{name}: {reason}") });
                 }
                 LiveEvent::Notice(message) => self.warn(format!("Team Create: {message}")),
                 LiveEvent::Error(e) => {
@@ -1743,6 +1849,11 @@ impl Editor {
     fn fail_live_save(&mut self, live: &mut LiveView, error: impl Into<String>) {
         if let Some(save) = live.save_pending.take() {
             let error = error.into();
+            let place_name = live.origin.as_ref().map(|o| o.name.clone())
+                .or_else(|| self.game.doc.cloud.as_ref().map(|o| o.name.clone()))
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| format!("Place {}", live.place));
+            self.system(format_cloud_save_failed(save.vt, &place_name));
             self.error(error.clone());
             if save.from_dialog && self.cloud_upload_mode().is_some() {
                 self.cloud.upload_result = Some(Err(error));
@@ -1804,7 +1915,7 @@ impl Editor {
             return Err("Stop the play session before saving to Roblox".into());
         }
         if self.cloud_upload_pending() {
-            return Err("A Roblox upload is already in progress".into());
+            return Err("A Place Publish / Save is already in progress".into());
         }
         Ok(())
     }
@@ -1829,7 +1940,12 @@ impl Editor {
             if from_dialog {
                 self.cloud.upload_result = None;
             }
-            self.info("Requesting a save from the Team Create server…");
+            // MESSAGE_SYSTEM purple status line.
+            self.system(if vt == VersionType::Published {
+                "Sent message to server to publish."
+            } else {
+                "Saving to Roblox..."
+            });
             return Ok(());
         }
         let origin = self.game.doc.cloud.clone().ok_or("This place has no Roblox destination")?;
@@ -1844,7 +1960,20 @@ impl Editor {
         &mut self, universe: u64, place: u64, vt: VersionType, overwrite: bool, from_dialog: bool,
         origin: Option<CloudOrigin>,
     ) {
-        let relink = origin.is_none() && self.live_team_create_ids().is_none();
+        let is_save_as = origin.is_none();
+        let relink = is_save_as && self.live_team_create_ids().is_none();
+        let source_place_name = self.cloud.live.as_ref()
+            .filter(|live| live.document_id == Some(self.game.doc.id))
+            .and_then(|live| live.origin.as_ref().map(|o| o.name.clone()))
+            .or_else(|| self.game.doc.cloud.as_ref().map(|o| o.name.clone()))
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| {
+                self.game.doc.title
+                    .strip_suffix(" (Live)")
+                    .or_else(|| self.game.doc.title.strip_suffix(" (local copy)"))
+                    .unwrap_or(&self.game.doc.title)
+                    .to_string()
+            });
         let job = SaveJob {
             document: self.game.doc.id,
             revision: self.game.doc.revision,
@@ -1852,23 +1981,45 @@ impl Editor {
             place,
             vt,
             from_dialog,
+            is_save_as,
             relink,
+            source_place_name,
             origin,
         };
         if from_dialog {
             self.cloud.upload_result = None;
         }
+        // MESSAGE_SYSTEM purple status line.
+        self.system("Saving to Roblox...");
         self.cloud.start_save(self.game.account.shared_client(), &self.game.doc, job, overwrite);
     }
 
     fn finish_cloud_save(&mut self, job: SaveJob, result: Result<SaveOutcome, String>) {
         self.cloud.save_pending = false;
         let current = self.game.doc.id == job.document;
-        let action = if job.vt == VersionType::Published { "Published" } else { "Saved" };
+        let place_name = job.origin.as_ref()
+            .map(|o| o.name.as_str())
+            .filter(|s| !s.is_empty())
+            .or_else(|| (!job.is_save_as && !job.source_place_name.is_empty()).then_some(job.source_place_name.as_str()))
+            .map(str::to_string)
+            .unwrap_or_else(|| format!("Place {}", job.place));
+        let game_name = job.origin.as_ref()
+            .map(|o| o.experience.as_str())
+            .unwrap_or("")
+            .to_string();
         match result {
             Ok(SaveOutcome::Saved { version }) => {
                 self.cloud.last_saved = Some((version, job.vt));
-                self.info(format!("{action} to Roblox: version {version} of place {}", job.place));
+                let moved = current && job.relink && self.live_team_create_ids().is_none() && job.origin.is_some();
+                let still_editing = (job.is_save_as && !moved && !job.source_place_name.is_empty())
+                    .then_some(job.source_place_name.as_str());
+                self.system(format_cloud_save_message(
+                    job.vt,
+                    &place_name,
+                    &game_name,
+                    job.is_save_as,
+                    still_editing,
+                ));
                 if current {
                     if job.relink && self.live_team_create_ids().is_none() {
                         if let Some(origin) = job.origin {
@@ -1900,7 +2051,13 @@ impl Editor {
                 }
             }
             Err(error) => {
-                self.error(format!("Roblox upload to place {} failed: {error}", job.place));
+                // MESSAGE_SYSTEM purple failure line, followed by the detailed error reason.
+                self.system(format_cloud_save_failed(job.vt, &place_name));
+                if job.vt == VersionType::Published {
+                    self.error(format!("Error while publishing: {error}"));
+                } else {
+                    self.error(error.clone());
+                }
                 if current {
                     if job.from_dialog && self.cloud_upload_mode().is_some() {
                         self.cloud.upload_result = Some(Err(error));
@@ -3051,6 +3208,59 @@ mod saved_terrain_tests {
         assert_eq!(saved.grass_length, Some(0.3));
         assert_eq!(saved.decoration, Some(true));
         assert_eq!(saved.use_2022_materials, Some(true));
+    }
+
+    #[test]
+    fn studio_publish_and_save_output_lines() {
+        use rustudio_account::VersionType as VT;
+        assert_eq!(
+            super::format_cloud_save_message(VT::Published, "Lobby", "MyGame", false, None),
+            "Published new changes in \"Lobby\" to Roblox."
+        );
+        assert_eq!(
+            super::format_cloud_save_message(VT::Saved, "Lobby", "MyGame", false, None),
+            "Saved new changes in \"Lobby\" to Roblox."
+        );
+        assert_eq!(
+            super::format_cloud_save_message(VT::Published, "MyGame", "MyGame", true, None),
+            "Published \"MyGame\" to Roblox."
+        );
+        assert_eq!(
+            super::format_cloud_save_message(VT::Published, "Lobby", "MyGame", true, None),
+            "Published \"Lobby\" to \"MyGame\" in Roblox."
+        );
+        assert_eq!(
+            super::format_cloud_save_message(VT::Saved, "MyGame", "MyGame", true, None),
+            "Saved \"MyGame\" to Roblox."
+        );
+        assert_eq!(
+            super::format_cloud_save_message(VT::Saved, "Lobby", "MyGame", true, None),
+            "Saved \"Lobby\" to \"MyGame\" in Roblox."
+        );
+        assert_eq!(
+            super::format_cloud_save_message(VT::Published, "Target", "Target", true, Some("Current")),
+            "Published \"Target\" to Roblox, but you are still editing \"Current\"."
+        );
+        assert_eq!(
+            super::format_cloud_save_message(VT::Published, "Target", "Game", true, Some("Current")),
+            "Published \"Target\" to \"Game\" in Roblox, but you are still editing \"Current\"."
+        );
+        assert_eq!(
+            super::format_cloud_save_message(VT::Saved, "Target", "Target", true, Some("Current")),
+            "Saved \"Target\" to Roblox, but you are still editing \"Current\"."
+        );
+        assert_eq!(
+            super::format_cloud_save_message(VT::Saved, "Target", "Game", true, Some("Current")),
+            "Saved \"Target\" to \"Game\" in Roblox, but you are still editing \"Current\"."
+        );
+        assert_eq!(
+            super::format_cloud_save_failed(VT::Published, "Lobby"),
+            "Lobby publish failed."
+        );
+        assert_eq!(
+            super::format_cloud_save_failed(VT::Saved, "Lobby"),
+            "Lobby save failed."
+        );
     }
 }
 

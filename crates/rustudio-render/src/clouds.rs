@@ -75,11 +75,15 @@ fn child_of_class(d: &Document, parent: rbx_dom_weak::types::Ref, class: &str) -
     d.dom.get_by_ref(parent)?.children().iter().copied().find(|r| d.class_of(*r).is_some_and(|c| c == class))
 }
 
-/// The place's active clouds (Workspace.Terrain's Clouds, Enabled).
+fn last_child_of_class(d: &Document, parent: rbx_dom_weak::types::Ref, class: &str) -> Option<rbx_dom_weak::types::Ref> {
+    d.dom.get_by_ref(parent)?.children().iter().rev().copied().find(|r| d.class_of(*r).is_some_and(|c| c == class))
+}
+
+/// The place's active clouds (Workspace.Terrain's newest Clouds, Enabled).
 pub fn look(d: &Document) -> Option<CloudsLook> {
     let ws = d.workspace()?;
     let terrain = child_of_class(d, ws, "Terrain")?;
-    let c = child_of_class(d, terrain, "Clouds")?;
+    let c = last_child_of_class(d, terrain, "Clouds")?;
     if matches!(d.prop(c, "Enabled"), Some(Variant::Bool(false))) {
         return None;
     }
@@ -534,7 +538,9 @@ impl CloudsGpu {
     /// The sun cover read back (if it has arrived), smoothed by dt.
     fn update_cover(&mut self, device: &wgpu::Device, dt: f32) {
         if self.readback == 2 {
-            let _ = device.poll(wgpu::PollType::Poll);
+            if !crate::gpu_health::poll(device, wgpu::PollType::Poll) {
+                return;
+            }
             match self.mapped.load(Ordering::Acquire) {
                 1 => {
                     let byte = self.cover_buf.slice(..).get_mapped_range().ok().map(|d| d[0]);

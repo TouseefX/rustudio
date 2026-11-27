@@ -123,7 +123,7 @@ impl Bridge {
                     "protocolVersion": version,
                     "capabilities": { "tools": { "listChanged": false } },
                     "serverInfo": { "name": "rustudio", "title": "RuStudio", "version": env!("CARGO_PKG_VERSION") },
-                    "instructions": "Drives open RuStudio windows (a native Roblox Studio) live: the place tree, properties, scripts, Luau in edit / Play, Output, screenshots, Play / Stop, place files and Team Create. Calls go to one window: rustudio_windows lists them, rustudio_use_window picks one (else the only / most recent). Paths are GetFullName paths. On a live Team Create place writes reach every collaborator; script edits become drafts (team_create_commit_drafts, then team_create_wait).",
+                    "instructions": "Drives open RuStudio windows (a native Roblox Studio) live: the place tree, properties, scripts, Luau in edit / Play, Output, screenshots, MicroProfiler & Luau script profiling, Play / Stop, place files, asset uploading and Team Create. Calls go to one window: rustudio_windows lists them, rustudio_use_window picks one (else the only / most recent). Paths are GetFullName paths. On a live Team Create place writes reach every collaborator; script edits become drafts (team_create_commit_drafts, then team_create_wait).",
                 }))
             }
             "ping" => result(&id, json!({})),

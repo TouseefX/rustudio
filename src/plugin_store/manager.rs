@@ -126,6 +126,9 @@ impl PluginManager {
     fn info(&mut self, t: impl Into<String>) {
         self.lines.push(Line { level: watcher::Level::Info, text: t.into() });
     }
+    fn system(&mut self, t: impl Into<String>) {
+        self.lines.push(Line { level: watcher::Level::System, text: t.into() });
+    }
     fn error(&mut self, t: impl Into<String>) {
         self.lines.push(Line { level: watcher::Level::Error, text: t.into() });
     }
@@ -529,8 +532,8 @@ impl PluginManager {
             Msg::Published { result, overwrite, name } => {
                 self.publishing = false;
                 match &result {
-                    Ok(id) if overwrite.is_some() => self.info(format!("Published a new version of plugin {name} ({id})")),
-                    Ok(id) => self.info(format!("Published plugin {name} as asset {id}")),
+                    Ok(id) if overwrite.is_some() => self.system(format!("Published a new version of plugin \"{name}\" ({id}) to Roblox.")),
+                    Ok(id) => self.system(format!("Published plugin \"{name}\" as asset {id} to Roblox.")),
                     Err(f) => self.error(format!("Publish as Plugin failed: {}", f.describe())),
                 }
                 self.published.push((name, result.map_err(|f| f.describe())));
@@ -557,7 +560,7 @@ impl PluginManager {
             let r = if self.runtime.loaded().contains(&p.id) { self.runtime.reload(&p) } else { self.runtime.load(&p) };
             r.map_err(|e| format!("saved, but it failed to load: {e}"))?;
         }
-        self.info(format!("Saved local plugin {} ({})", p.name, path.display()));
+        self.system(format!("Saved to '{}'", path.display()));
         Ok(p)
     }
 }

@@ -38,14 +38,16 @@ pub(crate) fn wait_for_operation<E>(
     };
     let mut operation = parse(initial)?;
     let mut poll_url = None;
-    for attempt in 0..=60 {
+    let poll_delays_ms: &[u64] = &[100, 150, 200, 300, 500, 750];
+    let deadline = std::time::Instant::now() + Duration::from_secs(60);
+    for attempt in 0..=80 {
         if let Some(failure) = operation.get("error").filter(|v| !v.is_null()) {
             return Err(error(format!("Upload operation failed: {failure}")));
         }
         if operation.get("done").and_then(Value::as_bool) == Some(true) {
             return Ok(operation);
         }
-        if attempt == 60 {
+        if attempt == 80 || std::time::Instant::now() >= deadline {
             break;
         }
         if poll_url.is_none() {
@@ -73,11 +75,12 @@ pub(crate) fn wait_for_operation<E>(
             }
             poll_url = Some(format!("{operations_url}/{id}"));
         }
-        std::thread::sleep(Duration::from_secs(1));
+        let delay = Duration::from_millis(*poll_delays_ms.get(attempt).unwrap_or(&1000));
+        std::thread::sleep(delay);
         operation = parse(&fetch(poll_url.as_deref().unwrap())?)?;
     }
     Err(error(
-        "Upload operation did not finish after 60 polls".into(),
+        "Upload operation did not finish within 60 seconds".into(),
     ))
 }
 
@@ -114,9 +117,36 @@ pub(crate) fn multipart_upload<E>(
     error: impl Fn(String) -> E,
     check_reply: impl Fn(u16, String) -> Result<String, E>,
 ) -> Result<String, E> {
+    multipart_upload_chunks(
+        session,
+        apis,
+        method,
+        start_url,
+        asset,
+        content_type,
+        bytes,
+        MULTIPART_CHUNK,
+        error,
+        check_reply,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn multipart_upload_chunks<E>(
+    session: &crate::session::Session,
+    apis: &str,
+    method: &str,
+    start_url: &str,
+    asset: &Value,
+    content_type: &str,
+    bytes: &[u8],
+    chunk_size: usize,
+    error: impl Fn(String) -> E,
+    check_reply: impl Fn(u16, String) -> Result<String, E>,
+) -> Result<String, E> {
     use md5::{Digest, Md5};
     let md5: String = Md5::digest(bytes).iter().map(|b| format!("{b:02x}")).collect();
-    let plan: Vec<usize> = bytes.chunks(MULTIPART_CHUNK).map(<[u8]>::len).collect();
+    let plan: Vec<usize> = bytes.chunks(chunk_size.max(1)).map(<[u8]>::len).collect();
     let start = serde_json::json!({
         "asset": asset,
         "file": {
@@ -171,7 +201,7 @@ pub(crate) fn multipart_upload<E>(
         let url = part
             .get("url")
             .and_then(Value::as_str)
-            .filter(|u| u.starts_with("https://"))
+            .filter(|u| allowed_storage_url(u))
             .ok_or_else(|| error(format!("Multipart chunk {chunk} has no https upload URL")))?;
         let verb = part.get("httpVerb").and_then(Value::as_str).unwrap_or("PUT");
         if verb != "PUT" {
@@ -194,4 +224,15 @@ pub(crate) fn multipart_upload<E>(
         call("POST", &format!("{base}:multipartUploadChunkComplete"), done.to_string().as_bytes())?;
     }
     call("POST", &format!("{base}:multipartUploadComplete"), b"{}")
+}
+
+fn allowed_storage_url(u: &str) -> bool {
+    if u.starts_with("https://") {
+        return true;
+    }
+    #[cfg(test)]
+    if u.starts_with("http://127.0.0.1:") || u.starts_with("http://localhost:") {
+        return true;
+    }
+    false
 }

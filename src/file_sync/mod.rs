@@ -43,7 +43,7 @@ pub mod ui;
 
 use std::collections::{HashSet, VecDeque};
 use std::path::{Path, PathBuf};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use rbx_dom_weak::types::{Ref, Variant};
 use rustudio_core::doc::{self, Mark, Marks};
@@ -59,6 +59,9 @@ use settings::{FileSyncSettings, Initial, LogLevel, Prompts};
 const LOG_KEEP: usize = 500;
 /// A live script commit the server hasn't answered in this long is reported.
 const COMMIT_TIMEOUT_S: f32 = 60.0;
+/// How long after the last File Sync apply (with no queue or pending commits)
+/// to still watch for async Team Create failures on instances File Sync touched.
+const LIVE_UNSYNCED_GRACE: Duration = Duration::from_secs(3);
 
 pub struct LogEntry {
     pub id: u64,
@@ -186,12 +189,45 @@ pub struct FileSync {
     auto_done: Option<u64>,
     /// RUSTUDIO_FILE_SYNC_ATTACH=<project>[#mode]: attached once (tests).
     env_attach: Option<(PathBuf, Initial)>,
-    /// Team Create edits not sent, when File Sync last applied.
-    live_unsynced: Option<usize>,
+    /// Team Create unsynced edits scoped to instances File Sync touched.
+    live_watch: Option<LiveWatch>,
     /// The one confirmation for "Never" in a live place, while it shows.
     pub never_confirm: Option<NeverConfirm>,
     /// A live apply going out in batches.
     pub queue: Option<plan::LiveQueue>,
+}
+
+/// Tracks the instances a live File Sync apply touched so unrelated Team Create
+/// failures (e.g. a plugin writing a non-replicated property) aren't blamed on
+/// File Sync.
+struct LiveWatch {
+    cursor: usize,
+    refs: HashSet<Ref>,
+    paths: HashSet<String>,
+    last_apply: Instant,
+}
+
+fn unsynced_belongs_to_file_sync(
+    reference: Option<Ref>,
+    path: Option<&str>,
+    touched_refs: &HashSet<Ref>,
+    touched_paths: &HashSet<String>,
+) -> bool {
+    if reference.is_none() && path.is_none() {
+        return true;
+    }
+    if reference.is_some_and(|r| touched_refs.contains(&r)) {
+        return true;
+    }
+    if let Some(p) = path {
+        if touched_paths
+            .iter()
+            .any(|tp| p == tp || (p.len() > tp.len() && p.starts_with(tp) && p.as_bytes()[tp.len()] == b'.'))
+        {
+            return true;
+        }
+    }
+    false
 }
 
 /// "Live place: changes will be sent to the server without asking."
@@ -223,7 +259,7 @@ impl Default for FileSync {
             remember: true,
             auto_done: None,
             env_attach: None,
-            live_unsynced: None,
+            live_watch: None,
             never_confirm: None,
             queue: None,
         }
@@ -443,6 +479,7 @@ impl Editor {
         }
         let waiting = self.file_sync.commits.len();
         self.file_sync.commits.clear();
+        self.file_sync.live_watch = None;
         if forget {
             if let Some(k) = &a.place_key {
                 self.file_sync.settings.remember(k, None);
@@ -534,7 +571,19 @@ impl Editor {
     fn file_sync_apply(&mut self, p: plan::Plan) {
         let live = self.file_sync_live();
         if live {
-            self.file_sync.live_unsynced = self.mcp_live_activity().map(|a| a.unsynced);
+            if let Some(a) = self.mcp_live_activity() {
+                match self.file_sync.live_watch.as_mut() {
+                    Some(w) => w.last_apply = Instant::now(),
+                    None => {
+                        self.file_sync.live_watch = Some(LiveWatch {
+                            cursor: a.unsynced,
+                            refs: HashSet::new(),
+                            paths: HashSet::new(),
+                            last_apply: Instant::now(),
+                        });
+                    }
+                }
+            }
             let batch = self.file_sync.settings.live_batch;
             let instances: usize = p.steps.iter().map(|s| if let plan::Step::Create { snap, .. } = s { crate::mcp::project_apply::count(snap) } else { 1 }).sum();
             if batch > 0 && instances > batch {
@@ -555,6 +604,11 @@ impl Editor {
         let Some(mut q) = self.file_sync.queue.take() else { return };
         let budget = self.file_sync.settings.live_batch.max(1);
         let results = q.apply_batch(&mut self.game.doc, budget);
+        let touched = std::mem::take(&mut q.touched);
+        if let Some(w) = self.file_sync.live_watch.as_mut() {
+            w.refs.extend(touched);
+            w.last_apply = Instant::now();
+        }
         let n = results.len();
         let done = q.is_done();
         let (sent, total) = (q.sent, q.total);
@@ -582,6 +636,11 @@ impl Editor {
                 None => {
                     let id = self.file_sync_log(LogLevel::Info, format!("{}: {}", r.path, r.what), file);
                     if live {
+                        if let Some(w) = self.file_sync.live_watch.as_mut() {
+                            w.refs.extend(r.refs.iter().copied());
+                            w.paths.insert(r.path.clone());
+                            w.last_apply = Instant::now();
+                        }
                         match r.source_set {
                             Some(s) => {
                                 self.file_sync.set_status(id, "draft: committing to the server…", None);
@@ -670,6 +729,7 @@ impl Editor {
                 self.file_sync.never_confirm = None;
                 self.file_sync.pending = None;
                 self.file_sync.commits.clear();
+                self.file_sync.live_watch = None;
                 self.file_sync_log(LogLevel::Info, format!("{label} closed: detached"), None);
             }
         }
@@ -826,12 +886,23 @@ impl Editor {
     /// the server confirms; a conflict waits for the person.
     fn file_sync_commits(&mut self) {
         if self.file_sync.commits.is_empty() {
-            if let (Some(before), Some(now)) = (self.file_sync.live_unsynced, self.mcp_live_activity().map(|a| a.unsynced)) {
-                if now > before {
-                    self.file_sync.live_unsynced = Some(now);
-                    let msg = format!("{} edit(s) could not be sent to the Team Create server (the Output says which)", now - before);
-                    self.file_sync.error = Some(msg.clone());
-                    self.file_sync_log(LogLevel::Error, msg, None);
+            if self.file_sync.queue.is_none() {
+                if let Some(mut watch) = self.file_sync.live_watch.take() {
+                    if let Some((total, items)) = self.live_unsynced_since(watch.cursor) {
+                        watch.cursor = total;
+                        let mine = items
+                            .iter()
+                            .filter(|(r, p)| unsynced_belongs_to_file_sync(*r, p.as_deref(), &watch.refs, &watch.paths))
+                            .count();
+                        if mine > 0 {
+                            let msg = format!("{mine} edit(s) could not be sent to the Team Create server (the Output says which)");
+                            self.file_sync.error = Some(msg.clone());
+                            self.file_sync_log(LogLevel::Error, msg, None);
+                        }
+                        if watch.last_apply.elapsed() < LIVE_UNSYNCED_GRACE {
+                            self.file_sync.live_watch = Some(watch);
+                        }
+                    }
                 }
             }
             return;
@@ -949,5 +1020,32 @@ impl Editor {
                 Err(e) => self.file_sync_log(LogLevel::Error, format!("couldn't open {}: {e}", f.display()), rel),
             };
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn unrelated_live_failures_are_not_attributed_to_file_sync() {
+        let synced_ref = Ref::new();
+        let other_ref = Ref::new();
+        let refs = HashSet::from([synced_ref]);
+        let paths = HashSet::from([
+            "ReplicatedStorage.Shared.Rules".to_string(),
+            "ServerScriptService.Server.Game.Combat".to_string(),
+        ]);
+
+        // Unrelated StarterGui failure (e.g. plugin edit) is ignored.
+        assert!(!unsynced_belongs_to_file_sync(Some(other_ref), Some("StarterGui"), &refs, &paths));
+        // Similar path prefix without a dot boundary is ignored.
+        assert!(!unsynced_belongs_to_file_sync(Some(other_ref), Some("ReplicatedStorage.Shared.Rules2"), &refs, &paths));
+
+        // Direct ref match, exact path match, child path match, and global overflow match.
+        assert!(unsynced_belongs_to_file_sync(Some(synced_ref), None, &refs, &paths));
+        assert!(unsynced_belongs_to_file_sync(None, Some("ServerScriptService.Server.Game.Combat"), &refs, &paths));
+        assert!(unsynced_belongs_to_file_sync(None, Some("ReplicatedStorage.Shared.Rules.TombChamber"), &refs, &paths));
+        assert!(unsynced_belongs_to_file_sync(None, None, &refs, &paths));
     }
 }

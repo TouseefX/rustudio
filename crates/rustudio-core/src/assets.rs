@@ -302,7 +302,16 @@ fn normalize_rbxasset(rest: &str) -> String {
 
 fn legacy_lookup(table: &HashMap<String, u64>, rest: &str) -> Option<u64> {
     let key = normalize_rbxasset(rest).to_ascii_lowercase();
-    table.get(&key).copied()
+    if let Some(id) = table.get(&key) {
+        return Some(*id);
+    }
+    // Old sounds were renamed to .mp3 when they left content/: Studio keeps
+    // the .wav / .ogg names beside the table (`rbxasset://sounds/swordlunge.wav`,
+    // the classic sword's lunge) and plays the .mp3's asset (911864442,
+    // TimeLength 0.7837 in Studio 0.748, the same as that asset's length).
+    let stem = key.strip_prefix("sounds/")?;
+    let stem = stem.strip_suffix(".wav").or_else(|| stem.strip_suffix(".ogg"))?;
+    table.get(&format!("sounds/{stem}.mp3")).copied()
 }
 
 /// A local file for a non-cloud content id.
@@ -2055,6 +2064,12 @@ pub struct LoadedTexture {
 /// Released pixels kept around for the next composite that shares them.
 const LOOSE_PIXELS_BYTES: usize = 192 << 20;
 
+/// Maximum background decodes in flight + waiting to upload at once.
+/// Prevents large place loads (thousands of textures) from flooding the
+/// decode channel, blowing past `WAITING_LIMIT`'s 15 s timeout, spiking host
+/// RAM by 1+ GiB, and thrashing expired decode results in a loop.
+const MAX_INFLIGHT_DECODES: usize = 32;
+
 #[derive(Default)]
 pub struct TextureCache {
     entries: HashMap<String, Option<LoadedTexture>>,
@@ -2155,6 +2170,10 @@ impl TextureCache {
                 // workers (the part waits and is redone on arrival).
                 Fetch::Ready(bytes) if bytes.len() <= 16 * 1024 || sync_decode() => Some(texture::decode(&bytes).map(|i| (i, None, None))),
                 Fetch::Ready(bytes) => {
+                    if self.decoding.len() + self.decoded.len() >= MAX_INFLIGHT_DECODES {
+                        self.deferred = true;
+                        return None;
+                    }
                     let (tx, _) = self.decode_chan.get_or_insert_with(std::sync::mpsc::channel);
                     texture::decode_async(bytes, tx.clone(), id.to_string());
                     self.decoding.insert(id.to_string());
@@ -2282,6 +2301,14 @@ impl TextureCache {
         self.deferred = true;
     }
 
+    /// Keep an already-decoded entry alive when a composite skips fetching it
+    /// for this frame due to the upload budget.
+    pub fn touch_decoded(&mut self, id: &str) {
+        if let Some((_, frame)) = self.decoded.get_mut(id) {
+            *frame = self.decode_frame;
+        }
+    }
+
     /// Account for a composite's GPU upload against this frame's upload budget.
     pub fn record_upload(&mut self, bytes: usize, ms: f32) {
         self.upload_bytes += bytes;
@@ -2328,6 +2355,10 @@ impl TextureCache {
                     texture::decode(&bytes).map(|i| (i, None, None))
                 }
                 Fetch::Ready(bytes) => {
+                    if self.decoding.len() + self.decoded.len() >= MAX_INFLIGHT_DECODES {
+                        self.deferred = true;
+                        return None;
+                    }
                     let (tx, _) = self.decode_chan.get_or_insert_with(std::sync::mpsc::channel);
                     texture::decode_async(bytes, tx.clone(), id.to_string());
                     self.decoding.insert(id.to_string());
@@ -2428,6 +2459,9 @@ impl TextureCache {
             return true;
         }
         if self.decoding.contains(id) {
+            return false;
+        }
+        if self.decoding.len() + self.decoded.len() >= MAX_INFLIGHT_DECODES {
             return false;
         }
         !asset_ref(id).is_some_and(|a| store.pending.contains(&a))
@@ -3448,6 +3482,21 @@ mod tests {
     }
 
     #[test]
+    fn inflight_decode_cap_prioritizes_ready_results() {
+        let mut cache = TextureCache::default();
+        let store = AssetStore::default();
+        for i in 0..MAX_INFLIGHT_DECODES {
+            cache.decoded.insert(format!("rbxassetid://100{i}"), (Err("fixture".into()), 0));
+        }
+        // Already-decoded ids can still progress so the queue drains.
+        assert!(cache.can_progress("rbxassetid://1000", &store));
+        // Unstarted ids wait until an inflight/decoded slot frees up.
+        assert!(!cache.can_progress("rbxassetid://999999", &store));
+        cache.decoded.remove("rbxassetid://1000");
+        assert!(cache.can_progress("rbxassetid://999999", &store));
+    }
+
+    #[test]
     fn upload_budget_parse() {
         assert_eq!(parse_upload_budget(None), UPLOAD_BUDGET_BYTES);
         assert_eq!(parse_upload_budget(Some("x")), UPLOAD_BUDGET_BYTES);
@@ -3507,6 +3556,16 @@ mod tests {
         assert_eq!(id("rbxasset://textures/SwordTexture.png"), Some(12224218));
         assert_eq!(id("rbxasset://textures/rocketlaunchertex.png"), Some(12224070));
         assert_eq!(id("rbxasset://fonts/clonewand.mesh"), Some(12221344));
+        // Old .wav / .ogg sound names play the renamed .mp3's asset (Studio
+        // 0.748: `rbxasset://sounds/swordlunge.wav` loads, TimeLength 0.7837 =
+        // asset 911864442's length).
+        assert_eq!(id("rbxasset://sounds/swordlunge.wav"), Some(911864442));
+        assert_eq!(id("rbxasset://sounds/swordlunge.mp3"), Some(911864442));
+        assert_eq!(id("rbxasset://sounds/Unsheath.WAV"), Some(911865819));
+        assert_eq!(id("rbxasset://sounds/grass.ogg"), Some(911780223));
+        assert_eq!(asset_ref("rbxasset://sounds/swordslash.wav").map(|a| a.id), Some(911865258));
+        assert_eq!(id("rbxasset://sounds/nosuchsound.wav"), None);
+        assert_eq!(id("rbxasset://textures/swordlunge.wav"), None);
         // A file the content folder has is not mapped.
         let _ = std::fs::create_dir_all(empty.join("fonts"));
         let _ = std::fs::write(empty.join("fonts/sword.mesh"), b"x");

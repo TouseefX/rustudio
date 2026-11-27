@@ -124,8 +124,8 @@ pub fn tick(doing: &str, detail: impl FnOnce() -> String) {
             if doing.is_empty() { String::new() } else { format!(", {doing}") }
         );
     }
-    let mut w = WATCH.lock().unwrap_or_else(|e| e.into_inner());
-    let w = w.get_or_insert_with(|| Watch { read: now - EVERY, logged: None });
+    let mut guard = WATCH.lock().unwrap_or_else(|e| e.into_inner());
+    let w = guard.get_or_insert_with(|| Watch { read: now - EVERY, logged: None });
     if now.duration_since(w.read) < EVERY {
         return;
     }
@@ -152,7 +152,8 @@ pub fn tick(doing: &str, detail: impl FnOnce() -> String) {
     let device = if first { device_line() } else { String::new() };
     log::info!("memory: {mb} MB resident{change}{doing}{device}");
     w.logged = Some((mb, now));
-    drop(w);
+    // (the lock goes before `detail()` reads the editor's own counters)
+    drop(guard);
     // What the editor holds (the renderer's meshes, textures and items;
     // the shown DataModel), with each line: which of them grew.
     let detail = detail();

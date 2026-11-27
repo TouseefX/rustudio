@@ -604,6 +604,7 @@ impl Editor {
                 "view_selector": c.view_selector.id(),
                 "rig_builder": c.rig_builder.id(),
                 "material_picker": c.material_picker.id(),
+                "animation_editor": c.animation_editor.id(),
             },
             "actions": m.actions.iter().map(|a| serde_json::json!({"action_id": a.key, "text": a.text, "status_tip": a.status_tip})).collect::<Vec<_>>(),
             "open_menus": m.menus.len(),

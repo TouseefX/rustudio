@@ -778,7 +778,7 @@ pub fn newindex(lua: &Lua, r: Ref, class: &str, key: &str, value: &Value) -> mlu
             let new = lua_to_variant(key, value, ty, None, old.as_ref())?;
             if old.as_ref() != Some(&new) {
                 store_prop(lua, r, canon, new)?;
-                let (edit, inside, id) = {
+                let (inside, id) = {
                     let w = world(lua)?;
                     let a = pstr(w.d(), r, canon);
                     let id = if a.is_empty() {
@@ -786,9 +786,11 @@ pub fn newindex(lua: &Lua, r: Ref, class: &str, key: &str, value: &Value) -> mlu
                     } else {
                         a
                     };
-                    (w.mode == RunMode::Edit, in_dm(w.d(), r), id)
+                    (in_dm(w.d(), r), id)
                 };
-                if edit && !inside {
+                // Studio (Edit and Play): a Sound outside the DataModel
+                // doesn't load; it does once parented (touch_sound).
+                if !inside {
                     clear_sound_asset(lua, r)?;
                 } else {
                     let got = if id.starts_with("rbxasset://") {
@@ -1855,9 +1857,16 @@ pub fn sound_length(lua: &Lua, r: Ref) -> mlua::Result<Option<f64>> {
     Ok(world(lua)?.input.sound_len.get(&r).copied())
 }
 
-/// Register a single `Sound` with media on demand (used in `RunMode::Edit`
-/// when a Sound is created, reparented, edited, or played, so Edit mode loads
-/// only touched Sounds without scanning the whole place).
+/// Register a single `Sound` with media on demand: in `RunMode::Edit` when a
+/// Sound is created, reparented, edited, or played (Edit loads only touched
+/// Sounds, no scan of the whole place), and in Play when a Sound enters or
+/// leaves the DataModel. Studio (0.748, Edit, Client and Server alike):
+/// `template:Clone()` reads IsLoaded false / TimeLength 0 until parented, then
+/// true and its length on the very next line when the asset is already
+/// loaded; a Sound under a Model that gets parented too; unparented again it
+/// reads false / 0. In Play this used to wait for the 4 Hz media scan, so the
+/// common one-shot `s.Parent = part; s:Play(); task.delay(s.TimeLength,
+/// s.Destroy)` read 0 and destroyed the sound the next frame, never heard.
 pub fn touch_sound(lua: &Lua, r: Ref) -> mlua::Result<()> {
     if lua.app_data_ref::<Media>().is_none() {
         return Ok(());
@@ -1875,12 +1884,24 @@ pub fn touch_sound(lua: &Lua, r: Ref) -> mlua::Result<()> {
     if !inside {
         return clear_sound_asset(lua, r);
     }
-    let already_loaded = {
+    let (same, ready, queued) = {
         let m = media(lua)?;
-        m.sound_assets.get(&r) == Some(&id)
-            && (world(lua)?.input.sound_len.contains_key(&r) || m.sound_loads.contains_key(&r))
+        (
+            m.sound_assets.get(&r) == Some(&id),
+            world(lua)?.input.sound_len.contains_key(&r),
+            m.sound_loads.contains_key(&r),
+        )
     };
-    if already_loaded {
+    if same && ready {
+        return Ok(());
+    }
+    if same && queued {
+        // Queued by a scan (or still fetching / decoding) while another
+        // Sound already has the asset decoded: ready now.
+        if let Some(p) = pcm_cached(&id) {
+            media(lua)?.sound_loads.remove(&r);
+            return finish_sound_load(lua, r, id, Got::Ready(p));
+        }
         return Ok(());
     }
     let got = if id.trim().is_empty() {
@@ -2476,6 +2497,73 @@ mod asset_tests {
             assert!(out.iter().any(|l| l == want), "{want:?} not in {out:?}");
         }
         assert!(!out.iter().any(|l| l.starts_with("ended 2")), "{out:?}");
+    }
+
+    /// TECHDEV's SoundSet:Play (sword draw / sheathe / hit): Clone a loaded
+    /// template Sound, parent it to a part, Play, `task.delay(TimeLength,
+    /// Destroy)`. Studio 0.748, measured on Client and Server in Play and in
+    /// Edit (checks/sound-clone-load): the unparented clone reads IsLoaded
+    /// false / TimeLength 0; parented, it reads true and the asset's length on
+    /// the next line; a clone under a Model is loaded once the Model is
+    /// parented; unparented again it reads false / 0. rustudio waited for the
+    /// 4 Hz media scan, so TimeLength read 0 and the sound was destroyed the
+    /// next frame, silent.
+    #[test]
+    fn cloned_sound_is_loaded_once_parented_in_play() {
+        let id = "rbxassetid://9900012031";
+        super::pcm_store(id, std::sync::Arc::new(crate::audio::Pcm { rate: 48000, chans: vec![vec![0.25; 4800]; 2] }));
+        let out = run_for(
+            r#"
+            task.spawn(function()
+            local folder = Instance.new("Folder")
+            folder.Parent = game:GetService("ReplicatedStorage")
+            local t = Instance.new("Sound")
+            t.SoundId = "rbxassetid://9900012031"
+            t.Parent = folder
+            print("template", t.IsLoaded, t.TimeLength)
+            local part = Instance.new("Part")
+            part.Parent = workspace
+            local c = t:Clone()
+            print("clone", c.IsLoaded, c.TimeLength)
+            c.Parent = part
+            print("parented", c.IsLoaded, c.TimeLength)
+            c:Play()
+            local gone = false
+            task.delay(c.TimeLength, function() gone = true; c:Destroy() end)
+            task.wait()
+            print("next frame", c.Parent ~= nil, gone, c.IsPlaying)
+            local m = Instance.new("Model")
+            local mp = Instance.new("Part")
+            mp.Parent = m
+            local c2 = t:Clone()
+            c2.Parent = mp
+            print("in model", c2.IsLoaded, c2.TimeLength)
+            m.Parent = workspace
+            print("model parented", c2.IsLoaded, c2.TimeLength)
+            c2.Parent = nil
+            print("unparented", c2.IsLoaded, c2.TimeLength)
+            local n = Instance.new("Sound")
+            n.SoundId = "rbxassetid://9900012031"
+            print("new", n.IsLoaded, n.TimeLength)
+            n.Parent = part
+            print("new parented", n.IsLoaded, n.TimeLength)
+            end)
+        "#,
+            3,
+        );
+        for want in [
+            "template true 0.1",
+            "clone false 0",
+            "parented true 0.1",
+            "next frame true false true",
+            "in model false 0",
+            "model parented true 0.1",
+            "unparented false 0",
+            "new false 0",
+            "new parented true 0.1",
+        ] {
+            assert!(out.iter().any(|l| l == want), "{want:?} not in {out:?}");
+        }
     }
 
     /// Laser Tag's AudioPlayers load with the id in AudioContent (Studio

@@ -55,6 +55,20 @@ MergeVertices / Triangulate and the *WithAttribute queries are stubs; no
 Editable* memory budget (Create* never returns nil); EditableImage /
 EditableMesh are Instances here (typeof "Instance", Roblox: "Object").
 
+## InputBinding.UIButton (buttons bound to input actions)
+
+InputBinding.UIButton and UIModifier were read and written but nothing
+acted on them (`write-ignored`): a game whose GuiButtons drive InputActions
+through a binding's UIButton got no Pressed / Released, so its buttons did
+nothing when clicked. Now Play sends each GuiButton's MouseButton1Down / Up
+to the input action system (crates/rustudio-engine/src/domains/gui_input.luau):
+a Bool action is held from the button's MouseButton1Down to its
+MouseButton1Up, as the Roblox docs describe ("a GuiButton press/release
+through the binding's UIButton property"). Estimates (the docs don't say):
+UIModifier is a second button held with UIButton, context Priority and Sink
+apply as for keys, and a press that never gets its MouseButton1Up ends when
+the left mouse button comes up or the button leaves the game.
+
 ## Round 19: the whole corpus, and what was wrong rather than missing
 
 Ranked by `RUSTUDIO_GAPS` calls summed over the six fidelity places (Place A's

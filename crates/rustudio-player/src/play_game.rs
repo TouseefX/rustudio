@@ -352,6 +352,9 @@ pub fn fire_gui_events(rt: &Runtime, events: Vec<rustudio_engine::gui::GuiEvent>
                     .collect();
                 let input = args.iter().any(|a| matches!(a, GuiArg::Input { .. } | GuiArg::InputMove { .. } | GuiArg::Touch { .. }));
                 rt.fire(r, name, vals);
+                if matches!(name, "MouseButton1Down" | "MouseButton1Up") {
+                    rustudio_engine::runtime::domains::gui_input::ui_button(lua, rt.inst(r), name == "MouseButton1Down");
+                }
                 if input {
                     // A finger's InputObject is one for its life: its
                     // handlers run before its next event changes it
@@ -2341,6 +2344,17 @@ impl Game {
     /// a script already started during its first run (their Play() sets
     /// Playing = true too and is queued): that started every such sound twice.
     pub(super) fn start_autoplay_sounds(&mut self) {
+        // Play leaves the client's DataModel in front (play.rs start_play
+        // switches to it before this call), but this scan and the
+        // server→client mapping are the server's. Without the swap the refs
+        // found are client refs, client_of() misses them, and neither side's
+        // IsPlaying is set (a Sound saved with Playing = true never starts).
+        self.server_front();
+        self.start_autoplay_sounds_inner();
+        self.shown_front();
+    }
+
+    fn start_autoplay_sounds_inner(&mut self) {
         let queued: HashSet<Ref> = self
             .play
             .as_ref()

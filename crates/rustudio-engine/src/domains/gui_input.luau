@@ -2276,8 +2276,9 @@ methods["ParticleEmitter2D.Clear"] = function(self) G.p2d(self, 0) end
 -------------------------------------------------------- Input action system
 -- InputContext (Enabled, Priority, Sink) > InputAction (Type, Enabled) >
 -- InputBinding (KeyCode or Up/Down/Left/Right/Forward/Backward, modifiers,
--- Scale). An action's state starts at its type's zero; Bool actions fire
--- Pressed / Released, every change fires StateChanged(state).
+-- Scale, or a GuiButton held down: UIButton, UIModifier). An action's state
+-- starts at its type's zero; Bool actions fire Pressed / Released, every
+-- change fires StateChanged(state).
 local action_state = setmetatable({}, { __mode = "k" })
 local action_type = setmetatable({}, { __mode = "k" })
 local function zero_of(t)
@@ -2381,7 +2382,8 @@ get["InputAction.PreferredBinding"] = function(a)
 end
 get["InputActionLabel.ResolvedText"] = function() return "" end
 get["InputActionLabel.ResolvedImageContent"] = function() return Content.none end
--- Held keys / buttons per binding, for the action's value.
+-- Held keys / buttons per binding, for the action's value (GuiButtons
+-- held down by the pointer are keyed by the instance).
 local held = {}
 local pad_values = {}
 local sticks = {}
@@ -2397,7 +2399,10 @@ local function binding_value(a, b)
     local s = b.Scale
     local function h(k) return k ~= KEY_NONE and held[k] == true end
     if t == Enum.InputActionType.Bool then
-        return h(b.KeyCode) and mods_ok(b)
+        -- UIButton: "a GuiButton press/release" (create.roblox.com/docs/input/
+        -- input-action-system). UIModifier as a second button held with it,
+        -- like PrimaryModifier for keys, is an estimate (the docs don't say).
+        return (h(b.KeyCode) and mods_ok(b)) or (h(b.UIButton) and (b.UIModifier == nil or h(b.UIModifier)))
     elseif t == Enum.InputActionType.Direction1D then
         local v = 0
         if h(b.KeyCode) then v = 1 end
@@ -2424,6 +2429,7 @@ local function binding_value(a, b)
 end
 local function binding_uses(b, key)
     if b.Type == Enum.InputBindingType.Scriptable then return false end
+    if typeof(key) == "Instance" then return b.UIButton == key or b.UIModifier == key end
     for _, k in { b.KeyCode, b.Up, b.Down, b.Left, b.Right, b.Forward, b.Backward } do
         if k == key then return true end
     end
@@ -2682,6 +2688,28 @@ touch_input = function(state, id, x, y, dx, dy, gpe, began_on)
 end
 end
 local mouse_keys = { MouseButton1 = "MouseLeftButton", MouseButton2 = "MouseRightButton", MouseButton3 = "MouseMiddleButton" }
+-- A GuiButton pressed (MouseButton1Down) or let go (MouseButton1Up) drives
+-- the actions bound to it through UIButton / UIModifier, with the same
+-- context Priority and Sink as keys (an estimate: the docs give Sink for
+-- KeyCodes only). A press whose button is hidden, destroyed or moved out of
+-- the game before it's let go gets no MouseButton1Up: it ends when the left
+-- mouse button comes up, or when the button leaves the game (estimates).
+local function ui_button_input(btn, down)
+    if typeof(btn) ~= "Instance" or (held[btn] == true) == down then return end
+    actions_input(btn, down)
+end
+local function release_ui_buttons(gone_only)
+    for k in held do
+        if typeof(k) == "Instance" then
+            local ok, inside = true, false
+            if gone_only then ok, inside = pcall(function() return k:IsDescendantOf(game) end) end
+            if not (ok and inside) then actions_input(k, false) end
+        end
+    end
+end
+local function step_ui_buttons()
+    if next(held) ~= nil then release_ui_buttons(true) end
+end
 
 ------------------------------------------------------- Mouse / UIS extras
 -- The legacy Mouse's KeyDown / KeyUp (lower-case character), Move,
@@ -2712,6 +2740,7 @@ local function on_input(state, uit, key, x, y, z, gpe, dx, dy)
         if not gpe and (state == "Begin" or state == "End") then
             actions_input(Enum.KeyCode[mouse_keys[uit]], state == "Begin")
         end
+        if uit == "MouseButton1" and state == "End" then release_ui_buttons(false) end
         last_device = "Keyboard"
     elseif uit == "MouseMovement" then
         mouse_moved = true
@@ -3328,6 +3357,7 @@ local function step_all(dt)
         start_touch_buttons()
     end
     G.profile_step(2, step_styles, style_rev, vw, vh, hover_sig)
+    step_ui_buttons()
     return styles_dirty
         or next(playing_fx) ~= nil
         or next(tweening) ~= nil
@@ -3356,6 +3386,14 @@ function M.focus_now()
     if not G.is_client() then return end
     local ok, err = xpcall(step_focus, debug.traceback)
     if not ok then log("error", "gui_input focus: " .. tostring(err):gsub("\n", " | ")) end
+end
+
+-- A GuiButton's MouseButton1Down (down) or MouseButton1Up, fired by Play's
+-- GUI events (crates/rustudio-player/src/play_game.rs): its UIButton bindings.
+function M.ui_button(btn, down)
+    if not G.is_client() then return end
+    local ok, err = pcall(ui_button_input, btn, down)
+    if not ok then log("error", "gui_input: " .. tostring(err)) end
 end
 
 function M.step(dt)

@@ -242,7 +242,7 @@ pub fn studio_near_dof_div(height: u32, near_intensity: f32) -> u32 {
     }
 }
 
-struct DepthPipelines {
+pub(crate) struct DepthPipelines {
     sunrays_depth: wgpu::RenderPipeline,
     dof_cheap_prep: wgpu::RenderPipeline,
     dof_far_down_h: wgpu::RenderPipeline,
@@ -251,10 +251,10 @@ struct DepthPipelines {
     dof_resolve_near: wgpu::RenderPipeline,
 }
 
-struct PostFxTargets {
-    size: [u32; 2],
-    samples: u32,
-    depth_bg: wgpu::BindGroup,
+/// Lazily allocated Depth-of-Field targets (~78–312 MiB at 1080p–4K).
+/// Only created when an active `DepthOfFieldEffect` actually runs, and
+/// immediately dropped if GPU memory comes under pressure.
+struct PostFxDofTargets {
     // Full-res DoF scratch targets (HDR_FORMAT).
     dof_full_prep: wgpu::TextureView,
     dof_scene_a: wgpu::TextureView,
@@ -275,21 +275,8 @@ struct PostFxTargets {
     dof_q_b: wgpu::TextureView,        // qw x qh
     dof_q_coc_a: wgpu::TextureView,    // qw x qh (R16Float)
     dof_q_coc_b: wgpu::TextureView,    // qw x qh (R16Float)
-    // Bloom pyramid (levels 0..5 -> >>1..>>5).
-    bloom_sizes: [[u32; 2]; 5],
-    bloom_textures: Vec<wgpu::Texture>,
-    bloom_views: Vec<wgpu::TextureView>,
-    bloom_bright_capture: Option<wgpu::Texture>,
-    // Quarter-res (w>>2, h>>2) SunRays & Blur targets.
-    quarter_size: [u32; 2],
-    sr_depth: wgpu::TextureView,       // R16Float
-    sr_march: wgpu::TextureView,       // HDR_FORMAT
-    sr_radial: wgpu::TextureView,      // HDR_FORMAT
-    blur_a: wgpu::TextureView,         // HDR_FORMAT
-    blur_b: wgpu::TextureView,         // HDR_FORMAT
-    // Pre-built texture bind groups (zero per-frame allocation!).
-    // Scene sources: [0] = hdr_view, [1] = dof_scene_a, [2] = dof_scene_b
-    bg_scene: [wgpu::BindGroup; 3],
+    // Scene sources: [0] = dof_scene_a (scene_idx 1), [1] = dof_scene_b (scene_idx 2)
+    bg_scene: [wgpu::BindGroup; 2],
     bg_dof_cheap: wgpu::BindGroup,
     bg_dof_half_down_v: wgpu::BindGroup,
     bg_dof_half_coc_from_col: wgpu::BindGroup,
@@ -309,6 +296,30 @@ struct PostFxTargets {
     bg_dof_q_bokeh: wgpu::BindGroup,          // (dof_q_b, coc_a)
     bg_dof_q_tent: wgpu::BindGroup,           // (dof_q_a)
     bg_dof_resolve_q: [wgpu::BindGroup; 3],
+    // ImageProcess bind groups for scene_idx 1 & 2 ([idx-1][bloom_slot][sr_on])
+    bg_image_process: [[[wgpu::BindGroup; 2]; 3]; 2],
+}
+
+struct PostFxTargets {
+    size: [u32; 2],
+    samples: u32,
+    hdr_view: wgpu::TextureView,
+    depth_bg: wgpu::BindGroup,
+    dof: Option<PostFxDofTargets>,
+    // Bloom pyramid (levels 0..5 -> >>1..>>5).
+    bloom_sizes: [[u32; 2]; 5],
+    bloom_textures: Vec<wgpu::Texture>,
+    bloom_views: Vec<wgpu::TextureView>,
+    bloom_bright_capture: Option<wgpu::Texture>,
+    // Quarter-res (w>>2, h>>2) SunRays & Blur targets.
+    quarter_size: [u32; 2],
+    sr_depth: wgpu::TextureView,       // R16Float
+    sr_march: wgpu::TextureView,       // HDR_FORMAT
+    sr_radial: wgpu::TextureView,      // HDR_FORMAT
+    blur_a: wgpu::TextureView,         // HDR_FORMAT
+    blur_b: wgpu::TextureView,         // HDR_FORMAT
+    // Pre-built texture bind groups for scene_idx == 0 (hdr_view).
+    bg_scene_hdr: wgpu::BindGroup,
     bg_bloom_down: [wgpu::BindGroup; 4],      // levels 0->1, 1->2, 2->3, 3->4
     bg_bloom_up: [wgpu::BindGroup; 4],        // levels 1->0, 2->1, 3->2, 4->3
     bg_sr_march: wgpu::BindGroup,             // (sr_depth, noise)
@@ -318,8 +329,36 @@ struct PostFxTargets {
     // FXComposite bind groups indexed by [bloom_slot 0..3][sr_on 0..2]
     // bloom_slot: 0 = black, 1 = bloom[0] (HQ), 2 = bloom[2] (LQ)
     bg_fx_comp: [[wgpu::BindGroup; 2]; 3],
-    // ImageProcess bind groups indexed by [scene_idx 0..3][bloom_slot 0..3][sr_on 0..2]
-    bg_image_process: [[[wgpu::BindGroup; 2]; 3]; 3],
+    // ImageProcess bind groups for scene_idx == 0 ([bloom_slot 0..3][sr_on 0..2])
+    bg_image_process_hdr: [[wgpu::BindGroup; 2]; 3],
+}
+
+impl PostFxTargets {
+    fn bg_scene(&self, scene_idx: usize) -> &wgpu::BindGroup {
+        match scene_idx {
+            1 => self.dof.as_ref().map_or(&self.bg_scene_hdr, |d| &d.bg_scene[0]),
+            2 => self.dof.as_ref().map_or(&self.bg_scene_hdr, |d| &d.bg_scene[1]),
+            _ => &self.bg_scene_hdr,
+        }
+    }
+
+    fn bg_image_process(&self, scene_idx: usize, bloom_slot: usize, sr_slot: usize) -> &wgpu::BindGroup {
+        match scene_idx {
+            1 => self
+                .dof
+                .as_ref()
+                .map_or(&self.bg_image_process_hdr[bloom_slot][sr_slot], |d| {
+                    &d.bg_image_process[0][bloom_slot][sr_slot]
+                }),
+            2 => self
+                .dof
+                .as_ref()
+                .map_or(&self.bg_image_process_hdr[bloom_slot][sr_slot], |d| {
+                    &d.bg_image_process[1][bloom_slot][sr_slot]
+                }),
+            _ => &self.bg_image_process_hdr[bloom_slot][sr_slot],
+        }
+    }
 }
 
 pub struct PostFx {
@@ -357,6 +396,7 @@ pub struct PostFx {
     // Depth-reading pipelines: [0] = 1x, [1] = MSAA (>1x)
     depth_pipes: [Option<DepthPipelines>; 2],
     targets: Option<PostFxTargets>,
+    last_oom_epoch: u64,
 }
 
 const INITIAL_UBO_SLOTS: usize = 64;
@@ -687,7 +727,14 @@ impl PostFx {
             image_process,
             depth_pipes: [None, None],
             targets: None,
+            last_oom_epoch: crate::gpu_health::oom_epoch(),
         }
+    }
+
+    /// Drops resolution-dependent post-FX targets (e.g. before a 1× fallback
+    /// target allocation on OOM).
+    pub fn drop_targets(&mut self) {
+        self.targets = None;
     }
 
     fn ensure_depth_pipes(&mut self, device: &wgpu::Device, samples: u32) {
@@ -695,61 +742,88 @@ impl PostFx {
         if self.depth_pipes[slot].is_some() {
             return;
         }
-        let combined = format!("{}\n{}", include_str!("postfx.wgsl"), include_str!("postfx_depth.wgsl"));
-        let combined = if samples == 1 {
-            combined.replace("texture_depth_multisampled_2d", "texture_depth_2d")
-        } else {
-            combined
-        };
-        let src = crate::gpu_caps::shader_for(device, &combined);
-        let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some(if samples > 1 { "postfx depth ms" } else { "postfx depth 1x" }),
-            source: wgpu::ShaderSource::Wgsl(src.into()),
-        });
-        let pl = if samples > 1 {
-            &self.pl_depth_ms
-        } else {
-            &self.pl_depth_1x
-        };
-        let make = |label: &str, fs: &str, format: wgpu::TextureFormat| {
-            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-                label: Some(label),
-                layout: Some(pl),
-                vertex: wgpu::VertexState {
-                    module: &module,
-                    entry_point: Some("vs_post"),
-                    compilation_options: Default::default(),
-                    buffers: &[],
-                },
-                primitive: Default::default(),
-                depth_stencil: None,
-                multisample: Default::default(),
-                fragment: Some(wgpu::FragmentState {
-                    module: &module,
-                    entry_point: Some(fs),
-                    compilation_options: Default::default(),
-                    targets: &[Some(wgpu::ColorTargetState {
-                        format,
-                        blend: None,
-                        write_mask: wgpu::ColorWrites::ALL,
-                    })],
-                }),
-                multiview_mask: None,
-                cache: crate::pipeline_cache::current(),
-            })
-        };
-        self.depth_pipes[slot] = Some(DepthPipelines {
-            sunrays_depth: make("postfx sunrays depth", "fs_sunrays_depth", wgpu::TextureFormat::R16Float),
-            dof_cheap_prep: make("postfx dof cheap prep", "fs_dof_cheap_prep", self.hdr_format),
-            dof_far_down_h: make("postfx dof far down h", "fs_dof_far_down_h", self.hdr_format),
-            dof_near_down_h: make("postfx dof near down h", "fs_dof_near_down_h", self.hdr_format),
-            dof_resolve_far: make("postfx dof resolve far", "fs_dof_resolve_far", self.hdr_format),
-            dof_resolve_near: make("postfx dof resolve near", "fs_dof_resolve_near", self.hdr_format),
-        });
+        let pl = if samples > 1 { &self.pl_depth_ms } else { &self.pl_depth_1x };
+        self.depth_pipes[slot] = Some(build_depth_pipes(device, pl, self.hdr_format, samples));
     }
 
+    /// What [`build_depth_pipes`] needs for `samples` a pixel, for a thread
+    /// that builds them ahead of their first use (render.rs warmup).
+    pub(crate) fn depth_pipes_job(&self, samples: u32) -> (wgpu::PipelineLayout, wgpu::TextureFormat) {
+        let pl = if samples > 1 { &self.pl_depth_ms } else { &self.pl_depth_1x };
+        (pl.clone(), self.hdr_format)
+    }
+
+    pub(crate) fn has_depth_pipes(&self, samples: u32) -> bool {
+        self.depth_pipes[usize::from(samples > 1)].is_some()
+    }
+
+    /// Takes a prebuilt set for `samples` a pixel; dropped when the slot
+    /// was filled meanwhile. Returns whether it was taken.
+    pub(crate) fn install_depth_pipes(&mut self, samples: u32, pipes: DepthPipelines) -> bool {
+        let slot = usize::from(samples > 1);
+        if self.depth_pipes[slot].is_some() {
+            return false;
+        }
+        self.depth_pipes[slot] = Some(pipes);
+        true
+    }
+}
+
+/// The depth-reading post passes (sun rays, depth of field) for `samples`
+/// a pixel: one shader module, six pipelines.
+pub(crate) fn build_depth_pipes(device: &wgpu::Device, pl: &wgpu::PipelineLayout, hdr_format: wgpu::TextureFormat, samples: u32) -> DepthPipelines {
+    let combined = format!("{}\n{}", include_str!("postfx.wgsl"), include_str!("postfx_depth.wgsl"));
+    let combined = if samples == 1 {
+        combined.replace("texture_depth_multisampled_2d", "texture_depth_2d")
+    } else {
+        combined
+    };
+    let src = crate::gpu_caps::shader_for(device, &combined);
+    let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: Some(if samples > 1 { "postfx depth ms" } else { "postfx depth 1x" }),
+        source: wgpu::ShaderSource::Wgsl(src.into()),
+    });
+    let make = |label: &str, fs: &str, format: wgpu::TextureFormat| {
+        device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some(label),
+            layout: Some(pl),
+            vertex: wgpu::VertexState {
+                module: &module,
+                entry_point: Some("vs_post"),
+                compilation_options: Default::default(),
+                buffers: &[],
+            },
+            primitive: Default::default(),
+            depth_stencil: None,
+            multisample: Default::default(),
+            fragment: Some(wgpu::FragmentState {
+                module: &module,
+                entry_point: Some(fs),
+                compilation_options: Default::default(),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format,
+                    blend: None,
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+            }),
+            multiview_mask: None,
+            cache: crate::pipeline_cache::current(),
+        })
+    };
+    DepthPipelines {
+        sunrays_depth: make("postfx sunrays depth", "fs_sunrays_depth", wgpu::TextureFormat::R16Float),
+        dof_cheap_prep: make("postfx dof cheap prep", "fs_dof_cheap_prep", hdr_format),
+        dof_far_down_h: make("postfx dof far down h", "fs_dof_far_down_h", hdr_format),
+        dof_near_down_h: make("postfx dof near down h", "fs_dof_near_down_h", hdr_format),
+        dof_resolve_far: make("postfx dof resolve far", "fs_dof_resolve_far", hdr_format),
+        dof_resolve_near: make("postfx dof resolve near", "fs_dof_resolve_near", hdr_format),
+    }
+}
+
+impl PostFx {
     /// Rebuilds resolution-dependent targets and bind groups whenever the viewport
-    /// target is created or resized.
+    /// target is created or resized. Depth-of-Field targets (~78–312 MiB) are
+    /// allocated lazily only when an active `DepthOfFieldEffect` runs.
     pub fn rebuild_targets(
         &mut self,
         device: &wgpu::Device,
@@ -759,6 +833,11 @@ impl PostFx {
         depth_view: &wgpu::TextureView,
     ) {
         self.ensure_depth_pipes(device, samples);
+        // Drop previous targets before creating new ones so old and new
+        // resolution pyramids never coexist in VRAM during resize.
+        self.targets = None;
+        let oom_scope = device.push_error_scope(wgpu::ErrorFilter::OutOfMemory);
+        let val_scope = device.push_error_scope(wgpu::ErrorFilter::Validation);
         let mk_tex = |label: &str, w: u32, h: u32, format: wgpu::TextureFormat, copy_src: bool| {
             let mut usage =
                 wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING;
@@ -819,8 +898,6 @@ impl PostFx {
         };
 
         let [w, h] = size;
-        let half_size = [((w + (w & 1)) / 2).max(1), ((h + (h & 1)) / 2).max(1)];
-        let quarter_dof_size = [((w + (w & 1)) / 4).max(1), ((h + (h & 1)) / 4).max(1)];
         let quarter_size = [(w >> 2).max(1), (h >> 2).max(1)];
         let r16 = wgpu::TextureFormat::R16Float;
 
@@ -836,39 +913,6 @@ impl PostFx {
                 resource: wgpu::BindingResource::TextureView(depth_view),
             }],
         });
-
-        let dof_full_prep = mk_view("postfx dof prep", w, h, self.hdr_format);
-        let dof_scene_a = mk_view("postfx dof scene a", w, h, self.hdr_format);
-        let dof_scene_b = mk_view("postfx dof scene b", w, h, self.hdr_format);
-
-        let dof_half_h = mk_view("postfx dof half h", half_size[0], h, self.hdr_format);
-        let dof_half_col = mk_view("postfx dof half col", half_size[0], half_size[1], self.hdr_format);
-        let dof_half_a = mk_view("postfx dof half a", half_size[0], half_size[1], self.hdr_format);
-        let dof_half_b = mk_view("postfx dof half b", half_size[0], half_size[1], self.hdr_format);
-        let dof_half_coc_a = mk_view("postfx dof half coc a", half_size[0], half_size[1], r16);
-        let dof_half_coc_b = mk_view("postfx dof half coc b", half_size[0], half_size[1], r16);
-
-        let dof_q_h = mk_view("postfx dof q h", quarter_dof_size[0], h, self.hdr_format);
-        let dof_q_col = mk_view(
-            "postfx dof q col",
-            quarter_dof_size[0],
-            quarter_dof_size[1],
-            self.hdr_format,
-        );
-        let dof_q_a = mk_view(
-            "postfx dof q a",
-            quarter_dof_size[0],
-            quarter_dof_size[1],
-            self.hdr_format,
-        );
-        let dof_q_b = mk_view(
-            "postfx dof q b",
-            quarter_dof_size[0],
-            quarter_dof_size[1],
-            self.hdr_format,
-        );
-        let dof_q_coc_a = mk_view("postfx dof q coc a", quarter_dof_size[0], quarter_dof_size[1], r16);
-        let dof_q_coc_b = mk_view("postfx dof q coc b", quarter_dof_size[0], quarter_dof_size[1], r16);
 
         let mut bloom_sizes = [[1u32; 2]; 5];
         let mut bloom_textures = Vec::with_capacity(5);
@@ -925,8 +969,162 @@ impl PostFx {
             self.hdr_format,
         );
 
-        let scenes = [hdr_view, &dof_scene_a, &dof_scene_b];
-        let bg_scene = std::array::from_fn(|i| bg1("postfx scene", scenes[i]));
+        let bg_scene_hdr = bg1("postfx scene", hdr_view);
+        let bg_bloom_down = std::array::from_fn(|i| bg1("postfx bloom down", &bloom_views[i]));
+        let bg_bloom_up = std::array::from_fn(|i| bg1("postfx bloom up", &bloom_views[i + 1]));
+        let bg_sr_march = bg2("postfx sr march", &sr_depth, &self.noise_view);
+        let bg_sr_radial = bg1("postfx sr radial", &sr_march);
+        let bg_blur_h = bg1("postfx blur h", &blur_a);
+        let bg_blur_v = bg1("postfx blur v", &blur_b);
+
+        let bloom_sources = [&self.black_view, &bloom_views[0], &bloom_views[2]];
+        let sr_sources = [&self.black_view, &sr_radial];
+
+        let bg_fx_comp = std::array::from_fn(|b| {
+            std::array::from_fn(|s| {
+                bg4(
+                    "postfx fx comp",
+                    &blur_b,
+                    bloom_sources[b],
+                    sr_sources[s],
+                    &self.black_view,
+                )
+            })
+        });
+
+        let bg_image_process_hdr = std::array::from_fn(|b| {
+            std::array::from_fn(|s| {
+                bg4(
+                    "postfx image process",
+                    hdr_view,
+                    bloom_sources[b],
+                    sr_sources[s],
+                    &blur_a,
+                )
+            })
+        });
+
+        let val_err = crate::gpu_caps::block_on(val_scope.pop());
+        let oom_err = crate::gpu_caps::block_on(oom_scope.pop());
+        if let Some(err) = oom_err {
+            crate::gpu_health::mark_oom("postfx targets", &err.to_string());
+            return;
+        }
+        if let Some(err) = val_err {
+            log::warn!(target: "rustudio::gpu", "postfx target creation failed: {err}");
+            return;
+        }
+
+        self.targets = Some(PostFxTargets {
+            size,
+            samples,
+            hdr_view: hdr_view.clone(),
+            depth_bg,
+            dof: None,
+            bloom_sizes,
+            bloom_textures,
+            bloom_views,
+            bloom_bright_capture,
+            quarter_size,
+            sr_depth,
+            sr_march,
+            sr_radial,
+            blur_a,
+            blur_b,
+            bg_scene_hdr,
+            bg_bloom_down,
+            bg_bloom_up,
+            bg_sr_march,
+            bg_sr_radial,
+            bg_blur_h,
+            bg_blur_v,
+            bg_fx_comp,
+            bg_image_process_hdr,
+        });
+    }
+
+    /// Lazily allocates Depth-of-Field targets only when an active
+    /// `DepthOfFieldEffect` runs and GPU memory is not under pressure.
+    fn ensure_dof_targets(&mut self, device: &wgpu::Device) -> bool {
+        let Some(t) = self.targets.as_mut() else { return false };
+        if t.dof.is_some() {
+            return true;
+        }
+        if crate::gpu_health::oom_seen() {
+            return false;
+        }
+        let oom_scope = device.push_error_scope(wgpu::ErrorFilter::OutOfMemory);
+        let val_scope = device.push_error_scope(wgpu::ErrorFilter::Validation);
+        let mk_view = |label: &str, w: u32, h: u32, format: wgpu::TextureFormat| {
+            device
+                .create_texture(&wgpu::TextureDescriptor {
+                    label: Some(label),
+                    size: wgpu::Extent3d {
+                        width: w.max(1),
+                        height: h.max(1),
+                        depth_or_array_layers: 1,
+                    },
+                    mip_level_count: 1,
+                    sample_count: 1,
+                    dimension: wgpu::TextureDimension::D2,
+                    format,
+                    usage: wgpu::TextureUsages::RENDER_ATTACHMENT
+                        | wgpu::TextureUsages::TEXTURE_BINDING,
+                    view_formats: &[],
+                })
+                .create_view(&Default::default())
+        };
+        let bg4 = |label: &str,
+                   t0: &wgpu::TextureView,
+                   t1: &wgpu::TextureView,
+                   t2: &wgpu::TextureView,
+                   t3: &wgpu::TextureView| {
+            device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some(label),
+                layout: &self.tex_layout,
+                entries: &[
+                    wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(t0) },
+                    wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(t1) },
+                    wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(t2) },
+                    wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::TextureView(t3) },
+                ],
+            })
+        };
+        let bg1 = |label: &str, t0: &wgpu::TextureView| {
+            bg4(label, t0, &self.black_view, &self.black_view, &self.black_view)
+        };
+        let bg2 = |label: &str, t0: &wgpu::TextureView, t1: &wgpu::TextureView| {
+            bg4(label, t0, t1, &self.black_view, &self.black_view)
+        };
+
+        let [w, h] = t.size;
+        let half_size = [((w + (w & 1)) / 2).max(1), ((h + (h & 1)) / 2).max(1)];
+        let quarter_dof_size = [((w + (w & 1)) / 4).max(1), ((h + (h & 1)) / 4).max(1)];
+        let r16 = wgpu::TextureFormat::R16Float;
+
+        let dof_full_prep = mk_view("postfx dof prep", w, h, self.hdr_format);
+        let dof_scene_a = mk_view("postfx dof scene a", w, h, self.hdr_format);
+        let dof_scene_b = mk_view("postfx dof scene b", w, h, self.hdr_format);
+
+        let dof_half_h = mk_view("postfx dof half h", half_size[0], h, self.hdr_format);
+        let dof_half_col = mk_view("postfx dof half col", half_size[0], half_size[1], self.hdr_format);
+        let dof_half_a = mk_view("postfx dof half a", half_size[0], half_size[1], self.hdr_format);
+        let dof_half_b = mk_view("postfx dof half b", half_size[0], half_size[1], self.hdr_format);
+        let dof_half_coc_a = mk_view("postfx dof half coc a", half_size[0], half_size[1], r16);
+        let dof_half_coc_b = mk_view("postfx dof half coc b", half_size[0], half_size[1], r16);
+
+        let dof_q_h = mk_view("postfx dof q h", quarter_dof_size[0], h, self.hdr_format);
+        let dof_q_col = mk_view("postfx dof q col", quarter_dof_size[0], quarter_dof_size[1], self.hdr_format);
+        let dof_q_a = mk_view("postfx dof q a", quarter_dof_size[0], quarter_dof_size[1], self.hdr_format);
+        let dof_q_b = mk_view("postfx dof q b", quarter_dof_size[0], quarter_dof_size[1], self.hdr_format);
+        let dof_q_coc_a = mk_view("postfx dof q coc a", quarter_dof_size[0], quarter_dof_size[1], r16);
+        let dof_q_coc_b = mk_view("postfx dof q coc b", quarter_dof_size[0], quarter_dof_size[1], r16);
+
+        let scenes = [&t.hdr_view, &dof_scene_a, &dof_scene_b];
+        let bg_scene = [
+            bg1("postfx scene a", &dof_scene_a),
+            bg1("postfx scene b", &dof_scene_b),
+        ];
         let bg_dof_cheap = bg1("postfx dof cheap", &dof_full_prep);
         let bg_dof_half_down_v = bg1("postfx dof half down v", &dof_half_h);
         let bg_dof_half_coc_from_col = bg1("postfx dof half coc col", &dof_half_col);
@@ -950,46 +1148,35 @@ impl PostFx {
         let bg_dof_resolve_q =
             std::array::from_fn(|i| bg2("postfx dof resolve q", scenes[i], &dof_q_b));
 
-        let bg_bloom_down = std::array::from_fn(|i| bg1("postfx bloom down", &bloom_views[i]));
-        let bg_bloom_up = std::array::from_fn(|i| bg1("postfx bloom up", &bloom_views[i + 1]));
-        let bg_sr_march = bg2("postfx sr march", &sr_depth, &self.noise_view);
-        let bg_sr_radial = bg1("postfx sr radial", &sr_march);
-        let bg_blur_h = bg1("postfx blur h", &blur_a);
-        let bg_blur_v = bg1("postfx blur v", &blur_b);
-
-        let bloom_sources = [&self.black_view, &bloom_views[0], &bloom_views[2]];
-        let sr_sources = [&self.black_view, &sr_radial];
-
-        let bg_fx_comp = std::array::from_fn(|b| {
-            std::array::from_fn(|s| {
-                bg4(
-                    "postfx fx comp",
-                    &blur_b,
-                    bloom_sources[b],
-                    sr_sources[s],
-                    &self.black_view,
-                )
-            })
-        });
-
+        let bloom_sources = [&self.black_view, &t.bloom_views[0], &t.bloom_views[2]];
+        let sr_sources = [&self.black_view, &t.sr_radial];
+        let dof_scenes = [&dof_scene_a, &dof_scene_b];
         let bg_image_process = std::array::from_fn(|sc| {
             std::array::from_fn(|b| {
                 std::array::from_fn(|s| {
                     bg4(
-                        "postfx image process",
-                        scenes[sc],
+                        "postfx image process dof",
+                        dof_scenes[sc],
                         bloom_sources[b],
                         sr_sources[s],
-                        &blur_a,
+                        &t.blur_a,
                     )
                 })
             })
         });
 
-        self.targets = Some(PostFxTargets {
-            size,
-            samples,
-            depth_bg,
+        let val_err = crate::gpu_caps::block_on(val_scope.pop());
+        let oom_err = crate::gpu_caps::block_on(oom_scope.pop());
+        if let Some(err) = oom_err {
+            crate::gpu_health::mark_oom("postfx dof targets", &err.to_string());
+            return false;
+        }
+        if let Some(err) = val_err {
+            log::warn!(target: "rustudio::gpu", "postfx dof target creation failed: {err}");
+            return false;
+        }
+
+        t.dof = Some(PostFxDofTargets {
             dof_full_prep,
             dof_scene_a,
             dof_scene_b,
@@ -1007,16 +1194,6 @@ impl PostFx {
             dof_q_b,
             dof_q_coc_a,
             dof_q_coc_b,
-            bloom_sizes,
-            bloom_textures,
-            bloom_views,
-            bloom_bright_capture,
-            quarter_size,
-            sr_depth,
-            sr_march,
-            sr_radial,
-            blur_a,
-            blur_b,
             bg_scene,
             bg_dof_cheap,
             bg_dof_half_down_v,
@@ -1037,15 +1214,9 @@ impl PostFx {
             bg_dof_q_bokeh,
             bg_dof_q_tent,
             bg_dof_resolve_q,
-            bg_bloom_down,
-            bg_bloom_up,
-            bg_sr_march,
-            bg_sr_radial,
-            bg_blur_h,
-            bg_blur_v,
-            bg_fx_comp,
             bg_image_process,
         });
+        true
     }
 
     pub fn bloom_dump_textures(&self) -> Option<(&wgpu::Texture, Option<&wgpu::Texture>, [u32; 2])> {
@@ -1068,11 +1239,26 @@ impl PostFx {
         params: &PostFxParams,
         with_gpu_timing: bool,
     ) {
+        let epoch = crate::gpu_health::oom_epoch();
+        if epoch != self.last_oom_epoch {
+            self.last_oom_epoch = epoch;
+            if let Some(t) = self.targets.as_mut() {
+                t.dof = None;
+            }
+        }
         let Some(ref t) = self.targets else { return };
         let samples = t.samples;
         let dp_slot = usize::from(samples > 1);
         if self.depth_pipes[dp_slot].is_none() {
             self.ensure_depth_pipes(device, samples);
+        }
+        let bypass = params.raw_debug || params.terrain_capture_id;
+        let dof_allowed = !bypass && !params.is_ortho && params.post_fx_tier >= 3;
+        let mut far_i = if dof_allowed { params.dof[3] } else { 0.0 };
+        let mut near_i = if dof_allowed { params.dof[2] } else { 0.0 };
+        if (far_i > 0.0 || near_i > 0.0) && !self.ensure_dof_targets(device) {
+            far_i = 0.0;
+            near_i = 0.0;
         }
         let Some(ref t) = self.targets else { return };
         let Some(ref dp) = self.depth_pipes[dp_slot] else { return };
@@ -1184,12 +1370,9 @@ impl PostFx {
         let load = wgpu::LoadOp::Load;
 
         // ----------------------------------------------------------- Stage 1: DepthOfField
-        let bypass = params.raw_debug || params.terrain_capture_id;
-        let dof_allowed = !bypass && !params.is_ortho && params.post_fx_tier >= 3;
-        let far_i = if dof_allowed { params.dof[3] } else { 0.0 };
-        let near_i = if dof_allowed { params.dof[2] } else { 0.0 };
         let mut scene_idx: usize = 0; // 0 = hdr_view, 1 = dof_scene_a, 2 = dof_scene_b
 
+        if let Some(ref dof) = t.dof {
         if far_i > 0.0 {
             if far_i < DOF_CHEAP_BELOW {
                 let mut u0 = base_u;
@@ -1199,11 +1382,11 @@ impl PostFx {
                     encoder,
                     "dof far cheap prep",
                     &dp.dof_cheap_prep,
-                    &t.dof_full_prep,
+                    &dof.dof_full_prep,
                     clear,
                     &self.uniform_bg,
                     o0,
-                    &t.bg_scene[scene_idx],
+                    t.bg_scene(scene_idx),
                     Some(&t.depth_bg),
                 );
                 let mut u1 = base_u;
@@ -1213,19 +1396,19 @@ impl PostFx {
                     encoder,
                     "dof far cheap",
                     &self.dof_cheap,
-                    &t.dof_scene_a,
+                    &dof.dof_scene_a,
                     clear,
                     &self.uniform_bg,
                     o1,
-                    &t.bg_dof_cheap,
+                    &dof.bg_dof_cheap,
                     None,
                 );
             } else {
                 // Studio Far HQ 1/2-res chain.
                 let full_w = size[0] as f32;
                 let full_h = size[1] as f32;
-                let hw = t.half_size[0] as f32;
-                let hh = t.half_size[1] as f32;
+                let hw = dof.half_size[0] as f32;
+                let hh = dof.half_size[1] as f32;
                 let red_x = 2.0 * (full_w - hw) / full_w;
                 let red_y = (full_w - hh) / full_w;
 
@@ -1236,11 +1419,11 @@ impl PostFx {
                     encoder,
                     "dof far down h",
                     &dp.dof_far_down_h,
-                    &t.dof_half_h,
+                    &dof.dof_half_h,
                     clear,
                     &self.uniform_bg,
                     oh,
-                    &t.bg_scene[scene_idx],
+                    t.bg_scene(scene_idx),
                     Some(&t.depth_bg),
                 );
                 let mut uv = base_u;
@@ -1250,22 +1433,22 @@ impl PostFx {
                     encoder,
                     "dof far down v",
                     &self.dof_down_v,
-                    &t.dof_half_col,
+                    &dof.dof_half_col,
                     clear,
                     &self.uniform_bg,
                     ov,
-                    &t.bg_dof_half_down_v,
+                    &dof.bg_dof_half_down_v,
                     None,
                 );
 
                 // 6-pass Far CoC mask: Min H, Min V, Min H, Min V, Avg H, Avg V.
                 let coc_steps = [
-                    ([red_x / hw, 0.0], 1.0, 1.0, &t.bg_dof_half_coc_from_col, &t.dof_half_coc_b),
-                    ([0.0, red_y / hh], 1.0, 0.0, &t.bg_dof_half_coc_b, &t.dof_half_coc_a),
-                    ([far_i / hw, 0.0], 1.0, 0.0, &t.bg_dof_half_coc_a, &t.dof_half_coc_b),
-                    ([0.0, far_i / hh], 1.0, 0.0, &t.bg_dof_half_coc_b, &t.dof_half_coc_a),
-                    ([far_i / hw, 0.0], 2.0, 0.0, &t.bg_dof_half_coc_a, &t.dof_half_coc_b),
-                    ([0.0, far_i / hh], 2.0, 0.0, &t.bg_dof_half_coc_b, &t.dof_half_coc_a),
+                    ([red_x / hw, 0.0], 1.0, 1.0, &dof.bg_dof_half_coc_from_col, &dof.dof_half_coc_b),
+                    ([0.0, red_y / hh], 1.0, 0.0, &dof.bg_dof_half_coc_b, &dof.dof_half_coc_a),
+                    ([far_i / hw, 0.0], 1.0, 0.0, &dof.bg_dof_half_coc_a, &dof.dof_half_coc_b),
+                    ([0.0, far_i / hh], 1.0, 0.0, &dof.bg_dof_half_coc_b, &dof.dof_half_coc_a),
+                    ([far_i / hw, 0.0], 2.0, 0.0, &dof.bg_dof_half_coc_a, &dof.dof_half_coc_b),
+                    ([0.0, far_i / hh], 2.0, 0.0, &dof.bg_dof_half_coc_b, &dof.dof_half_coc_a),
                 ];
                 for (step, mode, read_alpha, bg, dst) in coc_steps {
                     let mut uc = base_u;
@@ -1290,11 +1473,11 @@ impl PostFx {
                     encoder,
                     "dof far edge fatten",
                     &self.dof_edge_fatten,
-                    &t.dof_half_a,
+                    &dof.dof_half_a,
                     clear,
                     &self.uniform_bg,
                     oe,
-                    &t.bg_dof_half_edge,
+                    &dof.bg_dof_half_edge,
                     None,
                 );
                 let of = push_u(base_u);
@@ -1302,11 +1485,11 @@ impl PostFx {
                     encoder,
                     "dof far fixup coc",
                     &self.dof_fixup_coc,
-                    &t.dof_half_b,
+                    &dof.dof_half_b,
                     clear,
                     &self.uniform_bg,
                     of,
-                    &t.bg_dof_half_fixup_far,
+                    &dof.bg_dof_half_fixup_far,
                     None,
                 );
                 let mut ub = base_u;
@@ -1316,11 +1499,11 @@ impl PostFx {
                     encoder,
                     "dof far bokeh",
                     &self.dof_bokeh_far,
-                    &t.dof_half_a,
+                    &dof.dof_half_a,
                     clear,
                     &self.uniform_bg,
                     ob,
-                    &t.bg_dof_half_bokeh,
+                    &dof.bg_dof_half_bokeh,
                     None,
                 );
                 let ot = push_u(base_u);
@@ -1328,11 +1511,11 @@ impl PostFx {
                     encoder,
                     "dof far tent",
                     &self.dof_tent,
-                    &t.dof_half_b,
+                    &dof.dof_half_b,
                     clear,
                     &self.uniform_bg,
                     ot,
-                    &t.bg_dof_half_tent,
+                    &dof.bg_dof_half_tent,
                     None,
                 );
                 let or = push_u(base_u);
@@ -1340,11 +1523,11 @@ impl PostFx {
                     encoder,
                     "dof far resolve",
                     &dp.dof_resolve_far,
-                    &t.dof_scene_a,
+                    &dof.dof_scene_a,
                     clear,
                     &self.uniform_bg,
                     or,
-                    &t.bg_dof_resolve_half[scene_idx],
+                    &dof.bg_dof_resolve_half[scene_idx],
                     Some(&t.depth_bg),
                 );
                 let _ = full_h;
@@ -1361,11 +1544,11 @@ impl PostFx {
                     encoder,
                     "dof near cheap prep",
                     &dp.dof_cheap_prep,
-                    &t.dof_full_prep,
+                    &dof.dof_full_prep,
                     clear,
                     &self.uniform_bg,
                     o0,
-                    &t.bg_scene[scene_idx],
+                    t.bg_scene(scene_idx),
                     Some(&t.depth_bg),
                 );
                 let mut u1 = base_u;
@@ -1375,11 +1558,11 @@ impl PostFx {
                     encoder,
                     "dof near cheap",
                     &self.dof_cheap,
-                    &t.dof_scene_b,
+                    &dof.dof_scene_b,
                     clear,
                     &self.uniform_bg,
                     o1,
-                    &t.bg_dof_cheap,
+                    &dof.bg_dof_cheap,
                     None,
                 );
             } else {
@@ -1389,43 +1572,43 @@ impl PostFx {
                 let (rw, rh, taps, v_h, v_col, v_a, v_b, v_ca, v_cb, bg_dv, bg_ccol, bg_ca, bg_cb, bg_fx, bg_bk, bg_tn, bg_rs) =
                     if div == 2 {
                         (
-                            t.half_size[0] as f32,
-                            t.half_size[1] as f32,
+                            dof.half_size[0] as f32,
+                            dof.half_size[1] as f32,
                             2.0f32,
-                            &t.dof_half_h,
-                            &t.dof_half_col,
-                            &t.dof_half_a,
-                            &t.dof_half_b,
-                            &t.dof_half_coc_a,
-                            &t.dof_half_coc_b,
-                            &t.bg_dof_half_down_v,
-                            &t.bg_dof_half_coc_from_col,
-                            &t.bg_dof_half_coc_a,
-                            &t.bg_dof_half_coc_b,
-                            &t.bg_dof_half_fixup_near,
-                            &t.bg_dof_half_bokeh,
-                            &t.bg_dof_half_tent,
-                            &t.bg_dof_resolve_half[scene_idx],
+                            &dof.dof_half_h,
+                            &dof.dof_half_col,
+                            &dof.dof_half_a,
+                            &dof.dof_half_b,
+                            &dof.dof_half_coc_a,
+                            &dof.dof_half_coc_b,
+                            &dof.bg_dof_half_down_v,
+                            &dof.bg_dof_half_coc_from_col,
+                            &dof.bg_dof_half_coc_a,
+                            &dof.bg_dof_half_coc_b,
+                            &dof.bg_dof_half_fixup_near,
+                            &dof.bg_dof_half_bokeh,
+                            &dof.bg_dof_half_tent,
+                            &dof.bg_dof_resolve_half[scene_idx],
                         )
                     } else {
                         (
-                            t.quarter_dof_size[0] as f32,
-                            t.quarter_dof_size[1] as f32,
+                            dof.quarter_dof_size[0] as f32,
+                            dof.quarter_dof_size[1] as f32,
                             4.0f32,
-                            &t.dof_q_h,
-                            &t.dof_q_col,
-                            &t.dof_q_a,
-                            &t.dof_q_b,
-                            &t.dof_q_coc_a,
-                            &t.dof_q_coc_b,
-                            &t.bg_dof_q_down_v,
-                            &t.bg_dof_q_coc_from_col,
-                            &t.bg_dof_q_coc_a,
-                            &t.bg_dof_q_coc_b,
-                            &t.bg_dof_q_fixup_near,
-                            &t.bg_dof_q_bokeh,
-                            &t.bg_dof_q_tent,
-                            &t.bg_dof_resolve_q[scene_idx],
+                            &dof.dof_q_h,
+                            &dof.dof_q_col,
+                            &dof.dof_q_a,
+                            &dof.dof_q_b,
+                            &dof.dof_q_coc_a,
+                            &dof.dof_q_coc_b,
+                            &dof.bg_dof_q_down_v,
+                            &dof.bg_dof_q_coc_from_col,
+                            &dof.bg_dof_q_coc_a,
+                            &dof.bg_dof_q_coc_b,
+                            &dof.bg_dof_q_fixup_near,
+                            &dof.bg_dof_q_bokeh,
+                            &dof.bg_dof_q_tent,
+                            &dof.bg_dof_resolve_q[scene_idx],
                         )
                     };
                 let red_x = 2.0 * (full_w - rw) / full_w;
@@ -1442,7 +1625,7 @@ impl PostFx {
                     clear,
                     &self.uniform_bg,
                     oh,
-                    &t.bg_scene[scene_idx],
+                    t.bg_scene(scene_idx),
                     Some(&t.depth_bg),
                 );
                 let mut uv = base_u;
@@ -1529,7 +1712,7 @@ impl PostFx {
                     encoder,
                     "dof near resolve",
                     &dp.dof_resolve_near,
-                    &t.dof_scene_b,
+                    &dof.dof_scene_b,
                     clear,
                     &self.uniform_bg,
                     or,
@@ -1538,6 +1721,7 @@ impl PostFx {
                 );
             }
             scene_idx = 2;
+        }
         }
         if with_gpu_timing {
             crate::gpu_timing::mark(encoder, "gpu: dof");
@@ -1555,7 +1739,7 @@ impl PostFx {
                 ub.extra = [1.0 / dst_sz[0] as f32, 1.0 / dst_sz[1] as f32, 0.0, 0.0];
                 let ob = push_u(ub);
                 let (pipe, bg) = if i == start_level {
-                    (&self.bloom_extract, &t.bg_scene[scene_idx])
+                    (&self.bloom_extract, t.bg_scene(scene_idx))
                 } else {
                     (&self.bloom_down, &t.bg_bloom_down[i - 1])
                 };
@@ -1626,7 +1810,7 @@ impl PostFx {
                 clear,
                 &self.uniform_bg,
                 od,
-                &t.bg_scene[0],
+                &t.bg_scene_hdr,
                 Some(&t.depth_bg),
             );
             let mut um = base_u;
@@ -1679,7 +1863,7 @@ impl PostFx {
                 clear,
                 &self.uniform_bg,
                 od,
-                &t.bg_scene[scene_idx],
+                t.bg_scene(scene_idx),
                 None,
             );
             if need_fx_comp {
@@ -1736,7 +1920,7 @@ impl PostFx {
             clear,
             &self.uniform_bg,
             op,
-            &t.bg_image_process[scene_idx][bloom_slot][sr_slot],
+            t.bg_image_process(scene_idx, bloom_slot, sr_slot),
             None,
         );
         if with_gpu_timing {

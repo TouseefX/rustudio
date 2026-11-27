@@ -2716,6 +2716,26 @@ fn prop_get_routed(
 }
 
 fn prop_get_special(lua: &Lua, r: Ref, class: &str, key: &str) -> mlua::Result<Option<Value>> {
+    // A text object's Font is its FontFace's Enum.Font item (font_enum.rs);
+    // a file from before FontFace keeps only Font.
+    if key == "Font" && crate::font_enum::has_font_view(class) {
+        let v = {
+            let w = world(lua)?;
+            let d = w.d();
+            let stored = |n: &str| {
+                d.dom.get_by_ref(r).and_then(|i| i.properties.get(&rbx_dom_weak::ustr(n)).cloned())
+            };
+            match (stored("FontFace"), stored("Font")) {
+                (Some(Variant::Font(f)), _) => crate::font_enum::enum_of_face(&f),
+                (_, Some(Variant::Enum(e))) => e.to_u32(),
+                _ => match d.prop(r, "FontFace") {
+                    Some(Variant::Font(f)) => crate::font_enum::enum_of_face(&f),
+                    _ => 0,
+                },
+            }
+        };
+        return Ok(Some(variant_to_lua(lua, &Variant::Enum(Enum::from_u32(v)), Some("Font"))?));
+    }
     if class == "Bone" && matches!(key, "TransformedCFrame" | "TransformedWorldCFrame") {
         let d = world(lua)?;
         let xf = if key == "TransformedCFrame" { rustudio_core::attachment::local(d.d(), r, true) }
@@ -2909,7 +2929,7 @@ pub fn set_parent(lua: &Lua, r: Ref, new_parent: Ref) -> mlua::Result<()> {
 }
 
 fn set_parent_opts(lua: &Lua, r: Ref, new_parent: Ref, replicate: bool, stop_scripts: bool, pose: domains::world::part::EnterPose) -> mlua::Result<()> {
-    let (old, descendants, lost, snaps, enters_ws, stopped, gripped, ungripped, edit_sound) = {
+    let (old, descendants, lost, snaps, enters_ws, stopped, gripped, ungripped, moved_sounds) = {
         let mut w = world(lua)?;
         let old = w
             .d()
@@ -3012,10 +3032,19 @@ fn set_parent_opts(lua: &Lua, r: Ref, new_parent: Ref, replicate: bool, stop_scr
         } else {
             HashSet::new()
         };
-        let edit_sound = w.mode == RunMode::Edit && w.d().class_of(r).as_deref() == Some("Sound");
+        // Sounds that moved: Studio loads a Sound (or a Clone of one) as it
+        // enters the DataModel, its descendants too, and unloads it on
+        // leaving, in Edit and in Play alike (checks/sound-clone-load).
+        let moved_sounds: Vec<Ref> = {
+            let d = w.d();
+            std::iter::once(r)
+                .chain(descendants.iter().copied())
+                .filter(|s| d.dom.get_by_ref(*s).is_some_and(|i| i.class == "Sound"))
+                .collect()
+        };
         let gripped = if w.mode != RunMode::Edit { crate::tool_grip::gripped_tools(w.d(), r, enters_ws) } else { Vec::new() };
         let ungripped = if w.mode != RunMode::Edit { crate::tool_grip::ungripped_welds(w.d(), r, old) } else { Vec::new() };
-        (old, descendants, lost, snaps, enters_ws, stopped, gripped, ungripped, edit_sound)
+        (old, descendants, lost, snaps, enters_ws, stopped, gripped, ungripped, moved_sounds)
     };
     for (model, pivot) in lost {
         store_prop(lua, model, "PrimaryPart", Variant::Ref(Ref::none()))?;
@@ -3030,8 +3059,8 @@ fn set_parent_opts(lua: &Lua, r: Ref, new_parent: Ref, replicate: bool, stop_scr
         apply_assembly_pose(&mut w, moves);
     }
     fire_parent_signals(lua, r, old, new_parent, descendants)?;
-    if edit_sound {
-        domains::media::touch_sound(lua, r)?;
+    for s in moved_sounds {
+        domains::media::touch_sound(lua, s)?;
     }
     // After the hierarchy signals (Studio: an AncestryChanged handler on the Tool still
     // reads CanCollide true; EquipTool has returned with it false): the queued
@@ -3633,6 +3662,10 @@ fn store_prop_in_world(
             for legacy in doc::content_legacy_names(name) {
                 inst.properties.remove(&ustr(legacy));
             }
+        } else if name == "FontFace" && crate::font_enum::has_font_view(inst.class.as_str()) {
+            // The legacy Font enum is a view of FontFace (font_enum.rs): a
+            // stored one would be stale now.
+            inst.properties.remove(&ustr("Font"));
         }
         (old.as_ref() != Some(&v), unset)
     };
@@ -4243,6 +4276,35 @@ fn newindex_routed(
         if new <= 0.0 && old > 0.0 {
             w.fire(r, "Died", vec![]);
             w.died.push(r);
+        }
+        return Ok(());
+    }
+    // A text object's Font writes its FontFace (font_enum.rs, Studio's
+    // faces); Enum.Font.Unknown writes nothing.
+    if canon == "Font" && crate::font_enum::has_font_view(class) {
+        let Variant::Enum(e) = v else { return Ok(()) };
+        let Some(face) = crate::font_enum::face_of_enum(e.to_u32()) else { return Ok(()) };
+        let before = world(lua)?.d().prop(r, "FontFace");
+        let changed = !matches!(&before, Some(Variant::Font(f))
+            if f.family == face.family && f.weight == face.weight && f.style == face.style);
+        store_prop(lua, r, "FontFace", Variant::Font(face))?;
+        if changed {
+            fire_changed(lua, r, "Font")?;
+        }
+        return Ok(());
+    }
+    // (and a FontFace write changes what Font reads: Changed for both, as
+    // Studio fires them)
+    if canon == "FontFace" && crate::font_enum::has_font_view(class) {
+        let view = |v: Option<Variant>| match v {
+            Some(Variant::Font(f)) => Some((f.family, f.weight, f.style)),
+            _ => None,
+        };
+        let before = view(world(lua)?.d().prop(r, "FontFace"));
+        let after = view(Some(v.clone()));
+        store_prop_key(lua, r, info.canon, v)?;
+        if before != after {
+            fire_changed(lua, r, "Font")?;
         }
         return Ok(());
     }
@@ -9038,6 +9100,80 @@ mod tests {
     }
 
     #[test]
+    fn input_actions_follow_ui_button_presses() {
+        let rt = Runtime::new().unwrap();
+        let mut w = World::new(Document::new_place(), RunMode::Play);
+        w.side = Side::Client;
+        rt.enter(w);
+        rt.bind_globals().unwrap();
+        rt.lua.load(r#"
+            local gui = Instance.new("ScreenGui", workspace)
+            gui.Name = "TestGui"
+            local text = Instance.new("TextButton", gui)
+            text.Name = "Text"
+            local image = Instance.new("ImageButton", gui)
+            image.Name = "Image"
+            local ctx = Instance.new("InputContext", workspace)
+            ctx.Name = "TestInputContext"
+            local closed = Instance.new("InputContext", workspace)
+            closed.Name = "Closed"
+            closed.Enabled = false
+            counts = {}
+            local function action(parent, name, button, key)
+                local a = Instance.new("InputAction", parent)
+                a.Name = name
+                local b = Instance.new("InputBinding", a)
+                b.UIButton = button
+                if key then b.KeyCode = key end
+                counts[name] = { 0, 0 }
+                a.Pressed:Connect(function() counts[name][1] += 1 end)
+                a.Released:Connect(function() counts[name][2] += 1 end)
+                return a
+            end
+            action(ctx, "Open", text, Enum.KeyCode.E)
+            action(ctx, "Fire", image)
+            action(ctx, "Off", text).Enabled = false
+            action(closed, "Shut", text)
+            action(ctx, "Jump", nil, Enum.KeyCode.Space)
+            function state(name)
+                return (workspace.TestInputContext:FindFirstChild(name) or workspace.Closed:FindFirstChild(name)):GetState()
+            end
+            function input(st, device, key)
+                __rs_input_event(st, device, key, 0, 0, 0, 0, 0, device ~= "Keyboard")
+            end
+        "#).exec().unwrap();
+        rt.step(1.0 / 60.0);
+        let button = |name: &str| rt.lua.load(format!("return workspace.TestGui.{name}")).eval::<Value>().unwrap();
+        let ui = |name: &str, down: bool| domains::gui_input::ui_button(&rt.lua, button(name), down);
+        let check = |src: &str| rt.lua.load(format!("assert({src})")).exec().unwrap();
+
+        ui("Text", true);
+        check(r#"state("Open") and not state("Fire") and not state("Off") and not state("Shut") and not state("Jump")"#);
+        // The key bound with it neither presses nor lets go again.
+        check(r#"(function() input("Begin", "Keyboard", "E") input("End", "Keyboard", "E") return state("Open") end)()"#);
+        ui("Text", false);
+        check(r#"not state("Open")"#);
+        // Held while the mouse is down; let go with no MouseButton1Up (the
+        // button was hidden) when the left button comes up.
+        ui("Image", true);
+        check(r#"state("Fire") and not state("Open")"#);
+        check(r#"(function() input("End", "MouseButton1", "Unknown") return not state("Fire") end)()"#);
+        ui("Image", false);
+        // A button destroyed mid-press lets its action go.
+        ui("Image", true);
+        check(r#"state("Fire")"#);
+        rt.lua.load("workspace.TestGui.Image:Destroy()").exec().unwrap();
+        rt.step(1.0 / 60.0);
+        check(r#"not workspace.TestInputContext.Fire:GetState()"#);
+        rt.step(1.0 / 60.0);
+        check(r#"counts.Open[1] == 1 and counts.Open[2] == 1"#);
+        check(r#"counts.Fire[1] == 2 and counts.Fire[2] == 2"#);
+        check(r#"counts.Off[1] == 0 and counts.Shut[1] == 0 and counts.Jump[1] == 0"#);
+        let out = rt.leave().output;
+        assert!(out.iter().all(|(level, _)| *level != Level::Error), "{out:?}");
+    }
+
+    #[test]
     fn render_callbacks_run_before_waiting_tasks_resume() {
         let rt = Runtime::new().unwrap();
         rt.enter(World::new(Document::new_place(), RunMode::Run));
@@ -10817,6 +10953,10 @@ mod attachment_tests;
 #[cfg(test)]
 #[path = "selftest/bridge.rs"]
 mod bridge_tests;
+
+#[cfg(test)]
+#[path = "selftest/text_font.rs"]
+mod text_font_tests;
 
 /// `Runtime::notify_prop` from inside Lua (ChangeHistoryService's undo,
 /// src/plugin_host/api_history.rs): Changed for a property changed outside

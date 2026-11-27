@@ -1025,6 +1025,7 @@ fn builtin_tool_selector_registers_one_of_each_and_never_materializes_unchosen()
             view_selector: ToolImpl::Roblox,
             rig_builder: ToolImpl::Roblox,
             material_picker: ToolImpl::Roblox,
+            animation_editor: ToolImpl::Roblox,
         };
         h.load_builtin_dir_with_choices(&dir, None, choices);
         frames(&mut h, &mut doc, 3);
@@ -1117,6 +1118,7 @@ fn builtin_tool_selector_registers_one_of_each_and_never_materializes_unchosen()
             BuiltinTool::ViewSelector => choices.view_selector = ToolImpl::Roblox,
             BuiltinTool::RigBuilder => choices.rig_builder = ToolImpl::Roblox,
             BuiltinTool::MaterialPicker => choices.material_picker = ToolImpl::Roblox,
+            BuiltinTool::AnimationEditor => choices.animation_editor = ToolImpl::Roblox,
         }
         let mut doc = Document::new_place();
         let mut h = PluginHost::default();

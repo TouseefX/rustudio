@@ -267,7 +267,7 @@ impl Game {
         let text = text.into();
         // Android: every Output line to logcat (`RustStdoutStderr`); the
         // panel is small on a phone and a report needs the Info lines too.
-        if level != Level::Info || cfg!(target_os = "android") {
+        if matches!(level, Level::Warn | Level::Error) || cfg!(target_os = "android") {
             eprintln!("[{level:?}] {text}");
         }
         tee_log(&text);

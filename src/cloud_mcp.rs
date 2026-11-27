@@ -74,6 +74,21 @@ impl crate::app::Editor {
         })
     }
 
+    /// Unsynced Team Create edits recorded from `since..`, returning the new
+    /// total length and `(reference, path)` for each new entry.
+    pub(crate) fn live_unsynced_since(&self, since: usize) -> Option<(usize, Vec<(Option<Ref>, Option<String>)>)> {
+        let live = self.cloud.live.as_ref().filter(|l| l.document_id == Some(self.game.doc.id))?;
+        let total = live.unsynced.len();
+        let items = live
+            .unsynced
+            .get(since..)
+            .unwrap_or(&[])
+            .iter()
+            .map(|u| (u.reference, u.path.clone()))
+            .collect();
+        Some((total, items))
+    }
+
     /// Scripts of the live document with a draft.
     pub(crate) fn mcp_live_drafts(&self) -> Vec<Ref> {
         let Some(live) = self.cloud.live.as_ref().filter(|l| l.document_id == Some(self.game.doc.id)) else { return Vec::new() };
@@ -120,7 +135,7 @@ impl crate::app::Editor {
             "place_name": live.origin.as_ref().map(|o| o.name.clone()),
             "instances": live.model.instance_count(),
             "sync_failed": live.sync_failed,
-            "unsynced": live.unsynced,
+            "unsynced": live.unsynced.iter().map(|u| &u.message).collect::<Vec<_>>(),
             "sent_last_10s": recent,
             "seconds_since_last_send": live.sent.back().map(|(at, _)| at.elapsed().as_secs_f32()),
             "drafts": drafts,

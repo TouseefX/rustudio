@@ -59,6 +59,8 @@ pub enum Tab {
     AvatarSettings,
     /// Studio's Terrain Editor (Home / View > Terrain Editor).
     TerrainEditor,
+    /// Studio's Animation Editor (Avatar > Clip Editor): src/anim_editor.
+    AnimationEditor,
     /// Studio's Toolbox (Home / View > Toolbox): src/toolbox.
     Toolbox,
     /// Studio's Asset Manager (Home > Assets, Window > Asset Manager): src/asset_manager.
@@ -84,6 +86,7 @@ impl Tab {
             Tab::Output => "Output",
             Tab::AvatarSettings => "Avatar Settings",
             Tab::TerrainEditor => "Terrain Editor",
+            Tab::AnimationEditor => "Animation Editor",
             Tab::Toolbox => "Toolbox",
             Tab::AssetManager => "Asset Manager",
             Tab::FileSync => "File Sync",
@@ -130,6 +133,64 @@ pub struct Harness {
     pub plugin_dirs: Vec<PathBuf>,
     pub no_plugins: bool,
     pub plugins_started: bool,
+}
+
+#[cfg(test)]
+impl Harness {
+    pub fn test_empty() -> Self {
+        Self {
+            run: RunHarness {
+                shot_after: None,
+                log_out: None,
+                input: crate::run_harness::HarnessInput {
+                    actions: Vec::new(),
+                    pointer: None,
+                    shift: false,
+                },
+                started: rustudio_core::sim_clock::now(),
+                held: 0.0,
+                screenshot: None,
+                screenshot_requested: false,
+                start_play: false,
+                camera: None,
+                shots: Vec::new(),
+                shot_next: 0,
+                shot_lines: Vec::new(),
+                from_play: false,
+                play_started: None,
+                play_game_time: None,
+                frame_ms: Vec::new(),
+                last_frame: None,
+                no_ui: true,
+                no_render: true,
+                show_core_gui: false,
+                show_core_gui_explicit: false,
+                end_after: None,
+                fail_on_error: false,
+                result: None,
+                end_value: None,
+                run_frames: Vec::new(),
+                run_last: None,
+                run_playing: false,
+                finished: false,
+                bench: None,
+                profile: None,
+            },
+            selftest: None,
+            ui_shots: None,
+            open_roblox: None,
+            team_create: None,
+            roblox_picker: None,
+            roblox_settings: false,
+            ui_due: Vec::new(),
+            overlays: false,
+            plugin_files: Vec::new(),
+            installed_plugins: Vec::new(),
+            plugin_dirs: Vec::new(),
+            no_plugins: true,
+            plugins_started: false,
+        }
+    }
 }
 
 use crate::game::Game;
@@ -265,6 +326,8 @@ pub struct Editor {
     pub file_sync: crate::file_sync::FileSync,
     /// The Terrain Editor's tools and settings.
     pub terrain_ed: crate::terrain_editor::TerrainEditor,
+    /// The Animation Editor's state (src/anim_editor).
+    pub anim_editor: crate::anim_editor::AnimationEditor,
     /// The Toolbox panel's state (src/toolbox), kept while it is hidden.
     pub toolbox: crate::toolbox::Toolbox,
     /// The Asset Manager panel's state (src/asset_manager), kept while hidden.
@@ -401,6 +464,21 @@ pub struct RustudioApp {
     /// first frame.
     #[cfg_attr(not(target_os = "android"), allow(dead_code))]
     cpu_usage: Option<f32>,
+    /// When the next frame may start under the Editor frame limit, and
+    /// how long the last frame slept for it (`pace_frame`, Android: the
+    /// desktop's pacing is native_loop.rs's).
+    #[cfg_attr(not(target_os = "android"), allow(dead_code))]
+    pace_next: Option<Instant>,
+    #[cfg_attr(not(target_os = "android"), allow(dead_code))]
+    paced_last: f32,
+    /// The rate last voted for the window (src/android/frame_rate.rs; 0:
+    /// any) and when; the display's rate is read again on the same clock.
+    #[cfg_attr(not(target_os = "android"), allow(dead_code))]
+    rate_voted: Option<(f32, Instant)>,
+    /// The frame report (perf_report.rs): a line to the log every few
+    /// seconds — on by default on a phone, `RUSTUDIO_PERF_LOG=1` on a
+    /// computer, `=0` off.
+    perf_report: Option<rustudio_player::perf_report::PerfReport>,
 }
 
 /// Studio's starting layout, from the placement table (src/panels.rs):
@@ -426,6 +504,7 @@ fn native_tab_enabled(tab: Tab, choices: rustudio_core::rustudio_settings::Built
     match tab {
         Tab::Toolbox => choices.use_native(BuiltinTool::Toolbox),
         Tab::TerrainEditor => choices.use_native(BuiltinTool::TerrainEditor),
+        Tab::AnimationEditor => choices.use_native(BuiltinTool::AnimationEditor),
         _ => true,
     }
 }
@@ -435,7 +514,7 @@ fn strip_disabled_native_tabs(
     panels: &mut crate::panels::Panels,
     choices: rustudio_core::rustudio_settings::BuiltinToolChoices,
 ) {
-    for tab in [Tab::Toolbox, Tab::TerrainEditor] {
+    for tab in [Tab::Toolbox, Tab::TerrainEditor, Tab::AnimationEditor] {
         if !native_tab_enabled(tab, choices) {
             panels.take(dock, &tab);
         }
@@ -519,6 +598,7 @@ impl RustudioApp {
             mcp: Default::default(),
             file_sync: Default::default(),
             terrain_ed: Default::default(),
+            anim_editor: Default::default(),
             toolbox: Default::default(),
             asset_manager: Default::default(),
             profiler: None,
@@ -746,7 +826,79 @@ impl RustudioApp {
             text_bar: Default::default(),
             refresh_hz: display_refresh_hz(),
             cpu_usage: None,
+            pace_next: None,
+            paced_last: 0.0,
+            rate_voted: None,
+            perf_report: match std::env::var("RUSTUDIO_PERF_LOG").ok().as_deref() {
+                Some("0") | Some("") => None,
+                Some(_) => Some(Default::default()),
+                None => cfg!(target_os = "android").then(Default::default),
+            },
         }
+    }
+}
+
+impl RustudioApp {
+    /// Android: Performance > Editor frame limit (60 on a phone by default,
+    /// as Roblox's client: rustudio_settings `choice_default_for`). The
+    /// limit is first asked of the panel (src/android/frame_rate.rs: a
+    /// 60/120 Hz phone on an adaptive setting switches to 60, and vsync
+    /// paces the frames); where the panel stays faster, the rest of the
+    /// period is slept here before the frame — the desktop's pacing is
+    /// native_loop.rs's, which the activity's eframe loop hasn't. Nothing
+    /// when the limit is at or over the display's rate (a 60 Hz phone at
+    /// the default never sleeps). Returns the seconds slept (left out of
+    /// the governor's hint).
+    #[cfg(target_os = "android")]
+    fn pace_frame(&mut self) -> f32 {
+        let limit = rustudio_core::rustudio_settings::fps_limit();
+        // The vote, when the limit changes and every few seconds (the
+        // window is a new one after a pause); the panel's rate read again
+        // on the same clock, since the vote may have changed it.
+        let want = limit.unwrap_or(0.0);
+        if self.rate_voted.is_none_or(|(hz, at)| hz != want || at.elapsed().as_secs() >= 3) {
+            if self.rate_voted.is_none_or(|(hz, _)| hz != want) {
+                match crate::android::frame_rate::vote(want) {
+                    Some(true) if want > 0.0 => log::info!("display: {want:.0} Hz asked for the frame limit"),
+                    Some(true) => log::info!("display: any rate (no frame limit)"),
+                    Some(false) => log::info!("display: the frame rate vote was refused"),
+                    None => {}
+                }
+            } else {
+                let _ = crate::android::frame_rate::vote(want);
+            }
+            self.rate_voted = Some((want, Instant::now()));
+            if let Ok(hz) = crate::android::jni::display_refresh_rate() {
+                if hz > 1.0 && (hz - self.refresh_hz).abs() > 0.5 {
+                    log::info!("display: {hz:.0} Hz");
+                    self.refresh_hz = hz;
+                }
+            }
+        }
+        let Some(cap) = limit else {
+            self.pace_next = None;
+            return 0.0;
+        };
+        if self.refresh_hz > 1.0 && cap >= self.refresh_hz * 0.98 {
+            self.pace_next = None;
+            return 0.0;
+        }
+        let period = std::time::Duration::from_secs_f32(1.0 / cap.max(1.0));
+        let now = Instant::now();
+        let mut slept = 0.0;
+        let next = match self.pace_next {
+            Some(next) if next > now => {
+                std::thread::sleep(next - now);
+                slept = now.elapsed().as_secs_f32();
+                next + period
+            }
+            // (a little late: the cadence holds; far behind, or the first
+            // frame: it restarts from now, no catching up in a burst)
+            Some(next) if now.duration_since(next) < period => next + period,
+            _ => now + period,
+        };
+        self.pace_next = Some(next);
+        slept
     }
 }
 
@@ -779,7 +931,7 @@ impl Editor {
     pub fn push_log(&mut self, level: Level, text: impl Into<String>) {
         let text = text.into();
         match level {
-            Level::Info => log::info!(target: "rustudio::editor", "{text}"),
+            Level::Info | Level::System => log::info!(target: "rustudio::editor", "{text}"),
             Level::Warn => log::warn!(target: "rustudio::editor", "{text}"),
             Level::Error => log::error!(target: "rustudio::editor", "{text}"),
         }
@@ -789,6 +941,11 @@ impl Editor {
 
     pub fn info(&mut self, text: impl Into<String>) {
         self.push_log(Level::Info, text);
+    }
+
+    /// Studio's purple `MESSAGE_SYSTEM` Output line (save / publish / system notices).
+    pub fn system(&mut self, text: impl Into<String>) {
+        self.push_log(Level::System, text);
     }
 
     pub(crate) fn flush_output_changes(&mut self) {
@@ -859,6 +1016,7 @@ impl Editor {
                 crate::plugin_store::watcher::Level::Info => Level::Info,
                 crate::plugin_store::watcher::Level::Warn => Level::Warn,
                 crate::plugin_store::watcher::Level::Error => Level::Error,
+                crate::plugin_store::watcher::Level::System => Level::System,
             };
             self.push_log(level, l.text);
         }
@@ -1104,7 +1262,7 @@ impl Editor {
         let place = st.place.clone();
         self.project = Some(st);
         match (dirty, place) {
-            (false, _) => self.info("Saved: every synced file is up to date; nothing outside them changed"),
+            (false, _) => self.system("No changes to the place detected. Did not save."),
             (true, Some(p)) => {
                 self.save_to(p);
                 if let Some(st) = self.project.as_mut() {
@@ -1140,7 +1298,7 @@ impl Editor {
             Purpose::SaveAs => self.save_to(path),
             Purpose::InsertModel => self.insert_model_file(path),
             Purpose::SaveSelection(sel) => match self.game.doc.save_selection_to(&sel, &path) {
-                Ok(()) => self.info(format!("Saved selection to {}", path.display())),
+                Ok(()) => self.system(format!("Saved to '{}'", path.display())),
                 Err(e) => self.error(format!("Save failed: {e}")),
             },
             Purpose::SaveLocalPlugin(sel) => {
@@ -1148,6 +1306,9 @@ impl Editor {
                 self.save_local_plugin_to(path);
             }
             Purpose::TerrainImage { height } => self.load_import_image(path, height),
+            Purpose::AnimImportFbx | Purpose::AnimImportRbxm | Purpose::AnimExportRbxm => {
+                self.anim_editor_handle_file(&purpose, path)
+            }
             Purpose::FileSyncProject => self.file_sync.pick = path.display().to_string(),
             Purpose::ProjectParent => {
                 if let Some(d) = self.project_export.as_mut() {
@@ -1238,7 +1399,7 @@ impl Editor {
             return;
         }
         match self.game.doc.save_to(&p) {
-            Ok(()) => self.info(format!("Saved {}", p.display())),
+            Ok(()) => self.system(format!("Saved to '{}'", p.display())),
             Err(e) => self.error(format!("Save failed: {e}")),
         }
     }
@@ -2113,6 +2274,7 @@ impl TabViewer for Viewer<'_> {
             Tab::Output => self.ed.output_ui(ui),
             Tab::AvatarSettings => self.ed.avatar_settings_ui(ui),
             Tab::TerrainEditor => self.ed.terrain_editor_ui(ui),
+            Tab::AnimationEditor => self.ed.anim_editor_ui(ui),
             Tab::Plugin(n) => self.ed.plugin_widget_ui(ui, *n),
             Tab::Toolbox => self.ed.toolbox_ui(ui),
             Tab::AssetManager => self.ed.asset_manager_ui(ui),
@@ -2502,6 +2664,13 @@ impl eframe::App for RustudioApp {
         // of its start, render.rs `ensure_pipelines` the viewport's)
         let first = self.last_ui_frame.is_none()
             && (cfg!(target_os = "android") || std::env::var_os("RUSTUDIO_STARTUP_TRACE").is_some());
+        // (the frame limit's sleep, before the frame's clock starts; the
+        // last frame's sleep is in eframe's measure of it, taken out below)
+        #[cfg(target_os = "android")]
+        let slept_last = {
+            let slept = self.pace_frame();
+            std::mem::replace(&mut self.paced_last, slept)
+        };
         let t0 = Instant::now();
         self.last_ui_frame = Some(t0);
         if self.egui_ctx.is_none() {
@@ -2509,6 +2678,10 @@ impl eframe::App for RustudioApp {
             self.egui_ctx = Some(ui.ctx().clone());
         }
         self.cpu_usage = frame.info().cpu_usage;
+        #[cfg(target_os = "android")]
+        if let Some(c) = self.cpu_usage.as_mut() {
+            *c = (*c - slept_last).max(0.0);
+        }
         // (a lost GPU device or one out of memory: save and restart,
         // src/android/mod.rs gpu_watch)
         #[cfg(target_os = "android")]
@@ -2522,6 +2695,24 @@ impl eframe::App for RustudioApp {
                 t0.elapsed().as_millis(),
                 rustudio_engine::runtime::process_start().elapsed().as_millis()
             );
+        }
+        if let Some(report) = self.perf_report.as_mut() {
+            #[cfg(target_os = "android")]
+            let slept_s = slept_last;
+            #[cfg(not(target_os = "android"))]
+            let slept_s = 0.0;
+            let adapter = self.ed.game.render_state.as_ref().map(|rs| rs.adapter.get_info()).map(|i| format!("{} ({:?}, {} {})", i.name, i.backend, i.driver, i.driver_info)).unwrap_or_default();
+            let line = report.frame(rustudio_player::perf_report::FrameIn {
+                cpu_s: self.cpu_usage,
+                app_s: t0.elapsed().as_secs_f32(),
+                slept_s,
+                causes: ui.ctx().repaint_causes(),
+                view: self.ed.game.perf_view(),
+                adapter: &adapter,
+            });
+            if let Some(line) = line {
+                log::info!("{line}");
+            }
         }
     }
 }
@@ -2713,16 +2904,17 @@ impl RustudioApp {
         let frame_start = Instant::now();
         // The CPU governor's frame hint (src/android/perf_hint.rs): the
         // last frame's time on the CPU (eframe's, without the wait for the
-        // display) against this frame's budget, the display's period.
-        // (Performance > Editor frame limit is native_loop.rs's pacing,
-        // which the activity's eframe loop hasn't: vsync sets the rate on
-        // a phone.)
+        // display) against this frame's budget, the display's period or
+        // the Editor frame limit's (`pace_frame`, which sleeps for it
+        // where vsync is faster).
         #[cfg(target_os = "android")]
         if let Some(cpu) = self.cpu_usage {
             let hz = if self.refresh_hz > 1.0 { self.refresh_hz } else { 60.0 };
+            // (the budget is the frame limit's period when that is longer)
+            let hz = rustudio_core::rustudio_settings::fps_limit().map_or(hz, |cap| cap.min(hz));
             crate::android::perf_hint::frame(
                 std::time::Duration::from_secs_f32(cpu.max(0.0)),
-                std::time::Duration::from_secs_f32(1.0 / hz),
+                std::time::Duration::from_secs_f32(1.0 / hz.max(1.0)),
             );
         }
         let causes = ctx.repaint_causes();
@@ -3061,6 +3253,7 @@ impl RustudioApp {
             (Tab::Output, "Output"),
             (Tab::AvatarSettings, "Avatar Settings"),
             (Tab::TerrainEditor, "Terrain Editor"),
+            (Tab::AnimationEditor, "Animation Editor"),
             (Tab::Toolbox, "Toolbox"),
             (Tab::AssetManager, "Asset Manager"),
             (Tab::FileSync, "File Sync"),
@@ -3074,6 +3267,8 @@ impl RustudioApp {
         if self.ed.profiler.is_some() && !self.ed.ui.panels_open.contains("MicroProfiler") {
             self.ed.profiler = None;
         }
+        self.ed.anim_editor_check_closed();
+        self.ed.anim_editor_sync_selection();
         let ed = &mut self.ed;
         ed.open_script_tabs(&mut self.dock, &mut self.panels);
         crate::panels::record_homes(&self.dock, &mut self.panels.homes);

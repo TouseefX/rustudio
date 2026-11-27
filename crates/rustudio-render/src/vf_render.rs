@@ -55,7 +55,7 @@ pub struct Layers {
     items: HashMap<Ref, rustc_hash::FxHashMap<Ref, Vec<Prep>>>,
     gen: HashMap<Ref, u64>,
     targets: HashMap<Ref, Target>,
-    blit: Option<Blit>,
+    pub(crate) blit: Option<Blit>,
     /// The world's globals from the last frame (material params, exposure).
     pub(super) base: Option<Globals>,
     /// Bumped whenever Renderer::rebind_globals replaces any globals binding.
@@ -128,9 +128,59 @@ struct Target {
     used: Instant,
 }
 
-struct Blit {
+pub(crate) struct Blit {
     pipeline: wgpu::RenderPipeline,
     layout: wgpu::BindGroupLayout,
+}
+
+impl Blit {
+    /// The pass that copies a frame's image into its RGBA8 texture (made
+    /// on first use, or ahead of it by the startup warm-up, render.rs).
+    pub(crate) fn new(device: &wgpu::Device) -> Self {
+        let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("viewport frame blit"),
+            entries: &[wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Texture {
+                    sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                    view_dimension: wgpu::TextureViewDimension::D2,
+                    multisampled: false,
+                },
+                count: None,
+            }],
+        });
+        let pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: None,
+            bind_group_layouts: &[Some(&layout)],
+            immediate_size: 0,
+        });
+        let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("viewport frame blit"),
+            source: wgpu::ShaderSource::Wgsl(BLIT.into()),
+        });
+        let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("viewport frame blit"),
+            layout: Some(&pl),
+            vertex: wgpu::VertexState { module: &module, entry_point: Some("vs"), compilation_options: Default::default(), buffers: &[] },
+            fragment: Some(wgpu::FragmentState {
+                module: &module,
+                entry_point: Some("fs"),
+                compilation_options: Default::default(),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: wgpu::TextureFormat::Rgba8Unorm,
+                    blend: None,
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+            }),
+            primitive: Default::default(),
+            depth_stencil: None,
+            multisample: Default::default(),
+            multiview_mask: None,
+            cache: crate::pipeline_cache::current(),
+        });
+        Blit { pipeline, layout }
+    }
 }
 
 const BLIT: &str = r#"
@@ -301,49 +351,10 @@ impl Renderer {
         };
         let device = &rs.device;
         if self.vf.blit.is_none() {
-            let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-                label: Some("viewport frame blit"),
-                entries: &[wgpu::BindGroupLayoutEntry {
-                    binding: 0,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Texture {
-                        sample_type: wgpu::TextureSampleType::Float { filterable: false },
-                        view_dimension: wgpu::TextureViewDimension::D2,
-                        multisampled: false,
-                    },
-                    count: None,
-                }],
-            });
-            let pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-                label: None,
-                bind_group_layouts: &[Some(&layout)],
-                immediate_size: 0,
-            });
-            let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-                label: Some("viewport frame blit"),
-                source: wgpu::ShaderSource::Wgsl(BLIT.into()),
-            });
-            let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-                label: Some("viewport frame blit"),
-                layout: Some(&pl),
-                vertex: wgpu::VertexState { module: &module, entry_point: Some("vs"), compilation_options: Default::default(), buffers: &[] },
-                fragment: Some(wgpu::FragmentState {
-                    module: &module,
-                    entry_point: Some("fs"),
-                    compilation_options: Default::default(),
-                    targets: &[Some(wgpu::ColorTargetState {
-                        format: wgpu::TextureFormat::Rgba8Unorm,
-                        blend: None,
-                        write_mask: wgpu::ColorWrites::ALL,
-                    })],
-                }),
-                primitive: Default::default(),
-                depth_stencil: None,
-                multisample: Default::default(),
-                multiview_mask: None,
-                cache: crate::pipeline_cache::current(),
-            });
-            self.vf.blit = Some(Blit { pipeline, layout });
+            if let Some(w) = self.warm.as_mut() {
+                w.mark_local(super::warmup::Kind::VfBlit, 1);
+            }
+            self.vf.blit = Some(Blit::new(device));
         }
         let mut encoder: Option<wgpu::CommandEncoder> = None;
         for (&vf, req) in reqs {

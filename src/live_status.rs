@@ -50,7 +50,7 @@ pub enum Indicator {
 /// status bar asks every frame, and a big live place has hundreds of
 /// thousands of them.
 fn lacking(doc: &rustudio_core::doc::Document, live: &LiveView) -> Vec<String> {
-    let mut out: Vec<String> = live.unsynced.clone();
+    let mut out: Vec<String> = live.unsynced.iter().map(|u| u.message.clone()).collect();
     let mut ids: Vec<u64> = live.drafts.ids().collect();
     ids.extend(live.script_commits.values().map(|(script, _, _)| *script));
     ids.sort_unstable();
@@ -184,7 +184,7 @@ impl crate::app::Editor {
     /// for leaving the document (what the server may lack).
     pub(super) fn note_live_ended(&mut self, live: &LiveView, reason: &str) {
         let Some(document_id) = live.document_id else { return };
-        let mut lost = live.unsynced.clone();
+        let mut lost: Vec<String> = live.unsynced.iter().map(|u| u.message.clone()).collect();
         lost.extend(live.sent.iter().filter(|(at, _)| at.elapsed() <= UNCONFIRMED_WINDOW).map(|(_, l)| format!("{l} (sent just before the disconnect)")));
         self.cloud.ended_live = Some(EndedLive { document_id, reason: reason.to_string(), lost });
     }

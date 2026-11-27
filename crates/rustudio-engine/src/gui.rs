@@ -402,7 +402,23 @@ struct Hit {
 }
 
 enum Img {
-    Ready(TextureHandle, [usize; 2]),
+    Ready {
+        handle: TextureHandle,
+        size: [usize; 2],
+        base_bytes: usize,
+        mip_bytes: usize,
+        last_used: u64,
+        editable: bool,
+    },
+    Failed,
+}
+
+enum FxImg {
+    Ready {
+        handle: TextureHandle,
+        bytes: usize,
+        last_used: u64,
+    },
     Failed,
 }
 
@@ -410,13 +426,52 @@ enum Img {
 /// it doesn't decode.
 type DecodedImage = (String, Option<(egui::ColorImage, Vec<egui::ColorImage>)>);
 
-fn decode_gui_image(bytes: &[u8]) -> Option<(egui::ColorImage, Vec<egui::ColorImage>)> {
-    let img = rustudio_core::texture::decode(bytes).ok()?;
+/// Box-filter downscale decoded RGBA8 pixels by powers of two until both
+/// dimensions fit within `max_dim` (avoids exhausting VRAM on 2 GiB GPUs when
+/// a place has hundreds of 1024²/2048² particle or BillboardGui images).
+fn downscale_rgba(mut img: rustudio_core::texture::Rgba, max_dim: u32) -> rustudio_core::texture::Rgba {
+    let (mut cw, mut ch) = (img.width, img.height);
+    if (cw <= max_dim && ch <= max_dim) || img.pixels.len() != (cw as usize) * (ch as usize) * 4 {
+        return img;
+    }
+    let mut cur = img.pixels;
+    while (cw > max_dim || ch > max_dim) && (cw > 1 || ch > 1) {
+        let (nw, nh) = ((cw / 2).max(1), (ch / 2).max(1));
+        let mut next = vec![0u8; (nw * nh * 4) as usize];
+        for y in 0..nh {
+            for x in 0..nw {
+                let mut acc = [0u32; 4];
+                for dy in 0..2 {
+                    let sy = (y * 2 + dy).min(ch - 1);
+                    for dx in 0..2 {
+                        let sx = (x * 2 + dx).min(cw - 1);
+                        let o = ((sy * cw + sx) * 4) as usize;
+                        for c in 0..4 {
+                            acc[c] += cur[o + c] as u32;
+                        }
+                    }
+                }
+                let o = ((y * nw + x) * 4) as usize;
+                for c in 0..4 {
+                    next[o + c] = ((acc[c] + 2) / 4) as u8;
+                }
+            }
+        }
+        (cw, ch, cur) = (nw, nh, next);
+    }
+    img.width = cw;
+    img.height = ch;
+    img.pixels = cur;
+    img
+}
+
+fn decode_gui_image(bytes: &[u8], max_dim: u32, max_mips: usize) -> Option<(egui::ColorImage, Vec<egui::ColorImage>)> {
+    let img = downscale_rgba(rustudio_core::texture::decode(bytes).ok()?, max_dim);
     let size = [img.width as usize, img.height as usize];
     let base = egui::ColorImage::from_rgba_unmultiplied(size, &img.pixels);
     let mut levels = Vec::new();
     let mut cur = base.clone();
-    while levels.len() < 8 && (cur.size[0] >= 8 || cur.size[1] >= 8) {
+    while levels.len() < max_mips && (cur.size[0] >= 8 || cur.size[1] >= 8) {
         cur = half_image(&cur);
         levels.push(cur.clone());
     }
@@ -427,8 +482,8 @@ fn decode_gui_image(bytes: &[u8]) -> Option<(egui::ColorImage, Vec<egui::ColorIm
 /// straight (unpremultiplied) RGBA8. Studio's ParticleCustomFS,
 /// ParticleCurveCrazySparklesFS and TrailFSLight sample unpremultiplied texels
 /// and premultiply (or split RGB/A) in the fragment shader after filtering.
-fn decode_fx_image(bytes: &[u8]) -> Option<egui::ColorImage> {
-    let img = rustudio_core::texture::decode(bytes).ok()?;
+fn decode_fx_image(bytes: &[u8], max_dim: u32) -> Option<egui::ColorImage> {
+    let img = downscale_rgba(rustudio_core::texture::decode(bytes).ok()?, max_dim);
     let size = [img.width as usize, img.height as usize];
     // `Color32::from_rgba_premultiplied` stores the four bytes untouched so
     // wgpu uploads and mipmaps straight RGBA8 without egui premultiplication.
@@ -514,12 +569,21 @@ pub struct Gui {
     image_decode: Option<(std::sync::mpsc::Sender<DecodedImage>, std::sync::mpsc::Receiver<DecodedImage>)>,
     images_ready: std::collections::VecDeque<DecodedImage>,
     /// Straight (unpremultiplied) RGBA textures for 3D effects (`fx_texture`).
-    fx_images: HashMap<String, Option<TextureHandle>>,
+    fx_images: HashMap<String, FxImg>,
     fx_images_decoding: HashSet<String>,
     fx_image_decode: Option<(
         std::sync::mpsc::Sender<(String, Option<egui::ColorImage>)>,
         std::sync::mpsc::Receiver<(String, Option<egui::ColorImage>)>,
     )>,
+    fx_images_ready: std::collections::VecDeque<(String, Option<egui::ColorImage>)>,
+    /// Estimated GPU bytes uploaded into egui for GUI + 3D effect textures.
+    gui_vram_bytes: usize,
+    /// Logged once when `gui_vram_bytes` hits `gpu_caps::gui_vram_budget()`.
+    gui_vram_warned: bool,
+    /// Frame counter for LRU eviction of unused GUI / FX textures.
+    vram_frame: u64,
+    /// Last `gpu_health::oom_epoch()` reacted to by reclaiming optional VRAM.
+    last_oom_epoch: u64,
     /// EditableImage textures (runtime/editable.rs) by id without the
     /// generation: the generation shown (updated in place when it moves on).
     editable_gens: HashMap<String, u64>,
@@ -777,8 +841,14 @@ fn name_of(d: &Document, r: Ref) -> String {
 
 /// Gradient colour and transparency at t (0..1) along a UIGradient.
 fn sample_gradient(d: &Document, g: Ref, t: f32) -> ([f32; 3], f32) {
+    sample_seqs(&d.prop(g, "Color"), &d.prop(g, "Transparency"), t)
+}
+
+/// Colour and transparency at t (0..1) of a UIGradient's Color and
+/// Transparency (read once by the caller).
+fn sample_seqs(color: &Option<Variant>, transparency: &Option<Variant>, t: f32) -> ([f32; 3], f32) {
     let t = t.clamp(0.0, 1.0);
-    let c = match d.prop(g, "Color") {
+    let c = match color {
         Some(Variant::ColorSequence(seq)) if !seq.keypoints.is_empty() => {
             let k = &seq.keypoints;
             let mut out = [k[0].color.r, k[0].color.g, k[0].color.b];
@@ -804,7 +874,7 @@ fn sample_gradient(d: &Document, g: Ref, t: f32) -> ([f32; 3], f32) {
         }
         _ => [1.0, 1.0, 1.0],
     };
-    let a = match d.prop(g, "Transparency") {
+    let a = match transparency {
         Some(Variant::NumberSequence(seq)) if !seq.keypoints.is_empty() => {
             let k = &seq.keypoints;
             let mut out = k[0].value;
@@ -895,30 +965,167 @@ fn recolor_galley(
 }
 
 /// A UIGradient over a rect: point → (colour, transparency).
-struct Grad<'a> {
-    d: &'a Document,
-    g: Ref,
+struct Grad {
+    color: Option<Variant>,
+    transparency: Option<Variant>,
     rect: Rect,
     dir: egui::Vec2,
     offset: [f32; 2],
+    /// Where the colour or transparency can bend: every keypoint time, and
+    /// 0 and 1 (past them the sequence is held). Between two of these both
+    /// are linear in t, so a mesh cut along them is exact (`Grad::mesh`);
+    /// spans where both change are cut finer (`Grad::new`).
+    cuts: Vec<f32>,
 }
 
-impl Grad<'_> {
-    fn new(d: &Document, g: Ref, rect: Rect) -> Grad<'_> {
+impl Grad {
+    fn new(d: &Document, g: Ref, rect: Rect) -> Grad {
         let rot = num(d, g, "Rotation", 0.0).to_radians();
+        let (color, transparency) = (d.prop(g, "Color"), d.prop(g, "Transparency"));
+        let mut cuts = vec![0.0, 1.0];
+        if let Some(Variant::ColorSequence(s)) = &color {
+            cuts.extend(s.keypoints.iter().map(|k| k.time));
+        }
+        if let Some(Variant::NumberSequence(s)) = &transparency {
+            cuts.extend(s.keypoints.iter().map(|k| k.time));
+        }
+        cuts.retain(|t| (0.0..=1.0).contains(t));
+        cuts.sort_by(f32::total_cmp);
+        cuts.dedup();
+        // Where colour and transparency both change between two cuts, the
+        // premultiplied colour the GPU interpolates (their product) is
+        // quadratic in t, not linear: cut that span into n so the error,
+        // dc * da / (4 n^2), stays under one 8-bit step, but no finer than
+        // a pixel apart.
+        let dir = egui::vec2(rot.cos(), rot.sin());
+        let px_per_t = 1.0
+            / ((dir.x / rect.width().max(1e-3)).powi(2) + (dir.y / rect.height().max(1e-3)).powi(2))
+                .sqrt()
+                .max(1e-6);
+        let mut fine = Vec::with_capacity(cuts.len());
+        for w in cuts.windows(2) {
+            fine.push(w[0]);
+            let ((c0, a0), (c1, a1)) = (sample_seqs(&color, &transparency, w[0]), sample_seqs(&color, &transparency, w[1]));
+            let dc = (0..3).map(|i| (c1[i] - c0[i]).abs()).fold(0.0, f32::max);
+            let q = dc * (a1 - a0).abs();
+            let n = ((q * 255.0 / 4.0).sqrt().ceil()).min(((w[1] - w[0]) * px_per_t).ceil()).max(1.0) as usize;
+            fine.extend((1..n).map(|i| w[0] + (w[1] - w[0]) * i as f32 / n as f32));
+        }
+        fine.extend(cuts.last());
         Grad {
-            d,
-            g,
+            color,
+            transparency,
             rect,
-            dir: egui::vec2(rot.cos(), rot.sin()),
+            dir,
             offset: vec2(d, g, "Offset", [0.0, 0.0]),
+            cuts: fine,
         }
     }
-    fn at(&self, p: Pos2) -> ([f32; 3], f32) {
+    /// The gradient position at p (unclamped; 0..1 across the gradient).
+    fn t(&self, p: Pos2) -> f32 {
         // Position in the unit square around the centre, minus Offset, along the direction.
         let u = (p.x - self.rect.center().x) / self.rect.width().max(1e-3) - self.offset[0];
         let v = (p.y - self.rect.center().y) / self.rect.height().max(1e-3) - self.offset[1];
-        sample_gradient(self.d, self.g, u * self.dir.x + v * self.dir.y + 0.5)
+        u * self.dir.x + v * self.dir.y + 0.5
+    }
+    fn at(&self, p: Pos2) -> ([f32; 3], f32) {
+        sample_seqs(&self.color, &self.transparency, self.t(p))
+    }
+    /// `m` (drawn in white, its vertex alpha the coverage: 0 on an
+    /// anti-aliased fringe) coloured by `col` under this gradient. Vertex
+    /// colours are interpolated linearly, so the triangles are first cut
+    /// along every line where t crosses a keypoint: a hard step (a health
+    /// bar cut by a 0.001-wide transparency step) stays a hard step instead
+    /// of blurring across the whole triangle, and a narrow peak between
+    /// two vertices isn't lost.
+    fn mesh(&self, m: Mesh, col: &dyn Fn(Pos2) -> Color32) -> Mesh {
+        let mut out = Mesh::with_texture(m.texture_id);
+        let paint = |v: &Vertex| {
+            let c = col(v.pos);
+            let k = v.color.a() as f32 / 255.0;
+            let s = |x: u8| (x as f32 * k).round() as u8;
+            Vertex {
+                pos: v.pos,
+                uv: v.uv,
+                color: Color32::from_rgba_premultiplied(s(c.r()), s(c.g()), s(c.b()), s(c.a())),
+            }
+        };
+        // Most triangles cross no cut: they keep their shared vertices,
+        // each coloured once.
+        let ts: Vec<f32> = m.vertices.iter().map(|v| self.t(v.pos)).collect();
+        let mut shared: Vec<Option<u32>> = vec![None; m.vertices.len()];
+        let mut pieces: Vec<Vec<Vertex>> = Vec::new();
+        let mut next: Vec<Vec<Vertex>> = Vec::new();
+        for tri in m.indices.chunks_exact(3) {
+            let (Some(a), Some(b), Some(c)) = (
+                m.vertices.get(tri[0] as usize),
+                m.vertices.get(tri[1] as usize),
+                m.vertices.get(tri[2] as usize),
+            ) else { continue };
+            let [ta, tb, tc] = [0, 1, 2].map(|i| ts[tri[i] as usize]);
+            let (lo, hi) = (ta.min(tb).min(tc), ta.max(tb).max(tc));
+            // The cuts strictly inside the triangle's span (sorted).
+            let first = self.cuts.partition_point(|&k| k <= lo);
+            let inside = &self.cuts[first..self.cuts.partition_point(|&k| k < hi).max(first)];
+            if inside.is_empty() {
+                for &i in tri {
+                    let o = *shared[i as usize].get_or_insert_with(|| {
+                        out.vertices.push(paint(&m.vertices[i as usize]));
+                        out.vertices.len() as u32 - 1
+                    });
+                    out.indices.push(o);
+                }
+                continue;
+            }
+            pieces.clear();
+            pieces.push(vec![*a, *b, *c]);
+            for &cut in inside {
+                next.clear();
+                for poly in &pieces {
+                    let ts: Vec<f32> = poly.iter().map(|v| self.t(v.pos)).collect();
+                    if ts.iter().all(|&t| t >= cut) || ts.iter().all(|&t| t <= cut) {
+                        next.push(poly.clone());
+                        continue;
+                    }
+                    let (mut below, mut above) = (Vec::new(), Vec::new());
+                    for k in 0..poly.len() {
+                        let j = (k + 1) % poly.len();
+                        if ts[k] <= cut {
+                            below.push(poly[k]);
+                        }
+                        if ts[k] >= cut {
+                            above.push(poly[k]);
+                        }
+                        if (ts[k] < cut) != (ts[j] < cut) && ts[k] != cut && ts[j] != cut {
+                            // Interpolate from the same end whichever triangle
+                            // owns the edge, so neighbours meet without a crack.
+                            let (p, q, tp, tq) = if (poly[k].pos.x, poly[k].pos.y) <= (poly[j].pos.x, poly[j].pos.y) {
+                                (&poly[k], &poly[j], ts[k], ts[j])
+                            } else {
+                                (&poly[j], &poly[k], ts[j], ts[k])
+                            };
+                            let v = lerp_vertex(p, q, (cut - tp) / (tq - tp));
+                            below.push(v);
+                            above.push(v);
+                        }
+                    }
+                    for side in [below, above] {
+                        if side.len() >= 3 {
+                            next.push(side);
+                        }
+                    }
+                }
+                std::mem::swap(&mut pieces, &mut next);
+            }
+            for poly in &pieces {
+                let base = out.vertices.len() as u32;
+                out.vertices.extend(poly.iter().map(paint));
+                for k in 1..poly.len() as u32 - 1 {
+                    out.indices.extend_from_slice(&[base, base + k, base + k + 1]);
+                }
+            }
+        }
+        out
     }
 }
 
@@ -1588,14 +1795,11 @@ fn font_of(d: &Document, r: Ref) -> (String, u32, bool) {
     let has = |n: &str| inst.is_some_and(|i| i.properties.contains_key(&rbx_dom_weak::ustr(n)));
     let face = || match d.prop(r, "FontFace") {
         Some(Variant::Font(f)) => Some((
-            // Studio writes Gotham (Font.Gotham*) as GothamSSm.json, a family
-            // its content doesn't have; it draws Montserrat for it, as the
-            // legacy Gotham fonts here (`legacy_font`).
-            if f.family.ends_with("/GothamSSm.json") {
-                "rbxasset://fonts/families/Montserrat.json".to_string()
-            } else {
-                f.family.clone()
-            },
+            // Studio writes Gotham (Font.Gotham*) as GothamSSm.json and
+            // Arial as Arial.json, families its content doesn't have; it
+            // draws Montserrat and Arimo for them, as the legacy fonts here
+            // (`legacy_font`).
+            crate::font_enum::drawn_family(&f.family),
             weight_of(f.weight),
             matches!(f.style, rbx_dom_weak::types::FontStyle::Italic),
         )),
@@ -2005,11 +2209,159 @@ impl Gui {
         true
     }
 
+    /// Advances the LRU frame clock and reclaims optional GUI/FX VRAM if a new
+    /// GPU OOM event occurred elsewhere in the renderer.
+    pub fn begin_vram_frame(&mut self) {
+        self.vram_frame = self.vram_frame.saturating_add(1);
+        self.sync_oom_pressure();
+    }
+
+    fn sync_oom_pressure(&mut self) -> bool {
+        let epoch = rustudio_render::gpu_health::oom_epoch();
+        if epoch != self.last_oom_epoch {
+            self.last_oom_epoch = epoch;
+            self.reclaim_vram(0, true);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Reclaims GUI/FX texture VRAM without disabling active particles, beams,
+    /// trails, or visible GUIs:
+    /// 1. Drops optional CPU-generated GUI mip chains (~25-33% of GUI VRAM).
+    /// 2. Evicts least-recently-used cold textures not used this frame.
+    /// 3. If still over budget, evicts oversized (> 64×64) textures so they
+    ///    reload at compact resolution on next use.
+    fn reclaim_vram(&mut self, needed_bytes: usize, force_oom_trim: bool) {
+        let budget = rustudio_render::gpu_caps::gui_vram_budget();
+        let over_budget = budget < usize::MAX && self.gui_vram_bytes.saturating_add(needed_bytes) > budget;
+        if !force_oom_trim && !over_budget {
+            return;
+        }
+        if over_budget && !self.gui_vram_warned {
+            self.gui_vram_warned = true;
+            rustudio_render::gpu_health::warn_gui_budget(self.gui_vram_bytes, budget);
+        }
+        let target = if budget == usize::MAX {
+            usize::MAX
+        } else if force_oom_trim {
+            (budget * 3 / 4).saturating_sub(needed_bytes)
+        } else {
+            budget.saturating_sub(needed_bytes)
+        };
+        let mut freed = 0usize;
+
+        // Pass 1: Drop optional GUI mipmap copies first (zero missing images).
+        if !self.mips.is_empty() {
+            self.mips.clear();
+            for img in self.images.values_mut() {
+                if let Img::Ready { mip_bytes, .. } = img {
+                    if *mip_bytes > 0 {
+                        self.gui_vram_bytes = self.gui_vram_bytes.saturating_sub(*mip_bytes);
+                        freed = freed.saturating_add(*mip_bytes);
+                        *mip_bytes = 0;
+                    }
+                }
+            }
+        }
+
+        // Pass 2: Evict least-recently-used cold textures (never those used on
+        // the current frame, and never EditableImages).
+        let need_evict = (budget < usize::MAX && self.gui_vram_bytes > target) || force_oom_trim;
+        if need_evict {
+            let cur = self.vram_frame;
+            // When budget is unlimited (e.g. RUSTUDIO_GUI_VRAM_MB=0) but an OOM
+            // happened, only evict textures idle for >= 120 frames (~2s).
+            let max_last_used = if budget == usize::MAX {
+                cur.saturating_sub(120)
+            } else {
+                cur.saturating_sub(1)
+            };
+            let mut candidates: Vec<(u64, usize, bool, String)> = Vec::new();
+            for (k, v) in &self.images {
+                if let Img::Ready { base_bytes, mip_bytes, last_used, editable, .. } = v {
+                    if !*editable && *last_used <= max_last_used {
+                        candidates.push((*last_used, base_bytes + mip_bytes, false, k.clone()));
+                    }
+                }
+            }
+            for (k, v) in &self.fx_images {
+                if let FxImg::Ready { bytes, last_used, .. } = v {
+                    if *last_used <= max_last_used {
+                        candidates.push((*last_used, *bytes, true, k.clone()));
+                    }
+                }
+            }
+            // Oldest first; break ties by largest allocation first.
+            candidates.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| b.1.cmp(&a.1)));
+            for (_, bytes, is_fx, key) in candidates {
+                if budget < usize::MAX && self.gui_vram_bytes <= target {
+                    break;
+                }
+                if is_fx {
+                    self.fx_images.remove(&key);
+                } else {
+                    self.images.remove(&key);
+                    self.mips.remove(&key);
+                }
+                self.gui_vram_bytes = self.gui_vram_bytes.saturating_sub(bytes);
+                freed = freed.saturating_add(bytes);
+            }
+        }
+
+        // Pass 3: If STILL over budget (everything is active at once), evict
+        // oversized (> 64×64) textures from earlier frames so they reload at
+        // compact 64×64 (~16 KiB) resolution instead of stopping effects.
+        const COMPACT_BYTES: usize = 64 * 64 * 4;
+        if budget < usize::MAX && self.gui_vram_bytes > target {
+            let mut oversized: Vec<(u64, usize, bool, String)> = Vec::new();
+            for (k, v) in &self.images {
+                if let Img::Ready { base_bytes, mip_bytes, last_used, editable, .. } = v {
+                    let b = base_bytes + mip_bytes;
+                    if !*editable && b > COMPACT_BYTES && *last_used < self.vram_frame {
+                        oversized.push((*last_used, b, false, k.clone()));
+                    }
+                }
+            }
+            for (k, v) in &self.fx_images {
+                if let FxImg::Ready { bytes, last_used, .. } = v {
+                    if *bytes > COMPACT_BYTES && *last_used < self.vram_frame {
+                        oversized.push((*last_used, *bytes, true, k.clone()));
+                    }
+                }
+            }
+            oversized.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+            for (_, bytes, is_fx, key) in oversized {
+                if self.gui_vram_bytes <= target {
+                    break;
+                }
+                if is_fx {
+                    self.fx_images.remove(&key);
+                } else {
+                    self.images.remove(&key);
+                    self.mips.remove(&key);
+                }
+                self.gui_vram_bytes = self.gui_vram_bytes.saturating_sub(bytes);
+                freed = freed.saturating_add(bytes);
+            }
+        }
+
+        rustudio_render::gpu_health::note_vram_reclaimed("GUI/FX textures", freed);
+    }
+
+    fn compact_color_image(mut img: egui::ColorImage, max_dim: usize) -> egui::ColorImage {
+        while (img.size[0] > max_dim || img.size[1] > max_dim) && (img.size[0] > 1 || img.size[1] > 1) {
+            img = half_image(&img);
+        }
+        img
+    }
+
     /// Whether an image went through `texture` (GUI images and, since
     /// round 26, effect textures): loaded, failed, or never asked for (None).
     pub fn image_state(&self, id: &str) -> Option<Result<(), String>> {
         match self.images.get(id)? {
-            Img::Ready(..) => Some(Ok(())),
+            Img::Ready { .. } => Some(Ok(())),
             Img::Failed => Some(Err("not decoded or unavailable".into())),
         }
     }
@@ -2022,28 +2374,45 @@ impl Gui {
         doc_dir: Option<&std::path::Path>,
         id: &str,
     ) -> Option<(egui::TextureId, [usize; 2])> {
+        let now_frame = self.vram_frame;
         if let Some((base, gen)) = rustudio_core::editable_source::image_key(id) {
             // (EditableImage pixels change without a document mark)
             self.no_cache = Some("editable image");
             if self.editable_gens.get(base).is_some_and(|h| *h >= gen) {
-                if let Some(Img::Ready(h, s)) = self.images.get(base) {
-                    return Some((h.id(), *s));
+                if let Some(Img::Ready { handle, size, last_used, .. }) = self.images.get_mut(base) {
+                    *last_used = now_frame;
+                    return Some((handle.id(), *size));
                 }
             }
             let (now, img) = rustudio_core::editable_source::image_pixels(id)?;
             let size = [img.width as usize, img.height as usize];
+            let new_bytes = size[0].saturating_mul(size[1]).saturating_mul(4);
             let color = egui::ColorImage::from_rgba_unmultiplied(size, &img.pixels);
             let opts = egui::TextureOptions::NEAREST;
             let out = match self.images.get_mut(base) {
-                Some(Img::Ready(h, s)) => {
-                    h.set(color, opts);
+                Some(Img::Ready { handle, size: s, base_bytes, last_used, .. }) => {
+                    handle.set(color, opts);
                     *s = size;
-                    (h.id(), size)
+                    self.gui_vram_bytes = self.gui_vram_bytes.saturating_sub(*base_bytes).saturating_add(new_bytes);
+                    *base_bytes = new_bytes;
+                    *last_used = now_frame;
+                    (handle.id(), size)
                 }
                 _ => {
-                    let h = ctx.load_texture(format!("gui:{base}"), color, opts);
-                    let out = (h.id(), size);
-                    self.images.insert(base.to_string(), Img::Ready(h, size));
+                    let handle = ctx.load_texture(format!("gui:{base}"), color, opts);
+                    let out = (handle.id(), size);
+                    self.gui_vram_bytes = self.gui_vram_bytes.saturating_add(new_bytes);
+                    self.images.insert(
+                        base.to_string(),
+                        Img::Ready {
+                            handle,
+                            size,
+                            base_bytes: new_bytes,
+                            mip_bytes: 0,
+                            last_used: now_frame,
+                            editable: true,
+                        },
+                    );
                     out
                 }
             };
@@ -2056,9 +2425,12 @@ impl Gui {
         if self.images_decoding.contains(id) {
             self.poll_images(ctx);
         }
-        if let Some(i) = self.images.get(id) {
+        if let Some(i) = self.images.get_mut(id) {
             return match i {
-                Img::Ready(h, s) => Some((h.id(), *s)),
+                Img::Ready { handle, size, last_used, .. } => {
+                    *last_used = now_frame;
+                    Some((handle.id(), *size))
+                }
                 Img::Failed => None,
             };
         }
@@ -2101,26 +2473,79 @@ impl Gui {
                 }
             }
         }
+        self.sync_oom_pressure();
+        let (max_dim, max_mips) = self.gui_image_limits();
         // Fixed-step runs decode here, so captures don't depend on the
         // host's timing; otherwise the decode and mip levels are made on
         // the decode threads and the image shows from the frame they land
         // (as while it downloads).
         if rustudio_core::sim_clock::on() {
-            let decoded = decode_gui_image(&bytes);
+            let decoded = decode_gui_image(&bytes, max_dim, max_mips);
             return self.finish_image(ctx, id, decoded);
+        }
+        if self.images_decoding.len() + self.images_ready.len() >= 16 {
+            self.no_cache = Some("image decode queue full");
+            ctx.request_repaint();
+            return None;
         }
         let (tx, _) = self.image_decode.get_or_insert_with(std::sync::mpsc::channel);
         let tx = tx.clone();
         let repaint = ctx.clone();
         let name = id.to_string();
         decode_off_thread(Box::new(move || {
-            let decoded = decode_gui_image(&bytes);
+            let decoded = decode_gui_image(&bytes, max_dim, max_mips);
             let _ = tx.send((name, decoded));
             repaint.request_repaint();
         }));
         self.images_decoding.insert(id.to_string());
         self.no_cache = Some("image loading");
         None
+    }
+
+    fn gui_image_limits(&self) -> (u32, usize) {
+        let low = rustudio_render::gpu_caps::is_low_vram_global();
+        let oom = rustudio_render::gpu_health::oom_seen();
+        let budget = rustudio_render::gpu_caps::gui_vram_budget();
+        let (mut max_dim, mut max_mips) = if low { (512u32, 2usize) } else { (u32::MAX, 8usize) };
+        if oom {
+            max_dim = max_dim.min(if low { 64 } else { 128 });
+            max_mips = 0;
+        }
+        if budget < usize::MAX {
+            let b = budget.max(1);
+            if self.gui_vram_bytes >= b {
+                max_dim = max_dim.min(64);
+                max_mips = 0;
+            } else if self.gui_vram_bytes.saturating_mul(5) >= b.saturating_mul(4) {
+                max_dim = max_dim.min(128);
+                max_mips = 0;
+            } else if self.gui_vram_bytes.saturating_mul(2) >= b {
+                max_dim = max_dim.min(if oom { 64 } else { 256 });
+                max_mips = max_mips.min(1);
+            }
+        }
+        (max_dim, max_mips)
+    }
+
+    fn fx_image_max_dim(&self) -> u32 {
+        let low = rustudio_render::gpu_caps::is_low_vram_global();
+        let oom = rustudio_render::gpu_health::oom_seen();
+        let budget = rustudio_render::gpu_caps::gui_vram_budget();
+        let mut max_dim = if low { 256u32 } else { u32::MAX };
+        if oom {
+            max_dim = max_dim.min(if low { 64 } else { 128 });
+        }
+        if budget < usize::MAX {
+            let b = budget.max(1);
+            if self.gui_vram_bytes >= b {
+                max_dim = max_dim.min(64);
+            } else if self.gui_vram_bytes.saturating_mul(5) >= b.saturating_mul(4) {
+                max_dim = max_dim.min(if low || oom { 64 } else { 256 });
+            } else if self.gui_vram_bytes.saturating_mul(2) >= b {
+                max_dim = max_dim.min(if low || oom { 64 } else { 512 });
+            }
+        }
+        max_dim
     }
 
     /// Makes the textures of images decoded off the main thread, at most
@@ -2154,20 +2579,57 @@ impl Gui {
         id: &str,
         decoded: Option<(egui::ColorImage, Vec<egui::ColorImage>)>,
     ) -> Option<(egui::TextureId, [usize; 2])> {
-        let Some((base, levels)) = decoded else {
+        let Some((mut base, mut levels)) = decoded else {
             self.images.insert(id.to_string(), Img::Failed);
             return None;
         };
+        let oom_changed = self.sync_oom_pressure();
+        let oom = rustudio_render::gpu_health::oom_seen();
+        let budget = rustudio_render::gpu_caps::gui_vram_budget();
+        let mut base_bytes = base.pixels.len() * 4;
+        let mut mip_bytes: usize = levels.iter().map(|l| l.pixels.len() * 4).sum();
+        if oom || (budget < usize::MAX && self.gui_vram_bytes.saturating_add(base_bytes + mip_bytes) > budget) {
+            // Drop optional mip levels first and reclaim LRU textures so the
+            // image still loads instead of disappearing.
+            levels.clear();
+            mip_bytes = 0;
+            self.reclaim_vram(base_bytes, oom_changed);
+            if oom || (budget < usize::MAX && self.gui_vram_bytes.saturating_add(base_bytes) > budget) {
+                let cap = if budget < usize::MAX && self.gui_vram_bytes.saturating_add(base_bytes) > budget {
+                    64
+                } else {
+                    self.gui_image_limits().0 as usize
+                };
+                if base.size[0] > cap || base.size[1] > cap {
+                    base = Self::compact_color_image(base, cap);
+                    base_bytes = base.pixels.len() * 4;
+                }
+            }
+        }
         let levels = levels
             .into_iter()
             .enumerate()
             .map(|(i, level)| ctx.load_texture(format!("gui:{id}#{}", i + 1), level, egui::TextureOptions::LINEAR))
-            .collect();
-        self.mips.insert(id.to_string(), levels);
+            .collect::<Vec<_>>();
+        if !levels.is_empty() {
+            self.mips.insert(id.to_string(), levels);
+        }
         let size = base.size;
-        let h = ctx.load_texture(format!("gui:{id}"), base, egui::TextureOptions::LINEAR);
-        let out = (h.id(), size);
-        self.images.insert(id.to_string(), Img::Ready(h, size));
+        let handle = ctx.load_texture(format!("gui:{id}"), base, egui::TextureOptions::LINEAR);
+        let added_bytes = base_bytes.saturating_add(mip_bytes);
+        self.gui_vram_bytes = self.gui_vram_bytes.saturating_add(added_bytes);
+        let out = (handle.id(), size);
+        self.images.insert(
+            id.to_string(),
+            Img::Ready {
+                handle,
+                size,
+                base_bytes,
+                mip_bytes,
+                last_used: self.vram_frame,
+                editable: false,
+            },
+        );
         share().loaded.insert(id.to_string());
         Some(out)
     }
@@ -2183,19 +2645,58 @@ impl Gui {
         doc_dir: Option<&std::path::Path>,
         id: &str,
     ) -> Option<egui::TextureId> {
+        let oom_changed = self.sync_oom_pressure();
         if let Some((_, rx)) = &self.fx_image_decode {
-            let ready: Vec<_> = rx.try_iter().collect();
-            for (name, decoded) in ready {
-                self.fx_images_decoding.remove(&name);
-                let handle = decoded.map(|img| ctx.load_texture(format!("fx:{name}"), img, egui::TextureOptions::LINEAR));
-                self.fx_images.insert(name, handle);
+            self.fx_images_ready.extend(rx.try_iter());
+        }
+        let mut frame_budget: usize = 8 << 20;
+        let mut first = true;
+        let budget = rustudio_render::gpu_caps::gui_vram_budget();
+        let oom = rustudio_render::gpu_health::oom_seen();
+        while let Some((_, decoded)) = self.fx_images_ready.front() {
+            let bytes = decoded.as_ref().map_or(0, |img| img.pixels.len() * 4);
+            if !first && bytes > frame_budget {
+                ctx.request_repaint();
+                break;
             }
+            first = false;
+            frame_budget = frame_budget.saturating_sub(bytes);
+            let (name, decoded) = self.fx_images_ready.pop_front().expect("front");
+            self.fx_images_decoding.remove(&name);
+            let entry = match decoded {
+                None => FxImg::Failed,
+                Some(mut img) => {
+                    let mut b = img.pixels.len() * 4;
+                    if oom || (budget < usize::MAX && self.gui_vram_bytes.saturating_add(b) > budget) {
+                        self.reclaim_vram(b, oom_changed);
+                        let cap = if budget < usize::MAX && self.gui_vram_bytes.saturating_add(b) > budget {
+                            64
+                        } else {
+                            self.fx_image_max_dim() as usize
+                        };
+                        if img.size[0] > cap || img.size[1] > cap {
+                            img = Self::compact_color_image(img, cap);
+                            b = img.pixels.len() * 4;
+                        }
+                    }
+                    self.gui_vram_bytes = self.gui_vram_bytes.saturating_add(b);
+                    let handle = ctx.load_texture(format!("fx:{name}"), img, egui::TextureOptions::LINEAR);
+                    FxImg::Ready { handle, bytes: b, last_used: self.vram_frame }
+                }
+            };
+            self.fx_images.insert(name, entry);
         }
         if !store.allows(id) {
             return None;
         }
-        if let Some(entry) = self.fx_images.get(id) {
-            return entry.as_ref().map(|h| h.id());
+        if let Some(entry) = self.fx_images.get_mut(id) {
+            return match entry {
+                FxImg::Ready { handle, last_used, .. } => {
+                    *last_used = self.vram_frame;
+                    Some(handle.id())
+                }
+                FxImg::Failed => None,
+            };
         }
         if self.fx_images_decoding.contains(id) {
             return None;
@@ -2204,7 +2705,7 @@ impl Gui {
             Fetch::Ready(b) => b,
             Fetch::Pending => return None,
             Fetch::Unavailable(_) => {
-                self.fx_images.insert(id.to_string(), None);
+                self.fx_images.insert(id.to_string(), FxImg::Failed);
                 return None;
             }
         };
@@ -2222,23 +2723,46 @@ impl Gui {
                 Some(Fetch::Ready(b)) => bytes = b,
                 Some(Fetch::Pending) => return None,
                 _ => {
-                    self.fx_images.insert(id.to_string(), None);
+                    self.fx_images.insert(id.to_string(), FxImg::Failed);
                     return None;
                 }
             }
         }
+        let max_dim = self.fx_image_max_dim();
         if rustudio_core::sim_clock::on() {
-            let handle = decode_fx_image(&bytes).map(|img| ctx.load_texture(format!("fx:{id}"), img, egui::TextureOptions::LINEAR));
-            let tid = handle.as_ref().map(|h| h.id());
-            self.fx_images.insert(id.to_string(), handle);
+            let entry = match decode_fx_image(&bytes, max_dim) {
+                None => FxImg::Failed,
+                Some(mut img) => {
+                    let mut b = img.pixels.len() * 4;
+                    if oom || (budget < usize::MAX && self.gui_vram_bytes.saturating_add(b) > budget) {
+                        self.reclaim_vram(b, oom_changed);
+                        if budget < usize::MAX && self.gui_vram_bytes.saturating_add(b) > budget {
+                            img = Self::compact_color_image(img, 64);
+                            b = img.pixels.len() * 4;
+                        }
+                    }
+                    self.gui_vram_bytes = self.gui_vram_bytes.saturating_add(b);
+                    let handle = ctx.load_texture(format!("fx:{id}"), img, egui::TextureOptions::LINEAR);
+                    FxImg::Ready { handle, bytes: b, last_used: self.vram_frame }
+                }
+            };
+            let tid = match &entry {
+                FxImg::Ready { handle, .. } => Some(handle.id()),
+                FxImg::Failed => None,
+            };
+            self.fx_images.insert(id.to_string(), entry);
             return tid;
+        }
+        if self.fx_images_decoding.len() + self.fx_images_ready.len() >= 16 {
+            ctx.request_repaint();
+            return None;
         }
         let (tx, _) = self.fx_image_decode.get_or_insert_with(std::sync::mpsc::channel);
         let tx = tx.clone();
         let repaint = ctx.clone();
         let name = id.to_string();
         decode_off_thread(Box::new(move || {
-            let decoded = decode_fx_image(&bytes);
+            let decoded = decode_fx_image(&bytes, max_dim);
             let _ = tx.send((name, decoded));
             repaint.request_repaint();
         }));
@@ -2595,6 +3119,62 @@ mod tests {
     }
 
     #[test]
+    fn downscale_rgba_caps_large_textures() {
+        let img = rustudio_core::texture::Rgba {
+            width: 512,
+            height: 256,
+            pixels: vec![120u8; 512 * 256 * 4],
+        };
+        let out = downscale_rgba(img, 128);
+        assert_eq!((out.width, out.height), (128, 64));
+        assert_eq!(out.pixels.len(), 128 * 64 * 4);
+        assert!(out.pixels.iter().all(|&b| b == 120));
+    }
+
+    #[test]
+    fn reclaim_vram_drops_mips_and_lru_without_blocking_active_fx() {
+        let ctx = egui::Context::default();
+        let mut gui = Gui::default();
+        gui.vram_frame = 1;
+
+        // Frame 1: load a cold GUI texture with mip levels and a cold FX texture.
+        let big = egui::ColorImage::filled([256, 256], Color32::from_rgba_premultiplied(200, 100, 50, 255));
+        let mip = egui::ColorImage::filled([128, 128], Color32::from_rgba_premultiplied(200, 100, 50, 255));
+        assert!(gui.finish_image(&ctx, "cold_gui", Some((big.clone(), vec![mip]))).is_some());
+        assert!(gui.mips.contains_key("cold_gui"));
+        let cold_fx_h = ctx.load_texture("fx:cold_fx", big.clone(), egui::TextureOptions::LINEAR);
+        let cold_fx_bytes = big.pixels.len() * 4;
+        gui.gui_vram_bytes += cold_fx_bytes;
+        gui.fx_images.insert(
+            "cold_fx".into(),
+            FxImg::Ready { handle: cold_fx_h, bytes: cold_fx_bytes, last_used: 1 },
+        );
+
+        // Frame 2: load an active FX texture used this frame.
+        gui.vram_frame = 2;
+        let active_fx_h = ctx.load_texture("fx:active_fx", big.clone(), egui::TextureOptions::LINEAR);
+        gui.gui_vram_bytes += cold_fx_bytes;
+        gui.fx_images.insert(
+            "active_fx".into(),
+            FxImg::Ready { handle: active_fx_h, bytes: cold_fx_bytes, last_used: 2 },
+        );
+        let before = gui.gui_vram_bytes;
+        assert!(before > 0);
+
+        // Force OOM reclamation: drops optional mips + cold LRU entries,
+        // keeps the active current-frame FX texture alive.
+        gui.reclaim_vram(0, true);
+        assert!(gui.mips.is_empty(), "optional GUI mips should be purged under pressure");
+        assert!(gui.gui_vram_bytes < before, "reclaim_vram should free tracked bytes");
+        assert!(matches!(gui.fx_images.get("active_fx"), Some(FxImg::Ready { .. })));
+
+        // Compact helper scales oversized images cleanly to <= 64x64 (~16 KiB).
+        let compacted = Gui::compact_color_image(big, 64);
+        assert_eq!(compacted.size, [64, 64]);
+        assert_eq!(compacted.pixels.len() * 4, 64 * 64 * 4);
+    }
+
+    #[test]
     fn rich_text_runs() {
         let runs = rich_runs(
             "a <b>bold</b> <font color=\"#FF0000\" size=\"20\">red</font><br/>x &lt;y&gt;",
@@ -2692,6 +3272,172 @@ mod tests {
         assert!(img.vertices.iter().all(|v| {
             v.uv.x >= 0.2499 && v.uv.x <= 0.7501 && v.uv.y >= 0.2499 && v.uv.y <= 0.7501
         }));
+    }
+
+    /// A mesh's interpolated vertex alpha at p (the triangle holding it).
+    fn mesh_alpha_at(m: &Mesh, p: Pos2) -> Option<f32> {
+        mesh_rgba_at(m, p).map(|c| c[3])
+    }
+
+    /// A mesh's interpolated (premultiplied) vertex colour at p.
+    fn mesh_rgba_at(m: &Mesh, p: Pos2) -> Option<[f32; 4]> {
+        for t in m.indices.chunks_exact(3) {
+            let [a, b, c] = [0, 1, 2].map(|i| m.vertices[t[i] as usize]);
+            let d = (b.pos.y - c.pos.y) * (a.pos.x - c.pos.x) + (c.pos.x - b.pos.x) * (a.pos.y - c.pos.y);
+            if d.abs() < 1e-9 {
+                continue;
+            }
+            let wa = ((b.pos.y - c.pos.y) * (p.x - c.pos.x) + (c.pos.x - b.pos.x) * (p.y - c.pos.y)) / d;
+            let wb = ((c.pos.y - a.pos.y) * (p.x - c.pos.x) + (a.pos.x - c.pos.x) * (p.y - c.pos.y)) / d;
+            let wc = 1.0 - wa - wb;
+            if wa >= -1e-4 && wb >= -1e-4 && wc >= -1e-4 {
+                let ch = |i: usize| {
+                    let v = |x: Vertex| x.color.to_array()[i] as f32;
+                    wa * v(a) + wb * v(b) + wc * v(c)
+                };
+                return Some([ch(0), ch(1), ch(2), ch(3)]);
+            }
+        }
+        None
+    }
+
+    /// A UIGradient cut (a 0.001-wide transparency step moved by Offset,
+    /// as health bars use) stays a hard edge at the cut, with or without a
+    /// UICorner, instead of fading across the triangles around it.
+    #[test]
+    fn gradient_cut_stays_hard() {
+        use rbx_dom_weak::{types::{NumberSequence, NumberSequenceKeypoint, Vector2}, InstanceBuilder};
+        let mut doc = Document::new_place();
+        let root = doc.dom.root_ref();
+        let kp = |t: f32, v: f32| NumberSequenceKeypoint::new(t, v, 0.0);
+        let g = doc.dom.insert(root, InstanceBuilder::new("UIGradient")
+            .with_property("Transparency", NumberSequence {
+                keypoints: vec![kp(0.0, 0.0), kp(0.5, 0.0), kp(0.501, 1.0), kp(1.0, 1.0)],
+            })
+            // Cut at 60% of the bar: Offset = fraction - 0.5.
+            .with_property("Offset", Vector2::new(0.1, 0.0)));
+        let rect = Rect::from_min_size(Pos2::new(0.0, 0.0), egui::vec2(200.0, 17.0));
+        let gr = Grad::new(&doc, g, rect);
+        let col = |p: Pos2| rgba([1.0, 0.0, 0.0], 1.0 - gr.at(p).1);
+        let white = |_: Pos2| Color32::WHITE;
+        let uv = Rect::from_min_max(egui::epaint::WHITE_UV, egui::epaint::WHITE_UV);
+        for (name, shape) in [
+            ("square", quad_mesh(rect, uv, egui::TextureId::default(), &white, 1)),
+            ("rounded", fill_rounded_aa_mesh(rect, 6.0, 1.0, None, egui::TextureId::default(), &white, true)),
+        ] {
+            let m = gr.mesh(shape, &col);
+            for y in [3.0, 8.5, 14.0] {
+                // The cut is at x = 120 (0.2 px wide); 1 px either side is
+                // fully drawn / fully cut.
+                let left = mesh_alpha_at(&m, Pos2::new(119.0, y)).unwrap();
+                let right = mesh_alpha_at(&m, Pos2::new(121.0, y)).unwrap();
+                assert!(left > 254.0, "{name}: {left} just left of the cut at y {y}");
+                assert!(right < 1.0, "{name}: {right} just right of the cut at y {y}");
+                let mid = mesh_alpha_at(&m, Pos2::new(60.0, y)).unwrap();
+                assert!(mid > 254.0, "{name}: {mid} inside the fill at y {y}");
+            }
+        }
+    }
+
+    /// A gradient that fades colour and transparency together (white to
+    /// black while fading out) is cut finer than its keypoints: its
+    /// premultiplied colour is their product, which isn't linear between
+    /// two vertices, so halfway it is a half-transparent grey, not white.
+    #[test]
+    fn gradient_colour_and_transparency_fade_together() {
+        use rbx_dom_weak::{
+            types::{Color3, ColorSequence, ColorSequenceKeypoint, NumberSequence, NumberSequenceKeypoint},
+            InstanceBuilder,
+        };
+        let mut doc = Document::new_place();
+        let root = doc.dom.root_ref();
+        let g = doc.dom.insert(root, InstanceBuilder::new("UIGradient")
+            .with_property("Color", ColorSequence {
+                keypoints: vec![
+                    ColorSequenceKeypoint::new(0.0, Color3::new(1.0, 1.0, 1.0)),
+                    ColorSequenceKeypoint::new(1.0, Color3::new(0.0, 0.0, 0.0)),
+                ],
+            })
+            .with_property("Transparency", NumberSequence {
+                keypoints: vec![NumberSequenceKeypoint::new(0.0, 0.0, 0.0), NumberSequenceKeypoint::new(1.0, 1.0, 0.0)],
+            }));
+        let rect = Rect::from_min_size(Pos2::new(0.0, 0.0), egui::vec2(200.0, 20.0));
+        let gr = Grad::new(&doc, g, rect);
+        let col = |p: Pos2| {
+            let (c, t) = gr.at(p);
+            rgba(c, 1.0 - t)
+        };
+        let white = |_: Pos2| Color32::WHITE;
+        let uv = Rect::from_min_max(egui::epaint::WHITE_UV, egui::epaint::WHITE_UV);
+        let m = gr.mesh(quad_mesh(rect, uv, egui::TextureId::default(), &white, 1), &col);
+        for x in [25.0, 50.0, 100.0, 150.0] {
+            let p = Pos2::new(x, 10.0);
+            let want = col(p);
+            let got = mesh_rgba_at(&m, p).unwrap();
+            for (i, w) in want.to_array().iter().enumerate() {
+                assert!((got[i] - *w as f32).abs() <= 2.0, "at x {x}: {got:?}, want {want:?}");
+            }
+        }
+    }
+
+    /// Cut gradient meshes match the gradient everywhere inside the shape,
+    /// for rotated gradients, Offset, many colour keypoints and a
+    /// transparency sequence of its own, square or rounded.
+    #[test]
+    fn gradient_mesh_matches_gradient() {
+        use rbx_dom_weak::{
+            types::{Color3, ColorSequence, ColorSequenceKeypoint, NumberSequence, NumberSequenceKeypoint, Vector2},
+            InstanceBuilder,
+        };
+        let colours: Vec<_> = (0..=12)
+            .map(|i| {
+                let f = i as f32 / 12.0;
+                ColorSequenceKeypoint::new(f, Color3::new((f * 7.0).sin().abs(), 1.0 - f, (i % 2) as f32))
+            })
+            .collect();
+        let tr = NumberSequence {
+            keypoints: vec![
+                NumberSequenceKeypoint::new(0.0, 0.0, 0.0),
+                NumberSequenceKeypoint::new(0.3, 0.6, 0.0),
+                NumberSequenceKeypoint::new(1.0, 0.2, 0.0),
+            ],
+        };
+        let rect = Rect::from_min_size(Pos2::new(10.0, 20.0), egui::vec2(160.0, 48.0));
+        let white = |_: Pos2| Color32::WHITE;
+        let uv = Rect::from_min_max(egui::epaint::WHITE_UV, egui::epaint::WHITE_UV);
+        for rot in [0.0f32, 45.0, 90.0, 200.0] {
+            let mut doc = Document::new_place();
+            let root = doc.dom.root_ref();
+            let g = doc.dom.insert(root, InstanceBuilder::new("UIGradient")
+                .with_property("Color", ColorSequence { keypoints: colours.clone() })
+                .with_property("Transparency", tr.clone())
+                .with_property("Rotation", rot)
+                .with_property("Offset", Vector2::new(0.15, -0.1)));
+            let gr = Grad::new(&doc, g, rect);
+            let col = |p: Pos2| {
+                let (c, t) = gr.at(p);
+                rgba(c, 1.0 - t)
+            };
+            for (name, shape) in [
+                ("square", quad_mesh(rect, uv, egui::TextureId::default(), &white, 1)),
+                ("rounded", fill_rounded_aa_mesh(rect, 8.0, 1.0, None, egui::TextureId::default(), &white, true)),
+            ] {
+                let m = gr.mesh(shape, &col);
+                for i in 0..20 {
+                    for j in 0..6 {
+                        let p = Pos2::new(rect.left() + 12.0 + i as f32 * 7.0, rect.top() + 6.0 + j as f32 * 7.0);
+                        let want = col(p).to_array();
+                        let got = mesh_rgba_at(&m, p).unwrap();
+                        for k in 0..4 {
+                            assert!(
+                                (got[k] - want[k] as f32).abs() <= 3.0,
+                                "{name} rot {rot} at {p:?}: {got:?}, want {want:?}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
     }
 
     #[test]
@@ -2962,12 +3708,7 @@ pub fn legacy_face_key(enum_name: &str) -> FaceKey {
 }
 
 pub fn normalize_face_key(family: &str, weight: u32, italic: bool) -> FaceKey {
-    let fam = if family.ends_with("/GothamSSm.json") {
-        "rbxasset://fonts/families/Montserrat.json".to_string()
-    } else {
-        family.to_string()
-    };
-    (fam, weight, italic)
+    (crate::font_enum::drawn_family(family), weight, italic)
 }
 
 /// Standalone measure-only `Fonts` backed by Studio's local content fonts +

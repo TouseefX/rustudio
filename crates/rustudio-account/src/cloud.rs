@@ -904,6 +904,85 @@ impl CloudApi {
         upload_place(&self.session, &self.ep.apis, place_id, bytes, is_xml, vt)
     }
 
+    /// Maps `Enum.GameAvatarType` (`0` = R6, `1` = R15, `2` = PlayerChoice) to
+    /// Roblox's `universeAvatarType` configuration enum string.
+    pub fn universe_avatar_type_str(avatar_type: u32) -> Option<&'static str> {
+        match avatar_type {
+            0 => Some("MorphToR6"),
+            1 => Some("MorphToR15"),
+            2 => Some("PlayerChoice"),
+            _ => None,
+        }
+    }
+
+    /// Updates a universe's avatar type (`universeAvatarType` and, when present,
+    /// `engineAvatarSettings`) via `PATCH /v2/universes/{universeId}/configuration`,
+    /// matching Roblox Studio's `AvatarSettings::publish()`.
+    ///
+    /// Skips the PATCH when the universe configuration already matches.
+    pub fn set_universe_avatar_type(&self, universe_id: u64, avatar_type: u32) -> Result<()> {
+        if universe_id == 0 {
+            return Err(Error::new("Universe ID must be positive"));
+        }
+        let target_str = Self::universe_avatar_type_str(avatar_type)
+            .ok_or_else(|| Error::new(format!("Unsupported avatar type: {avatar_type}")))?;
+        let target_enum = avatar_type.to_string();
+
+        // Read current universe configuration best-effort so we preserve any
+        // existing `engineAvatarSettings` rules and avoid redundant PATCHes.
+        let get_url = format!("{}/v1/universes/{universe_id}/configuration", self.ep.develop);
+        let current = self.get_json(&get_url, "develop.roblox.com/v1/universes/{id}/configuration").ok();
+
+        let mut payload = serde_json::Map::new();
+        payload.insert("universeAvatarType".into(), Value::String(target_str.into()));
+
+        let mut engine_matches = true;
+        if let Some(raw) = current
+            .as_ref()
+            .and_then(|v| v.get("engineAvatarSettings"))
+            .and_then(Value::as_str)
+            .filter(|s| !s.trim().is_empty())
+        {
+            if let Ok(Value::Object(mut map)) = serde_json::from_str::<Value>(raw) {
+                let mut touched = false;
+                for key in ["AvatarBodyRules_AvatarType", "AvatarRules_AvatarType"] {
+                    if let Some(existing) = map.get_mut(key) {
+                        if existing.as_str() != Some(target_enum.as_str()) {
+                            *existing = Value::String(target_enum.clone());
+                            engine_matches = false;
+                        }
+                        touched = true;
+                    }
+                }
+                if !touched {
+                    map.insert("AvatarBodyRules_AvatarType".into(), Value::String(target_enum.clone()));
+                    engine_matches = false;
+                }
+                if let Ok(encoded) = serde_json::to_string(&Value::Object(map)) {
+                    payload.insert("engineAvatarSettings".into(), Value::String(encoded));
+                }
+            }
+        }
+
+        let current_matches = current
+            .as_ref()
+            .and_then(|v| v.get("universeAvatarType"))
+            .and_then(Value::as_str)
+            == Some(target_str);
+        if current_matches && engine_matches {
+            return Ok(());
+        }
+
+        write_json(
+            &self.session,
+            "PATCH",
+            &format!("{}/v2/universes/{universe_id}/configuration", self.ep.develop),
+            &format!("Update experience {universe_id} avatar type"),
+            Value::Object(payload),
+        )?;
+        Ok(())
+    }
+
     /// Creates a new asset (Decal, Audio, Model, etc.) via Roblox's user-auth
     /// assets endpoint and polls the operation until it finishes, returning
     /// the new asset ID.
@@ -917,18 +996,121 @@ impl CloudApi {
         mime: &str,
         bytes: &[u8],
     ) -> Result<u64> {
-        upload_asset(
-            &self.session,
-            &self.ep.apis,
+        let out = self.upload_asset_ex(&AssetUploadRequest {
             asset_type,
             display_name,
             description,
             group_id,
+            asset_id: None,
+            expected_price: None,
             filename,
             mime,
             bytes,
-        )
+            resolve_image_id: false,
+        })?;
+        Ok(out.asset_id)
     }
+
+    /// Creates a new asset (`POST`) or updates an existing asset (`PATCH` when
+    /// `req.asset_id` is `Some`), automatically switching to chunked
+    /// `:multipartUpload` over 7 MiB and optionally resolving the underlying
+    /// Image asset ID for `Decal` uploads.
+    pub fn upload_asset_ex(&self, req: &AssetUploadRequest<'_>) -> Result<UploadedAsset> {
+        let mut out = upload_asset_inner(
+            &self.session,
+            &self.ep.apis,
+            req,
+            asset_upload::MULTIPART_THRESHOLD,
+            asset_upload::MULTIPART_THRESHOLD,
+        )?;
+        if req.resolve_image_id && req.asset_type == "Decal" {
+            out.image_asset_id = self.resolve_decal_image_id(out.asset_id);
+        }
+        Ok(out)
+    }
+
+    /// Best-effort fetch of a Decal asset to extract its underlying Image asset
+    /// ID (`Texture` / `rbxassetid://`). Retries briefly right after upload.
+    pub fn resolve_decal_image_id(&self, decal_id: u64) -> Option<u64> {
+        let delays = [150u64, 300];
+        for attempt in 0..=delays.len() {
+            if let Ok((bytes, _)) = self.download(decal_id, None) {
+                if let Some(img_id) = extract_decal_image_id(&bytes, decal_id) {
+                    return Some(img_id);
+                }
+            }
+            if let Some(&ms) = delays.get(attempt) {
+                std::thread::sleep(Duration::from_millis(ms));
+            }
+        }
+        None
+    }
+}
+
+/// Parameters for [`CloudApi::upload_asset_ex`].
+#[derive(Debug, Clone)]
+pub struct AssetUploadRequest<'a> {
+    pub asset_type: &'a str,
+    pub display_name: &'a str,
+    pub description: &'a str,
+    /// Upload to a Roblox group instead of the signed-in user (create only).
+    pub group_id: Option<u64>,
+    /// Existing asset ID to update (`PATCH .../assets/{id}`). Omit to create.
+    pub asset_id: Option<u64>,
+    /// Optional `creationContext.expectedPrice` (Robux).
+    pub expected_price: Option<u64>,
+    pub filename: &'a str,
+    pub mime: &'a str,
+    pub bytes: &'a [u8],
+    /// For `Decal` uploads, fetch the created Decal to resolve its underlying
+    /// Image asset ID (`image_asset_id`).
+    pub resolve_image_id: bool,
+}
+
+/// Confirmed result of an asset upload or version update.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UploadedAsset {
+    pub asset_id: u64,
+    pub revision_id: Option<u64>,
+    pub image_asset_id: Option<u64>,
+}
+
+/// Extracts the underlying Image asset ID from a downloaded Roblox Decal asset
+/// (XML or uncompressed binary, optionally gzipped).
+pub fn extract_decal_image_id(raw: &[u8], decal_id: u64) -> Option<u64> {
+    let owned: Vec<u8>;
+    let bytes: &[u8] = if raw.starts_with(&[0x1f, 0x8b]) {
+        use std::io::Read;
+        let mut dec = flate2::read::GzDecoder::new(raw);
+        let mut out = Vec::new();
+        if dec.read_to_end(&mut out).is_ok() {
+            owned = out;
+            &owned
+        } else {
+            raw
+        }
+    } else {
+        raw
+    };
+    let text = String::from_utf8_lossy(bytes);
+    for needle in [
+        "roblox.com/asset/?id=",
+        "roblox.com/asset?id=",
+        "rbxassetid://",
+    ] {
+        let mut rest = text.as_ref();
+        while let Some(pos) = rest.find(needle) {
+            let after = &rest[pos + needle.len()..];
+            let digits: String = after.chars().take_while(|c| c.is_ascii_digit()).collect();
+            if let Ok(id) = digits.parse::<u64>() {
+                if id > 0 && id != decal_id {
+                    return Some(id);
+                }
+            }
+            rest = after;
+        }
+    }
+    None
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -943,17 +1125,89 @@ pub fn upload_asset(
     mime: &str,
     bytes: &[u8],
 ) -> Result<u64> {
-    let creator = match group_id {
-        Some(gid) => serde_json::json!({ "groupId": gid.to_string() }),
-        None => serde_json::json!({ "userId": session.profile.id.to_string() }),
+    let out = upload_asset_inner(
+        session,
+        apis,
+        &AssetUploadRequest {
+            asset_type,
+            display_name,
+            description,
+            group_id,
+            asset_id: None,
+            expected_price: None,
+            filename,
+            mime,
+            bytes,
+            resolve_image_id: false,
+        },
+        asset_upload::MULTIPART_THRESHOLD,
+        asset_upload::MULTIPART_THRESHOLD,
+    )?;
+    Ok(out.asset_id)
+}
+
+fn is_transient_upload_status(status: u16) -> bool {
+    matches!(status, 429 | 502 | 503 | 504)
+}
+
+fn upload_retry_delay(attempt: usize) -> Duration {
+    #[cfg(test)]
+    let ms = [25u64, 50, 100, 200][attempt.min(3)];
+    #[cfg(not(test))]
+    let ms = [1000u64, 2000, 4000, 8000][attempt.min(3)];
+    Duration::from_millis(ms)
+}
+
+fn upload_asset_inner(
+    session: &Session,
+    apis: &str,
+    req: &AssetUploadRequest<'_>,
+    multipart_threshold: usize,
+    chunk_size: usize,
+) -> Result<UploadedAsset> {
+    if req.bytes.is_empty() {
+        return Err(Error::new("Asset upload: file is empty"));
+    }
+    let mut creation_context = serde_json::Map::new();
+    let (method, url, request) = if let Some(target_id) = req.asset_id {
+        if let Some(price) = req.expected_price {
+            creation_context.insert("expectedPrice".into(), json!(price));
+        }
+        let mut obj = serde_json::Map::new();
+        obj.insert("assetType".into(), json!(req.asset_type));
+        obj.insert("assetId".into(), json!(target_id));
+        if !req.display_name.is_empty() {
+            obj.insert("displayName".into(), json!(req.display_name));
+        }
+        if !req.description.is_empty() {
+            obj.insert("description".into(), json!(req.description));
+        }
+        obj.insert("creationContext".into(), Value::Object(creation_context));
+        (
+            "PATCH",
+            format!("{apis}{ASSETS_PATH}/{target_id}"),
+            Value::Object(obj),
+        )
+    } else {
+        let creator = match req.group_id {
+            Some(gid) => json!({ "groupId": gid.to_string() }),
+            None => json!({ "userId": session.profile.id.to_string() }),
+        };
+        creation_context.insert("creator".into(), creator);
+        if let Some(price) = req.expected_price {
+            creation_context.insert("expectedPrice".into(), json!(price));
+        }
+        (
+            "POST",
+            format!("{apis}{ASSETS_PATH}"),
+            json!({
+                "assetType": req.asset_type,
+                "displayName": req.display_name,
+                "description": req.description,
+                "creationContext": Value::Object(creation_context),
+            }),
+        )
     };
-    let request = serde_json::json!({
-        "assetType": asset_type,
-        "displayName": display_name,
-        "description": description,
-        "creationContext": { "creator": creator },
-    });
-    let (content_type, body) = asset_upload::multipart(&request, filename, mime, bytes);
     let cookie = session.cookie();
     let error = |detail: String| {
         if cookie.appears_in(&detail) || session.cookie().appears_in(&detail) {
@@ -970,29 +1224,73 @@ pub fn upload_asset(
         let detail = error_message(&body).unwrap_or(body);
         Err(error(format!("HTTP {status}: {}", detail.trim())))
     };
-    let url = format!("{apis}{ASSETS_PATH}");
-    let (status, text) = session
-        .send_csrf_with_timeout("POST", &url, &content_type, &body, Some(Duration::from_secs(120)))
-        .map_err(|e| error(e.0))?;
-    let initial = check_reply(status, text)?;
+    const MAX_RETRIES: usize = 4;
+    let initial = if req.bytes.len() > multipart_threshold {
+        asset_upload::multipart_upload_chunks(
+            session,
+            apis,
+            method,
+            &format!("{url}:multipartUpload"),
+            &request,
+            req.mime,
+            req.bytes,
+            chunk_size,
+            error,
+            check_reply,
+        )?
+    } else {
+        let (content_type, body) = asset_upload::multipart(&request, req.filename, req.mime, req.bytes);
+        let mut attempt = 0;
+        loop {
+            let (status, text) = session
+                .send_csrf_with_timeout(method, &url, &content_type, &body, Some(Duration::from_secs(120)))
+                .map_err(|e| error(e.0))?;
+            if is_transient_upload_status(status) && attempt < MAX_RETRIES {
+                std::thread::sleep(upload_retry_delay(attempt));
+                attempt += 1;
+                continue;
+            }
+            break check_reply(status, text)?;
+        }
+    };
     let operation = asset_upload::wait_for_operation(
         &initial,
         &format!("{apis}{OPERATIONS_PATH}"),
-        |url| {
-            let (status, body) = session
-                .get_with_timeout(url, Some(Duration::from_secs(20)))
-                .map_err(|e| error(e.0))?;
-            check_reply(status, body)
+        |poll_url| {
+            let mut attempt = 0;
+            loop {
+                match session.get_with_timeout(poll_url, Some(Duration::from_secs(20))) {
+                    Ok((status, _)) if is_transient_upload_status(status) && attempt < MAX_RETRIES => {
+                        std::thread::sleep(upload_retry_delay(attempt));
+                        attempt += 1;
+                    }
+                    Ok((status, body)) => return check_reply(status, body),
+                    Err(_) if attempt < MAX_RETRIES => {
+                        std::thread::sleep(upload_retry_delay(attempt));
+                        attempt += 1;
+                    }
+                    Err(e) => return Err(error(e.0)),
+                }
+            }
         },
         error,
     )?;
-    let asset_id = operation
-        .pointer("/response/assetId")
-        .or_else(|| operation.pointer("/response/id"))
-        .and_then(|v| v.as_u64().or_else(|| v.as_str()?.parse().ok()))
-        .filter(|v| *v > 0)
+    let parse_u64 = |ptr: &str| {
+        operation
+            .pointer(ptr)
+            .and_then(|v| v.as_u64().or_else(|| v.as_str()?.parse().ok()))
+            .filter(|v| *v > 0)
+    };
+    let asset_id = parse_u64("/response/assetId")
+        .or_else(|| parse_u64("/response/id"))
+        .or(req.asset_id)
         .ok_or_else(|| Error::new("Asset upload: completed operation has no valid assetId"))?;
-    Ok(asset_id)
+    let revision_id = parse_u64("/response/revisionId");
+    Ok(UploadedAsset {
+        asset_id,
+        revision_id,
+        image_asset_id: None,
+    })
 }
 
 pub(crate) fn upload_place(
@@ -1753,6 +2051,426 @@ mod tests {
         }
         assert!(foreign.requests().is_empty());
     }
+
+    #[test]
+    fn set_universe_avatar_type_patches_legacy_and_engine_avatar_settings() {
+        // 1. Legacy universe config (no engineAvatarSettings): patches universeAvatarType = MorphToR6.
+        let s1 = MockServer::start(Arc::new(|r| match (r.method.as_str(), r.path.as_str()) {
+            ("GET", "/develop/v1/universes/42/configuration") => {
+                MockReply::json(200, r#"{"id":42,"universeAvatarType":"MorphToR15"}"#)
+            }
+            ("PATCH", "/develop/v2/universes/42/configuration") => {
+                MockReply::json(200, r#"{"id":42,"universeAvatarType":"MorphToR6"}"#)
+            }
+            _ => MockReply::json(404, "{}"),
+        }))
+        .unwrap();
+        api(&s1, None).set_universe_avatar_type(42, 0).unwrap();
+        let reqs1 = s1.requests();
+        assert_eq!(reqs1.len(), 2);
+        let body1: Value = serde_json::from_slice(&reqs1[1].body).unwrap();
+        assert_eq!(body1["universeAvatarType"], "MorphToR6");
+        assert!(body1.get("engineAvatarSettings").is_none());
+
+        // 2. Modern universe config with engineAvatarSettings: updates both universeAvatarType
+        //    and engineAvatarSettings while preserving other keys.
+        let s2 = MockServer::start(Arc::new(|r| match (r.method.as_str(), r.path.as_str()) {
+            ("GET", "/develop/v1/universes/77/configuration") => {
+                let engine = serde_json::json!({
+                    "AvatarSettings_RulesSchemaVersion": "3",
+                    "AvatarBodyRules_AvatarType": "1",
+                    "AvatarBodyRules_ScaleMode": "1",
+                })
+                .to_string();
+                MockReply::json(
+                    200,
+                    &serde_json::json!({
+                        "id": 77,
+                        "universeAvatarType": "MorphToR15",
+                        "engineAvatarSettings": engine,
+                    })
+                    .to_string(),
+                )
+            }
+            ("PATCH", "/develop/v2/universes/77/configuration") => MockReply::json(200, r#"{"id":77}"#),
+            _ => MockReply::json(404, "{}"),
+        }))
+        .unwrap();
+        api(&s2, None).set_universe_avatar_type(77, 0).unwrap();
+        let reqs2 = s2.requests();
+        assert_eq!(reqs2.len(), 2);
+        let body2: Value = serde_json::from_slice(&reqs2[1].body).unwrap();
+        assert_eq!(body2["universeAvatarType"], "MorphToR6");
+        let engine2: Value = serde_json::from_str(body2["engineAvatarSettings"].as_str().unwrap()).unwrap();
+        assert_eq!(engine2["AvatarBodyRules_AvatarType"], "0");
+        assert_eq!(engine2["AvatarBodyRules_ScaleMode"], "1");
+        assert_eq!(engine2["AvatarSettings_RulesSchemaVersion"], "3");
+
+        // 3. Already matching universe config: skips redundant PATCH.
+        let s3 = MockServer::start(Arc::new(|r| match (r.method.as_str(), r.path.as_str()) {
+            ("GET", "/develop/v1/universes/99/configuration") => {
+                let engine = serde_json::json!({
+                    "AvatarBodyRules_AvatarType": "0",
+                })
+                .to_string();
+                MockReply::json(
+                    200,
+                    &serde_json::json!({
+                        "id": 99,
+                        "universeAvatarType": "MorphToR6",
+                        "engineAvatarSettings": engine,
+                    })
+                    .to_string(),
+                )
+            }
+            _ => MockReply::json(500, "{}"),
+        }))
+        .unwrap();
+        api(&s3, None).set_universe_avatar_type(99, 0).unwrap();
+        assert_eq!(s3.requests().len(), 1);
+    }
+
+    #[test]
+    fn extract_decal_image_id_handles_xml_gzip_and_rbxassetid() {
+        let xml = br#"<roblox version="4"><Item class="Decal"><Properties><Content name="Texture"><url>http://www.roblox.com/asset/?id=987654321</url></Content></Properties></Item></roblox>"#;
+        assert_eq!(extract_decal_image_id(xml, 111), Some(987654321));
+        assert_eq!(extract_decal_image_id(xml, 987654321), None);
+
+        let rbxasset = b"\x00\x01rbxassetid://445566\x00";
+        assert_eq!(extract_decal_image_id(rbxasset, 111), Some(445566));
+
+        use flate2::write::GzEncoder;
+        use flate2::Compression;
+        use std::io::Write;
+        let mut gz = GzEncoder::new(Vec::new(), Compression::default());
+        gz.write_all(xml).unwrap();
+        let gz_bytes = gz.finish().unwrap();
+        assert_eq!(extract_decal_image_id(&gz_bytes, 111), Some(987654321));
+
+        assert_eq!(extract_decal_image_id(b"no asset id here", 111), None);
+    }
+
+    #[test]
+    fn upload_asset_create_decal_resolves_image_id_and_handles_csrf_and_group() {
+        let polls = std::sync::atomic::AtomicUsize::new(0);
+        let base_holder: Arc<Mutex<String>> = Arc::new(Mutex::new(String::new()));
+        let base_ref = base_holder.clone();
+        let server = MockServer::start(Arc::new(move |r| {
+            match (r.method.as_str(), r.path.as_str()) {
+                ("POST", "/apis/assets/user-auth/v1/assets") if r.header("x-csrf-token") != Some("asset-csrf") => {
+                    MockReply::json(403, "{}").with_header("x-csrf-token", "asset-csrf")
+                }
+                ("POST", "/apis/assets/user-auth/v1/assets") => {
+                    MockReply::json(202, r#"{"path":"operations/op-decal-1"}"#)
+                }
+                ("GET", "/apis/assets/user-auth/v1/operations/op-decal-1") => {
+                    if polls.fetch_add(1, std::sync::atomic::Ordering::Relaxed) == 0 {
+                        MockReply::json(200, r#"{"done":false}"#)
+                    } else {
+                        MockReply::json(
+                            200,
+                            r#"{"done":true,"response":{"assetId":"555001","revisionId":"1"}}"#,
+                        )
+                    }
+                }
+                ("GET", "/assetdelivery/v2/assetId/555001") => {
+                    let base = base_ref.lock().unwrap().clone();
+                    MockReply::json(
+                        200,
+                        &json!({"locations":[{"location": format!("{base}/cdn/decal-555001")}]}).to_string(),
+                    )
+                    .with_header("roblox-assetversionnumber", "1")
+                }
+                ("GET", "/cdn/decal-555001") => MockReply {
+                    status: 200,
+                    headers: vec![("Content-Type".into(), "application/xml".into())],
+                    body: b"<roblox version=\"4\"><Item class=\"Decal\"><Properties><Content name=\"Texture\"><url>http://www.roblox.com/asset/?id=555000</url></Content></Properties></Item></roblox>".to_vec(),
+                },
+                _ => MockReply::json(404, "{}"),
+            }
+        }))
+        .unwrap();
+        *base_holder.lock().unwrap() = server.base.clone();
+
+        let a = api(&server, None);
+        let out = a
+            .upload_asset_ex(&AssetUploadRequest {
+                asset_type: "Decal",
+                display_name: "Test Icon",
+                description: "desc",
+                group_id: Some(777),
+                asset_id: None,
+                expected_price: Some(0),
+                filename: "icon.png",
+                mime: "image/png",
+                bytes: b"\x89PNG\r\n\x1a\nfake",
+                resolve_image_id: true,
+            })
+            .unwrap();
+        assert_eq!(
+            out,
+            UploadedAsset {
+                asset_id: 555001,
+                revision_id: Some(1),
+                image_asset_id: Some(555000),
+            }
+        );
+
+        let reqs = server.requests();
+        // 403 CSRF challenge + POST retry + 2 GET polls + assetdelivery descriptor + CDN download
+        let post_retry = &reqs[1];
+        assert_eq!(post_retry.header("x-csrf-token"), Some("asset-csrf"));
+        assert_eq!(
+            multipart_request(post_retry),
+            json!({
+                "assetType": "Decal",
+                "displayName": "Test Icon",
+                "description": "desc",
+                "creationContext": {
+                    "creator": { "groupId": "777" },
+                    "expectedPrice": 0,
+                }
+            })
+        );
+    }
+
+    #[test]
+    fn upload_asset_patch_updates_existing_model_version() {
+        let server = MockServer::start(Arc::new(|r| match (r.method.as_str(), r.path.as_str()) {
+            ("PATCH", "/apis/assets/user-auth/v1/assets/888001") => MockReply::json(
+                200,
+                r#"{"done":true,"response":{"assetId":"888001","revisionId":"4"}}"#,
+            ),
+            _ => MockReply::json(404, "{}"),
+        }))
+        .unwrap();
+        let a = api(&server, None);
+        let out = a
+            .upload_asset_ex(&AssetUploadRequest {
+                asset_type: "Model",
+                display_name: "Updated Prop",
+                description: "",
+                group_id: None,
+                asset_id: Some(888001),
+                expected_price: None,
+                filename: "prop.rbxm",
+                mime: "model/x-rbxm",
+                bytes: b"<roblox!fake-model",
+                resolve_image_id: false,
+            })
+            .unwrap();
+        assert_eq!(
+            out,
+            UploadedAsset {
+                asset_id: 888001,
+                revision_id: Some(4),
+                image_asset_id: None,
+            }
+        );
+        let req = &server.requests()[0];
+        assert_eq!(req.method, "PATCH");
+        assert_eq!(
+            multipart_request(req),
+            json!({
+                "assetType": "Model",
+                "assetId": 888001,
+                "displayName": "Updated Prop",
+                "creationContext": {}
+            })
+        );
+    }
+
+    #[test]
+    fn upload_asset_chunked_multipart_flow() {
+        let base_holder: Arc<Mutex<String>> = Arc::new(Mutex::new(String::new()));
+        let base_ref = base_holder.clone();
+        let uploaded_chunks: Arc<Mutex<Vec<(usize, Vec<u8>)>>> = Arc::new(Mutex::new(Vec::new()));
+        let chunks_ref = uploaded_chunks.clone();
+        let completed_etags: Arc<Mutex<Vec<(usize, String)>>> = Arc::new(Mutex::new(Vec::new()));
+        let etags_ref = completed_etags.clone();
+
+        let server = MockServer::start(Arc::new(move |r| {
+            let base = base_ref.lock().unwrap().clone();
+            match (r.method.as_str(), r.path.as_str()) {
+                ("POST", "/apis/assets/user-auth/v1/assets:multipartUpload") => {
+                    let body: Value = serde_json::from_slice(&r.body).unwrap();
+                    let plan = body["file"]["chunkPlan"].as_array().unwrap();
+                    assert_eq!(plan.len(), 3);
+                    let mut start = 0usize;
+                    let mut urls = Vec::new();
+                    for (idx, len) in plan.iter().enumerate() {
+                        let l = len.as_u64().unwrap() as usize;
+                        urls.push(json!({
+                            "httpVerb": "PUT",
+                            "url": format!("{base}/s3/chunk/{}", idx + 1),
+                            "chunkNum": idx + 1,
+                            "contentStart": start,
+                            "contentLength": l,
+                        }));
+                        start += l;
+                    }
+                    MockReply::json(
+                        200,
+                        &json!({
+                            "operationPath": "operations/mp-op-1",
+                            "uploadUrls": urls,
+                        })
+                        .to_string(),
+                    )
+                }
+                ("PUT", p) if p.starts_with("/s3/chunk/") => {
+                    let num: usize = p.strip_prefix("/s3/chunk/").unwrap().parse().unwrap();
+                    chunks_ref.lock().unwrap().push((num, r.body.clone()));
+                    MockReply::json(200, "{}").with_header("etag", &format!("\"etag-{num}\""))
+                }
+                ("POST", "/apis/assets/user-auth/v1/operations/mp-op-1:multipartUploadChunkComplete") => {
+                    let body: Value = serde_json::from_slice(&r.body).unwrap();
+                    let num = body["chunkNum"].as_u64().unwrap() as usize;
+                    let etag = body["etag"].as_str().unwrap().to_string();
+                    etags_ref.lock().unwrap().push((num, etag));
+                    MockReply::json(200, "{}")
+                }
+                ("POST", "/apis/assets/user-auth/v1/operations/mp-op-1:multipartUploadComplete") => {
+                    MockReply::json(202, r#"{"path":"operations/mp-op-1"}"#)
+                }
+                ("GET", "/apis/assets/user-auth/v1/operations/mp-op-1") => MockReply::json(
+                    200,
+                    r#"{"done":true,"response":{"assetId":"999123","revisionId":"1"}}"#,
+                ),
+                _ => MockReply::json(404, "{}"),
+            }
+        }))
+        .unwrap();
+        *base_holder.lock().unwrap() = server.base.clone();
+
+        let payload = b"abcdefghij"; // 10 bytes -> 3 chunks of [4, 4, 2]
+        let a = api(&server, None);
+        let out = upload_asset_inner(
+            &a.session,
+            &a.ep.apis,
+            &AssetUploadRequest {
+                asset_type: "Model",
+                display_name: "Big Mesh",
+                description: "chunked",
+                group_id: None,
+                asset_id: None,
+                expected_price: None,
+                filename: "big.glb",
+                mime: "model/gltf-binary",
+                bytes: payload,
+                resolve_image_id: false,
+            },
+            5, // force chunked path
+            4, // 4-byte chunks -> [4, 4, 2]
+        )
+        .unwrap();
+        assert_eq!(out.asset_id, 999123);
+        assert_eq!(out.revision_id, Some(1));
+        assert_eq!(
+            *uploaded_chunks.lock().unwrap(),
+            vec![
+                (1, b"abcd".to_vec()),
+                (2, b"efgh".to_vec()),
+                (3, b"ij".to_vec()),
+            ]
+        );
+        assert_eq!(
+            *completed_etags.lock().unwrap(),
+            vec![
+                (1, "\"etag-1\"".into()),
+                (2, "\"etag-2\"".into()),
+                (3, "\"etag-3\"".into()),
+            ]
+        );
+    }
+
+    #[test]
+    fn upload_asset_rejects_empty_and_scrubs_cookie_on_error() {
+        let server = MockServer::start(Arc::new(|_| {
+            MockReply::json(400, r#"{"message":"leaked mock-session-not-a-real-cookie"}"#)
+        }))
+        .unwrap();
+        let a = api(&server, None);
+        let empty_err = a
+            .upload_asset_ex(&AssetUploadRequest {
+                asset_type: "Decal",
+                display_name: "Empty",
+                description: "",
+                group_id: None,
+                asset_id: None,
+                expected_price: None,
+                filename: "empty.png",
+                mime: "image/png",
+                bytes: b"",
+                resolve_image_id: false,
+            })
+            .unwrap_err();
+        assert!(empty_err.0.contains("empty"), "{empty_err}");
+        assert!(server.requests().is_empty());
+
+        let leak_err = a
+            .upload_asset_ex(&AssetUploadRequest {
+                asset_type: "Decal",
+                display_name: "Bad",
+                description: "",
+                group_id: None,
+                asset_id: None,
+                expected_price: None,
+                filename: "bad.png",
+                mime: "image/png",
+                bytes: b"1234",
+                resolve_image_id: false,
+            })
+            .unwrap_err();
+        assert_eq!(leak_err.0, "Asset upload failed");
+        assert!(!leak_err.0.contains("mock-session"));
+    }
+
+    #[test]
+    fn upload_asset_retries_on_429_and_503() {
+        let posts = std::sync::atomic::AtomicUsize::new(0);
+        let polls = std::sync::atomic::AtomicUsize::new(0);
+        let server = MockServer::start(Arc::new(move |r| {
+            match (r.method.as_str(), r.path.as_str()) {
+                ("POST", "/apis/assets/user-auth/v1/assets") => {
+                    match posts.fetch_add(1, std::sync::atomic::Ordering::Relaxed) {
+                        0 => MockReply::json(429, r#"{"message":"Too Many Requests"}"#),
+                        1 => MockReply::json(503, r#"{"message":"Service Unavailable"}"#),
+                        _ => MockReply::json(202, r#"{"path":"operations/op-retry-1"}"#),
+                    }
+                }
+                ("GET", "/apis/assets/user-auth/v1/operations/op-retry-1") => {
+                    if polls.fetch_add(1, std::sync::atomic::Ordering::Relaxed) == 0 {
+                        MockReply::json(429, r#"{"message":"Too Many Requests"}"#)
+                    } else {
+                        MockReply::json(
+                            200,
+                            r#"{"done":true,"response":{"assetId":"777123","revisionId":"1"}}"#,
+                        )
+                    }
+                }
+                _ => MockReply::json(404, "{}"),
+            }
+        }))
+        .unwrap();
+        let a = api(&server, None);
+        let out = a
+            .upload_asset_ex(&AssetUploadRequest {
+                asset_type: "Decal",
+                display_name: "Retry Test",
+                description: "",
+                group_id: None,
+                asset_id: None,
+                expected_price: None,
+                filename: "retry.png",
+                mime: "image/png",
+                bytes: b"\x89PNG\r\n\x1a\n1234",
+                resolve_image_id: false,
+            })
+            .unwrap();
+        assert_eq!(out.asset_id, 777123);
+        assert_eq!(server.requests().len(), 5);
+    }
 }
 
 #[cfg(test)]
@@ -1806,6 +2524,484 @@ mod live {
                 Err(err) => println!("{} versions: {err}", e.name),
             }
             println!("{} team create: {:?}", e.name, a.team_create(e.id));
+        }
+    }
+
+    /// Real end-to-end upload smoke test against Roblox's live Assets API:
+    /// 1. Uploads a tiny 1x1 PNG as a Decal and resolves its underlying Image ID.
+    /// 2. Uploads a tiny valid `.rbxmx` Model (`POST`), then pushes a v2 update (`PATCH`).
+    /// Run explicitly with:
+    /// `cargo test -p rustudio-account -- --ignored --nocapture cloud::live::live_upload_decal_and_model_smoke`
+    #[test]
+    #[ignore]
+    fn live_upload_decal_and_model_smoke() {
+        let client = crate::Client::open(crate::AccountConfig::load().unwrap())
+            .unwrap_or_else(|e| panic!("no signed-in Roblox session: {}", e.describe()));
+        println!("signed in as {} ({})", client.session.profile.display(), client.session.profile.id);
+        let a = CloudApi::new(client.session.downloader(), Endpoints::default(), None);
+
+        // Minimal valid 1x1 opaque red PNG (69 bytes).
+        const PNG_1X1: &[u8] = &[
+            0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D, 0x49, 0x48,
+            0x44, 0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x02, 0x00, 0x00,
+            0x00, 0x90, 0x77, 0x53, 0xDE, 0x00, 0x00, 0x00, 0x0C, 0x49, 0x44, 0x41, 0x54, 0x08,
+            0xD7, 0x63, 0xF8, 0xCF, 0xC0, 0x00, 0x00, 0x03, 0x01, 0x01, 0x00, 0x18, 0xDD, 0x8D,
+            0xB0, 0x00, 0x00, 0x00, 0x00, 0x49, 0x45, 0x4E, 0x44, 0xAE, 0x42, 0x60, 0x82,
+        ];
+        let decal = a
+            .upload_asset_ex(&AssetUploadRequest {
+                asset_type: "Decal",
+                display_name: "rustudio_upload_test_1x1",
+                description: "automated rustudio uploader smoke test",
+                group_id: None,
+                asset_id: None,
+                expected_price: None,
+                filename: "test_1x1.png",
+                mime: "image/png",
+                bytes: PNG_1X1,
+                resolve_image_id: true,
+            })
+            .expect("decal upload failed");
+        println!("Decal uploaded: {decal:?}");
+        assert!(decal.asset_id > 0);
+        assert!(
+            decal.image_asset_id.is_some(),
+            "expected Decal upload to resolve underlying image_asset_id"
+        );
+
+        let model_v1 = br#"<roblox version="4"><Item class="Part"><Properties><string name="Name">RusTudioTestPartV1</string></Properties></Item></roblox>"#;
+        let model = a
+            .upload_asset_ex(&AssetUploadRequest {
+                asset_type: "Model",
+                display_name: "rustudio_upload_test_model",
+                description: "automated rustudio uploader smoke test v1",
+                group_id: None,
+                asset_id: None,
+                expected_price: None,
+                filename: "test_model.rbxmx",
+                mime: "model/x-rbxm",
+                bytes: model_v1,
+                resolve_image_id: false,
+            })
+            .expect("model create failed");
+        println!("Model v1 uploaded: {model:?}");
+        assert!(model.asset_id > 0);
+
+        let model_v2 = br#"<roblox version="4"><Item class="Part"><Properties><string name="Name">RusTudioTestPartV2</string></Properties></Item></roblox>"#;
+        let updated = a
+            .upload_asset_ex(&AssetUploadRequest {
+                asset_type: "Model",
+                display_name: "rustudio_upload_test_model",
+                description: "automated rustudio uploader smoke test v2",
+                group_id: None,
+                asset_id: Some(model.asset_id),
+                expected_price: None,
+                filename: "test_model.rbxmx",
+                mime: "model/x-rbxm",
+                bytes: model_v2,
+                resolve_image_id: false,
+            })
+            .expect("model PATCH update failed");
+        println!("Model v2 updated: {updated:?}");
+        assert_eq!(updated.asset_id, model.asset_id);
+        if let (Some(r1), Some(r2)) = (model.revision_id, updated.revision_id) {
+            assert!(r2 > r1, "expected revision to advance: {r1} -> {r2}");
+        }
+    }
+
+    /// Builds a valid minimal glTF 2.0 binary (`.glb`) containing a unit triangle
+    /// mesh (positions + normals + indices) so live mesh upload benchmarks need
+    /// no external fixtures.
+    fn minimal_glb(seed: f32) -> Vec<u8> {
+        // 3 vertices (vec3 pos + vec3 normal) + 3 u16 indices = 72 + 6 (+2 pad) = 80 bytes
+        let mut bin = Vec::new();
+        let verts: [[f32; 3]; 3] = [
+            [0.0, 0.0, 0.0],
+            [1.0 + seed * 0.01, 0.0, 0.0],
+            [0.0, 1.0, 0.0],
+        ];
+        for v in &verts {
+            for f in v {
+                bin.extend_from_slice(&f.to_le_bytes());
+            }
+        }
+        let norms: [[f32; 3]; 3] = [[0.0, 0.0, 1.0]; 3];
+        for n in &norms {
+            for f in n {
+                bin.extend_from_slice(&f.to_le_bytes());
+            }
+        }
+        for idx in [0u16, 1, 2] {
+            bin.extend_from_slice(&idx.to_le_bytes());
+        }
+        while bin.len() % 4 != 0 {
+            bin.push(0);
+        }
+        let max_x = 1.0 + seed * 0.01;
+        let gltf = json!({
+            "asset": { "version": "2.0" },
+            "scene": 0,
+            "scenes": [{ "nodes": [0] }],
+            "nodes": [{ "mesh": 0, "name": "BenchTri" }],
+            "meshes": [{
+                "name": "BenchTri",
+                "primitives": [{
+                    "attributes": { "POSITION": 0, "NORMAL": 1 },
+                    "indices": 2
+                }]
+            }],
+            "buffers": [{ "byteLength": bin.len() }],
+            "bufferViews": [
+                { "buffer": 0, "byteOffset": 0, "byteLength": 36, "target": 34962 },
+                { "buffer": 0, "byteOffset": 36, "byteLength": 36, "target": 34962 },
+                { "buffer": 0, "byteOffset": 72, "byteLength": 6, "target": 34963 }
+            ],
+            "accessors": [
+                { "bufferView": 0, "componentType": 5126, "count": 3, "type": "VEC3", "min": [0.0, 0.0, 0.0], "max": [max_x, 1.0, 0.0] },
+                { "bufferView": 1, "componentType": 5126, "count": 3, "type": "VEC3" },
+                { "bufferView": 2, "componentType": 5123, "count": 3, "type": "SCALAR" }
+            ]
+        });
+        let mut json_bytes = gltf.to_string().into_bytes();
+        while json_bytes.len() % 4 != 0 {
+            json_bytes.push(b' ');
+        }
+        let total_len = 12 + 8 + json_bytes.len() + 8 + bin.len();
+        let mut out = Vec::with_capacity(total_len);
+        out.extend_from_slice(&0x46546C67u32.to_le_bytes()); // "glTF"
+        out.extend_from_slice(&2u32.to_le_bytes());          // version 2
+        out.extend_from_slice(&(total_len as u32).to_le_bytes());
+        out.extend_from_slice(&(json_bytes.len() as u32).to_le_bytes());
+        out.extend_from_slice(&0x4E4F534Au32.to_le_bytes()); // "JSON"
+        out.extend_from_slice(&json_bytes);
+        out.extend_from_slice(&(bin.len() as u32).to_le_bytes());
+        out.extend_from_slice(&0x004E4942u32.to_le_bytes()); // "BIN\0"
+        out.extend_from_slice(&bin);
+        out
+    }
+
+    /// Real live upload speed benchmark for Decals (PNG) and Meshes (`.glb`),
+    /// both single (cold + warm) and parallel batches.
+    /// `cargo test -p rustudio-account -- --ignored --nocapture cloud::live::live_bench_decals_and_meshes`
+    #[test]
+    #[ignore]
+    fn live_bench_decals_and_meshes() {
+        use std::time::Instant;
+
+        let client = crate::Client::open(crate::AccountConfig::load().unwrap())
+            .unwrap_or_else(|e| panic!("no signed-in Roblox session: {}", e.describe()));
+        println!("signed in as {} ({})", client.session.profile.display(), client.session.profile.id);
+        let a = CloudApi::new(client.session.downloader(), Endpoints::default(), None);
+
+        // Use a real PNG from the repo (24x24 icon) so it's not a trivial 1x1.
+        let png_bytes = std::fs::read(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../assets/icons/rustudio-24.png"),
+        )
+        .expect("read rustudio-24.png");
+        println!("PNG size: {} bytes", png_bytes.len());
+
+        // 1. Cold Decal (includes CSRF acquisition + image_asset_id resolution)
+        let t0 = Instant::now();
+        let d_cold = a
+            .upload_asset_ex(&AssetUploadRequest {
+                asset_type: "Decal",
+                display_name: "bench_decal_cold",
+                description: "speed bench",
+                group_id: None,
+                asset_id: None,
+                expected_price: None,
+                filename: "icon.png",
+                mime: "image/png",
+                bytes: &png_bytes,
+                resolve_image_id: true,
+            })
+            .expect("cold decal");
+        println!("Decal 1 (cold + resolve): {:.0} ms -> {d_cold:?}", t0.elapsed().as_secs_f64() * 1000.0);
+
+        // 2. Warm Decal WITH resolve_image_id
+        let t0 = Instant::now();
+        let d_warm = a
+            .upload_asset_ex(&AssetUploadRequest {
+                asset_type: "Decal",
+                display_name: "bench_decal_warm",
+                description: "speed bench",
+                group_id: None,
+                asset_id: None,
+                expected_price: None,
+                filename: "icon.png",
+                mime: "image/png",
+                bytes: &png_bytes,
+                resolve_image_id: true,
+            })
+            .expect("warm decal");
+        println!("Decal 2 (warm + resolve): {:.0} ms -> {d_warm:?}", t0.elapsed().as_secs_f64() * 1000.0);
+
+        // 3. Warm Decal WITHOUT resolve_image_id
+        let t0 = Instant::now();
+        let d_nores = a
+            .upload_asset_ex(&AssetUploadRequest {
+                asset_type: "Decal",
+                display_name: "bench_decal_nores",
+                description: "speed bench",
+                group_id: None,
+                asset_id: None,
+                expected_price: None,
+                filename: "icon.png",
+                mime: "image/png",
+                bytes: &png_bytes,
+                resolve_image_id: false,
+            })
+            .expect("warm decal nores");
+        println!("Decal 3 (warm, no resolve): {:.0} ms -> {d_nores:?}", t0.elapsed().as_secs_f64() * 1000.0);
+
+        // 4. Parallel batch of 5 Decals (with resolve_image_id)
+        let t_batch = Instant::now();
+        let mut handles = Vec::new();
+        for i in 0..5 {
+            let sess = client.session.downloader();
+            let bytes = png_bytes.clone();
+            handles.push(std::thread::spawn(move || {
+                let api = CloudApi::new(sess, Endpoints::default(), None);
+                let ti = Instant::now();
+                let res = api.upload_asset_ex(&AssetUploadRequest {
+                    asset_type: "Decal",
+                    display_name: &format!("bench_decal_par_{i}"),
+                    description: "parallel bench",
+                    group_id: None,
+                    asset_id: None,
+                    expected_price: None,
+                    filename: "icon.png",
+                    mime: "image/png",
+                    bytes: &bytes,
+                    resolve_image_id: true,
+                });
+                (i, ti.elapsed().as_secs_f64() * 1000.0, res)
+            }));
+        }
+        let mut ok_decals = 0;
+        for h in handles {
+            let (i, ms, res) = h.join().unwrap();
+            match res {
+                Ok(u) => {
+                    ok_decals += 1;
+                    println!("  par decal {i}: {ms:.0} ms -> id={} img={:?}", u.asset_id, u.image_asset_id);
+                }
+                Err(e) => println!("  par decal {i}: FAILED in {ms:.0} ms -> {e}"),
+            }
+        }
+        let batch_ms = t_batch.elapsed().as_secs_f64() * 1000.0;
+        println!(
+            "Decals parallel x5: {ok_decals}/5 ok in {batch_ms:.0} ms ({:.2} decals/sec)",
+            ok_decals as f64 / (batch_ms / 1000.0)
+        );
+        assert_eq!(ok_decals, 5);
+
+        // 5. Mesh (.glb) single warm
+        let glb = minimal_glb(0.0);
+        println!("GLB size: {} bytes", glb.len());
+        let t0 = Instant::now();
+        let m1 = a
+            .upload_asset_ex(&AssetUploadRequest {
+                asset_type: "Model",
+                display_name: "bench_mesh_glb_1",
+                description: "mesh bench",
+                group_id: None,
+                asset_id: None,
+                expected_price: None,
+                filename: "tri.glb",
+                mime: "model/gltf-binary",
+                bytes: &glb,
+                resolve_image_id: false,
+            })
+            .expect("glb mesh upload");
+        println!("Mesh .glb 1 (warm): {:.0} ms -> {m1:?}", t0.elapsed().as_secs_f64() * 1000.0);
+
+        // 6. Parallel batch of 3 Meshes (.glb)
+        let t_mbatch = Instant::now();
+        let mut mhandles = Vec::new();
+        for i in 0..3 {
+            let sess = client.session.downloader();
+            let bytes = minimal_glb((i + 1) as f32);
+            mhandles.push(std::thread::spawn(move || {
+                let api = CloudApi::new(sess, Endpoints::default(), None);
+                let ti = Instant::now();
+                let res = api.upload_asset_ex(&AssetUploadRequest {
+                    asset_type: "Model",
+                    display_name: &format!("bench_mesh_glb_par_{i}"),
+                    description: "parallel mesh bench",
+                    group_id: None,
+                    asset_id: None,
+                    expected_price: None,
+                    filename: "tri.glb",
+                    mime: "model/gltf-binary",
+                    bytes: &bytes,
+                    resolve_image_id: false,
+                });
+                (i, ti.elapsed().as_secs_f64() * 1000.0, res)
+            }));
+        }
+        let mut ok_meshes = 0;
+        for h in mhandles {
+            let (i, ms, res) = h.join().unwrap();
+            match res {
+                Ok(u) => {
+                    ok_meshes += 1;
+                    println!("  par mesh {i}: {ms:.0} ms -> id={} rev={:?}", u.asset_id, u.revision_id);
+                }
+                Err(e) => println!("  par mesh {i}: FAILED in {ms:.0} ms -> {e}"),
+            }
+        }
+        let mbatch_ms = t_mbatch.elapsed().as_secs_f64() * 1000.0;
+        println!(
+            "Meshes .glb parallel x3: {ok_meshes}/3 ok in {mbatch_ms:.0} ms ({:.2} meshes/sec)",
+            ok_meshes as f64 / (mbatch_ms / 1000.0)
+        );
+        assert_eq!(ok_meshes, 3);
+    }
+
+    /// Stress benchmark: 100 Decals uploaded via a worker pool (default 16
+    /// concurrent workers, override with `RUSTUDIO_UPLOAD_CONCURRENCY=N`).
+    /// `cargo test -p rustudio-account -- --ignored --nocapture cloud::live::live_bench_100_decals`
+    #[test]
+    #[ignore]
+    fn live_bench_100_decals() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::{Arc, Mutex};
+        use std::time::Instant;
+
+        let client = crate::Client::open(crate::AccountConfig::load().unwrap())
+            .unwrap_or_else(|e| panic!("no signed-in Roblox session: {}", e.describe()));
+        println!("signed in as {} ({})", client.session.profile.display(), client.session.profile.id);
+
+        let png_bytes = std::fs::read(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../assets/icons/rustudio-24.png"),
+        )
+        .expect("read rustudio-24.png");
+
+        let total = 100usize;
+        let workers: usize = std::env::var("RUSTUDIO_UPLOAD_CONCURRENCY")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(16);
+
+        // Warm CSRF once so all workers share the token immediately.
+        let warm_api = CloudApi::new(client.session.downloader(), Endpoints::default(), None);
+        let t_all = Instant::now();
+        let next = Arc::new(AtomicUsize::new(0));
+        let done = Arc::new(AtomicUsize::new(0));
+        let ok_count = Arc::new(AtomicUsize::new(0));
+        let img_count = Arc::new(AtomicUsize::new(0));
+        let latencies: Arc<Mutex<Vec<f64>>> = Arc::new(Mutex::new(Vec::with_capacity(total)));
+        let errors: Arc<Mutex<Vec<(usize, String)>>> = Arc::new(Mutex::new(Vec::new()));
+
+        // First upload warms CSRF before launching the pool.
+        let t0 = Instant::now();
+        match warm_api.upload_asset_ex(&AssetUploadRequest {
+            asset_type: "Decal",
+            display_name: "bench100_decal_0",
+            description: "100x bench",
+            group_id: None,
+            asset_id: None,
+            expected_price: None,
+            filename: "icon.png",
+            mime: "image/png",
+            bytes: &png_bytes,
+            resolve_image_id: true,
+        }) {
+            Ok(u) => {
+                ok_count.fetch_add(1, Ordering::Relaxed);
+                if u.image_asset_id.is_some() {
+                    img_count.fetch_add(1, Ordering::Relaxed);
+                }
+                latencies.lock().unwrap().push(t0.elapsed().as_secs_f64() * 1000.0);
+            }
+            Err(e) => errors.lock().unwrap().push((0, e.0)),
+        }
+        next.store(1, Ordering::Relaxed);
+        done.store(1, Ordering::Relaxed);
+
+        let mut handles = Vec::new();
+        for _ in 0..workers {
+            let sess = client.session.downloader();
+            let bytes = png_bytes.clone();
+            let next = next.clone();
+            let done = done.clone();
+            let ok_count = ok_count.clone();
+            let img_count = img_count.clone();
+            let latencies = latencies.clone();
+            let errors = errors.clone();
+            handles.push(std::thread::spawn(move || {
+                let api = CloudApi::new(sess, Endpoints::default(), None);
+                loop {
+                    let i = next.fetch_add(1, Ordering::Relaxed);
+                    if i >= total {
+                        break;
+                    }
+                    let ti = Instant::now();
+                    let res = api.upload_asset_ex(&AssetUploadRequest {
+                        asset_type: "Decal",
+                        display_name: &format!("bench100_decal_{i}"),
+                        description: "100x bench",
+                        group_id: None,
+                        asset_id: None,
+                        expected_price: None,
+                        filename: "icon.png",
+                        mime: "image/png",
+                        bytes: &bytes,
+                        resolve_image_id: true,
+                    });
+                    let ms = ti.elapsed().as_secs_f64() * 1000.0;
+                    match res {
+                        Ok(u) => {
+                            ok_count.fetch_add(1, Ordering::Relaxed);
+                            if u.image_asset_id.is_some() {
+                                img_count.fetch_add(1, Ordering::Relaxed);
+                            }
+                            latencies.lock().unwrap().push(ms);
+                        }
+                        Err(e) => {
+                            errors.lock().unwrap().push((i, e.0));
+                        }
+                    }
+                    let n = done.fetch_add(1, Ordering::Relaxed) + 1;
+                    if n % 25 == 0 || n == total {
+                        println!(
+                            "  progress: {n}/{total} ({} ok, {} err, {:.1}s elapsed)",
+                            ok_count.load(Ordering::Relaxed),
+                            n - ok_count.load(Ordering::Relaxed),
+                            t_all.elapsed().as_secs_f64()
+                        );
+                    }
+                }
+            }));
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
+        let elapsed_s = t_all.elapsed().as_secs_f64();
+        let ok = ok_count.load(Ordering::Relaxed);
+        let imgs = img_count.load(Ordering::Relaxed);
+        let mut lats = latencies.lock().unwrap().clone();
+        lats.sort_by(|a, b| a.total_cmp(b));
+        let pct = |p: f64| -> f64 {
+            if lats.is_empty() {
+                return 0.0;
+            }
+            let idx = ((lats.len() - 1) as f64 * p).round() as usize;
+            lats[idx.min(lats.len() - 1)]
+        };
+        let errs = errors.lock().unwrap();
+        println!(
+            "RESULT 100 decals (workers={workers}): {ok}/{total} ok (img resolved: {imgs}/{ok}), {} err in {elapsed_s:.2}s -> {:.2} decals/sec | latency min={:.0}ms p50={:.0}ms p95={:.0}ms max={:.0}ms",
+            errs.len(),
+            ok as f64 / elapsed_s,
+            pct(0.0),
+            pct(0.5),
+            pct(0.95),
+            pct(1.0)
+        );
+        for (i, e) in errs.iter().take(10) {
+            println!("  err #{i}: {e}");
         }
     }
 }

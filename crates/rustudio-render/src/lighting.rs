@@ -233,8 +233,8 @@ pub fn effects(d: &Document, cam_obj: Option<Ref>) -> Effects {
     e
 }
 
-/// Lighting.Atmosphere (the first Atmosphere child) as Studio's renderer
-/// turns it into AdvSky props and fog.
+/// Lighting's active Atmosphere (the newest / last Atmosphere child by class)
+/// as Studio's renderer turns it into AdvSky props and fog.
 #[derive(Clone, Copy, Debug)]
 pub struct Atmos {
     /// Color² (FogColor before the sky's irradiance).
@@ -250,12 +250,23 @@ pub struct Atmos {
     pub fog_k: f32,
 }
 
+/// Atmosphere instances are selected by class (not Name); newest/last child wins.
+fn atmosphere_child(d: &Document, parent: Ref) -> Option<Ref> {
+    d.dom
+        .get_by_ref(parent)?
+        .children()
+        .iter()
+        .rev()
+        .copied()
+        .find(|r| d.class_of(*r).is_some_and(|c| c == "Atmosphere"))
+}
+
 /// The Atmosphere's props as Studio computes them: the change hook at
 /// (A, B from Haze), the Decay transform and the
 /// fog setup.
 pub fn atmosphere(d: &Document) -> Option<Atmos> {
     let l = d.find_child(d.dom.root_ref(), "Lighting")?;
-    let a = d.find_child(l, "Atmosphere")?;
+    let a = atmosphere_child(d, l)?;
     let num = |n: &str, dflt: f32| f32_of(d.prop(a, n)).unwrap_or(dflt);
     // Defaults: the Atmosphere constructor's: Density 0.395,
     // Color (199, 170, 107), Decay (92, 60, 13), the rest 0.
@@ -1064,9 +1075,15 @@ fn prepare_light(d: &Document, l: Ref, soft: bool) -> Option<CachedLight> {
 
 // ------------------------------------------------------------- sky faces
 
-/// Sky instances are selected by class; games commonly rename clones.
+/// Sky instances are selected by class (games commonly rename clones);
+/// newest/last child wins, matching Studio's Lighting::onChildAdded.
 fn sky_child(d: &Document, parent: Ref) -> Option<Ref> {
-    d.dom.get_by_ref(parent)?.children().iter().copied()
+    d.dom
+        .get_by_ref(parent)?
+        .children()
+        .iter()
+        .rev()
+        .copied()
         .find(|r| d.class_of(*r).is_some_and(|c| c == "Sky"))
 }
 
@@ -1102,6 +1119,7 @@ pub fn sky_faces(d: &Document) -> [String; 6] {
             Some(Variant::Content(c)) => {
                 c.as_uri().filter(|u| !u.is_empty()).map(|u| u.to_string())
             }
+            Some(Variant::String(s)) if !s.is_empty() => Some(s),
             _ => None,
         });
         out[i] =
@@ -1230,7 +1248,50 @@ mod tests {
         assert!(soft_style(&d), "live documents bypass file-load lighting migration");
         assert_eq!(sky_faces(&d)[0], "rbxassetid://123");
         assert_eq!(effects(&d, None).dof, Some([4.72, 0.0, 0.0, 0.567]));
+    }
 
+    #[test]
+    fn newest_sky_and_atmosphere_override_existing() {
+        use rbx_dom_weak::types::{Color3, ContentId};
+        let dom = WeakDom::new(
+            InstanceBuilder::new("DataModel").with_child(
+                InstanceBuilder::new("Lighting")
+                    .with_name("Lighting")
+                    .with_child(
+                        InstanceBuilder::new("Sky")
+                            .with_name("Sky")
+                            .with_property("SkyboxBk", ContentId::from("rbxassetid://111")),
+                    )
+                    .with_child(
+                        InstanceBuilder::new("Atmosphere")
+                            .with_name("Atmosphere")
+                            .with_property("Density", 0.3f32)
+                            .with_property("Color", Color3::new(0.8, 0.8, 0.8)),
+                    )
+                    .with_child(
+                        InstanceBuilder::new("Sky")
+                            .with_name("ToolboxSky")
+                            .with_property("SkyboxBk", Variant::String("rbxassetid://999".into())),
+                    )
+                    .with_child(
+                        InstanceBuilder::new("Atmosphere")
+                            .with_name("AestheticAtmosphere")
+                            .with_property("Density", 0.7f32)
+                            .with_property("Offset", 0.5f32),
+                    ),
+            ),
+        );
+        let d = Document::from_play_dom(dom, "override".into());
+        assert_eq!(sky_faces(&d)[0], "rbxassetid://999");
+        let a = atmosphere(&d).expect("renamed newest Atmosphere must be active");
+        assert!((a.offset - 0.5).abs() < 1e-5, "got offset {}", a.offset);
+        let expected_fog_k = mech::ATMOS_FOG_DENSITY_K * 0.7f32.powf(mech::ATMOS_FOG_DENSITY_POW);
+        assert!(
+            (a.fog_k - expected_fog_k).abs() < 1e-6,
+            "got fog_k {}, expected {}",
+            a.fog_k,
+            expected_fog_k
+        );
     }
 
     #[test]

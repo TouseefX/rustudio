@@ -28,19 +28,39 @@ fn benchmark_enabled() -> bool {
 }
 
 static AUTOMATIC: AtomicBool = AtomicBool::new(false);
+/// A periodic frame report wants every span ([`set_detailed`]).
+static DETAILED: AtomicBool = AtomicBool::new(false);
 
 pub(crate) fn set_automatic(enabled: bool) {
     AUTOMATIC.store(enabled, Ordering::Relaxed);
 }
 
+/// Times every labelled span from now on (as `RUSTUDIO_GPU_TIMING` does),
+/// for a frame report that reads [`take`] — a phone's perf log line.
+pub fn set_detailed(enabled: bool) {
+    DETAILED.store(enabled, Ordering::Relaxed);
+}
+
 fn on() -> bool {
-    benchmark_enabled() || AUTOMATIC.load(Ordering::Relaxed) || rustudio_core::profiler::gpu_wanted()
+    benchmark_enabled() || AUTOMATIC.load(Ordering::Relaxed) || DETAILED.load(Ordering::Relaxed) || rustudio_core::profiler::gpu_wanted()
 }
 
 /// Every labelled span is timed (the bench or the profiler wants them), not
 /// only the scene span automatic quality reads.
 fn detailed() -> bool {
-    benchmark_enabled() || rustudio_core::profiler::gpu_wanted()
+    benchmark_enabled() || DETAILED.load(Ordering::Relaxed) || rustudio_core::profiler::gpu_wanted()
+}
+
+/// A mark that ends a span of the viewport's own work, summed into
+/// `last_scene_ms` (what Automatic quality reads): the scene encoder up
+/// to and including its post-processing ("gpu: post"), or up to where
+/// the post was left for after the world GUI pass ("gpu: scene";
+/// render.rs `postfx_after_gui`), and that post run submitted apart
+/// ("gpu: post (after gui)", through [`submit`]). Summed, not spanned:
+/// the GPU may sit idle between the two submissions while the CPU
+/// builds the GUI, and that gap is no render cost.
+fn scene_label(label: &str) -> bool {
+    matches!(label, "gpu: post" | "gpu: scene" | "gpu: post (after gui)")
 }
 
 /// Keep timestamp queries available if Automatic is selected after startup.
@@ -60,7 +80,8 @@ struct Slot {
     resolve: wgpu::Buffer,
     read: wgpu::Buffer,
     spans: Vec<(u32, u32, &'static str)>,
-    scene_span: Option<(u32, u32)>,
+    /// The frame's scene spans ([`scene_label`]), summed.
+    scene_spans: Vec<(u32, u32)>,
     used: u32,
     state: Arc<AtomicU8>,
     /// The profiler's clock when the frame's work was submitted (where its
@@ -111,7 +132,7 @@ fn init(device: &wgpu::Device, queue: &wgpu::Queue) -> Option<State> {
                 mapped_at_creation: false,
             }),
             spans: Vec::new(),
-            scene_span: None,
+            scene_spans: Vec::new(),
             used: 0,
             state: Arc::new(AtomicU8::new(FREE)),
             cpu_ns: 0,
@@ -157,7 +178,7 @@ pub fn begin(device: &wgpu::Device, queue: &wgpu::Queue, encoder: &mut wgpu::Com
 
 /// Books the GPU time since the last `begin` / `mark` in this encoder to `label`.
 pub fn mark(encoder: &mut wgpu::CommandEncoder, label: &'static str) {
-    if !on() || (!detailed() && label != "gpu: post") {
+    if !on() || (!detailed() && !scene_label(label)) {
         return;
     }
     let mut g = STATE.lock().unwrap_or_else(|e| e.into_inner());
@@ -167,8 +188,10 @@ pub fn mark(encoder: &mut wgpu::CommandEncoder, label: &'static str) {
     let cur = st.cur.unwrap_or(0);
     let slot = &mut st.slots[cur];
     slot.spans.push((prev, i, label));
-    if label == "gpu: post" {
-        slot.scene_span = st.encoder_start.map(|start| (start, i));
+    if scene_label(label) {
+        if let Some(start) = st.encoder_start {
+            slot.scene_spans.push((start, i));
+        }
     }
     st.last = Some(i);
 }
@@ -177,6 +200,16 @@ pub fn mark(encoder: &mut wgpu::CommandEncoder, label: &'static str) {
 /// queries and collect earlier frames that finished.
 pub fn end_frame(device: &wgpu::Device, queue: &wgpu::Queue) {
     if !on() {
+        return;
+    }
+    // Once the device is lost (gpu_health: wgpu's callback has run) nothing
+    // here can resolve or map, and `Device::poll` on it is one of wgpu's
+    // fatal errors ("Error in Device::poll: Parent device is lost"): a
+    // panic in the frame the loss is reported, before the Android build's
+    // gpu_watch — the next frame's first step — could save the open place
+    // and restart (a 2026-11-26 crash report, three beams into a fight).
+    // The frame ends without this; the loss is handled where it is meant to be.
+    if crate::gpu_health::lost().is_some() {
         return;
     }
     let _scope = rustudio_core::bench::scope("gpu_timing_end_frame");
@@ -198,12 +231,14 @@ pub fn end_frame(device: &wgpu::Device, queue: &wgpu::Queue) {
         } else {
             slot.used = 0;
             slot.spans.clear();
-            slot.scene_span = None;
+            slot.scene_spans.clear();
         }
     }
     st.last = None;
     st.encoder_start = None;
-    let _ = device.poll(wgpu::PollType::Poll);
+    if !crate::gpu_health::poll(device, wgpu::PollType::Poll) {
+        return;
+    }
     let period = st.period_ns;
     for slot in st.slots.iter_mut() {
         if slot.state.load(Ordering::Acquire) != MAPPED {
@@ -222,7 +257,7 @@ pub fn end_frame(device: &wgpu::Device, queue: &wgpu::Queue) {
                     continue;
                 }
                 total += ms;
-                if benchmark_enabled() {
+                if detailed() {
                     match st.results.iter_mut().find(|e| e.0 == *label) {
                         Some(e) => e.1 += ms,
                         None => st.results.push((label, ms)),
@@ -230,21 +265,25 @@ pub fn end_frame(device: &wgpu::Device, queue: &wgpu::Queue) {
                 }
             }
             // Detailed profiling also times effects, UI and extra submits.
-            // Feed the controller the same viewport span in both modes.
-            if let Some((a, b)) = slot.scene_span {
-                let scene = ts[b as usize].wrapping_sub(ts[a as usize]) as f64 * period / 1e6;
-                if scene > 0.0 && scene < 1000.0 {
-                    st.last_scene_ms = Some(scene as f32);
+            // Feed the controller the same viewport spans in both modes.
+            let mut scene = 0.0;
+            for &(a, b) in &slot.scene_spans {
+                let ms = ts[b as usize].wrapping_sub(ts[a as usize]) as f64 * period / 1e6;
+                if (0.0..1000.0).contains(&ms) {
+                    scene += ms;
                 }
             }
-            if benchmark_enabled() {
+            if scene > 0.0 {
+                st.last_scene_ms = Some(scene as f32);
+            }
+            if detailed() {
                 st.totals.push(total);
             }
         }
         slot.read.unmap();
         slot.used = 0;
         slot.spans.clear();
-        slot.scene_span = None;
+        slot.scene_spans.clear();
         slot.state.store(FREE, Ordering::Release);
     }
     // The next free slot records the next frame; none free: that frame isn't timed.
@@ -284,15 +323,18 @@ pub fn take() -> (Vec<(&'static str, f64)>, Vec<f64>) {
 }
 
 /// `queue.submit(bufs)`, timed as `label` (a timestamp before and after,
-/// in their own command buffers) with the switch on. Doesn't disturb a
-/// `begin`/`mark` run being recorded in another encoder meanwhile.
+/// in their own command buffers) with the switch on — a scene label
+/// ([`scene_label`]) whenever the scene is timed, the rest only in
+/// detail. Doesn't disturb a `begin`/`mark` run being recorded in
+/// another encoder meanwhile.
 pub fn submit(
     device: &wgpu::Device,
     queue: &wgpu::Queue,
     label: &'static str,
     bufs: impl IntoIterator<Item = wgpu::CommandBuffer>,
 ) {
-    if !detailed() || UNSUPPORTED.get().is_some() {
+    let timed = detailed() || (on() && scene_label(label));
+    if !timed || UNSUPPORTED.get().is_some() {
         queue.submit(bufs);
         return;
     }

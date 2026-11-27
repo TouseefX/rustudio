@@ -723,7 +723,8 @@ impl Editor {
         }
         let vp_pick = rustudio_core::bench::scope("vp_pick");
         let pointer = resp.hover_pos();
-        let handles = if pointer.is_some() || resp.drag_started_by(PointerButton::Primary) {
+        let anim_owns_viewport = self.anim_editor_owns_viewport();
+        let handles = if !anim_owns_viewport && (pointer.is_some() || resp.drag_started_by(PointerButton::Primary)) {
             self.handles(rect)
         } else {
             Vec::new()
@@ -780,6 +781,7 @@ impl Editor {
             && !in_play
             && !self.clean_view
             && !roblox_dragger_idle
+            && !anim_owns_viewport
         {
             pointer
                 .filter(|p| self.screen_gui_at(*p).is_none())
@@ -814,6 +816,7 @@ impl Editor {
         {
             scene::grid_lines(&mut lines, self.ui.grid_size);
         }
+        self.anim_editor_floor_grid_lines(&mut lines);
         drop(vp_prepare);
         let painter = ui.painter_at(rect);
         self.game.draw_world(&ctx, &painter, rect, lines, &overlay, self.harness.run.started);
@@ -905,13 +908,19 @@ impl Editor {
         }
         let in_game = self.game.game_viewport(ui, rect, &resp, gui_took) || plugin_took;
 
+        // The Animation Editor's dragger/joint-picker owns the left button while open,
+        // so normal Select/Move/Rotate/Scale clicks and drags never highlight the whole rig.
+        let anim_dragging = !in_game && !alt && self.anim_editor_viewport_ui(&ctx, &painter, rect, &resp);
+        let anim_blocked = anim_dragging || (!in_game && !alt && anim_owns_viewport);
+
         // The Terrain Editor's brush has the left button while one is picked.
-        let brushing = !in_game
-            && !alt
-            && self
-                .builtin_tools
-                .use_native(rustudio_core::rustudio_settings::BuiltinTool::TerrainEditor)
-            && self.terrain_brush_ui(&ctx, rect, &resp, pointer, &painter);
+        let brushing = anim_blocked
+            || (!in_game
+                && !alt
+                && self
+                    .builtin_tools
+                    .use_native(rustudio_core::rustudio_settings::BuiltinTool::TerrainEditor)
+                && self.terrain_brush_ui(&ctx, rect, &resp, pointer, &painter));
 
         if self.part_drag.is_some() {
             for (key, tilt) in [(egui::Key::R, false), (egui::Key::T, true)] {
@@ -1012,7 +1021,10 @@ impl Editor {
         self.game.scene.sync(&mut self.game.doc);
         let _overlays = rustudio_core::bench::scope("viewport_overlays");
         // Comparison captures show the scene alone (clean_view).
-        if !self.clean_view {
+        // When the Animation Editor has an attached rig, only the Animation Editor's
+        // per-joint SelectionBox and gizmo should draw (never a whole-body rig outline).
+        let suppress_studio_selection = anim_owns_viewport && self.anim_editor.active;
+        if !self.clean_view && !suppress_studio_selection {
             let _s = rustudio_core::bench::scope("vp_selection_outline");
             self.draw_selection(&painter, rect);
         }
@@ -1021,7 +1033,7 @@ impl Editor {
         // Studio Settings > Selection: Show Hover Over, Hover Over Color,
         // Hover Line Thickness.
         let show_hover = crate::studio_settings::flag("Studio", "Show Hover Over", true);
-        if let Some(h) = self.hover.filter(|_| show_hover && !self.clean_view && self.part_drag.is_none() && self.drag.is_none()) {
+        if let Some(h) = self.hover.filter(|_| show_hover && !self.clean_view && !anim_owns_viewport && self.part_drag.is_none() && self.drag.is_none()) {
             let _s = rustudio_core::bench::scope("vp_hover_outline");
             self.sync_hover_refs(h);
             let refs = std::mem::take(&mut self.hover_outline_refs.1);
@@ -1030,7 +1042,7 @@ impl Editor {
             self.hover_outline_refs.1 = refs;
         }
         // A free drag hides the handles (Studio draws only the pivot then).
-        let handles = if self.part_drag.is_some() { Vec::new() } else { self.handles(rect) };
+        let handles = if self.part_drag.is_some() || anim_owns_viewport { Vec::new() } else { self.handles(rect) };
         // A grab point per handle: arrow/handle tips, and 45° along each ring
         // (where no other ring crosses it).
         self.gizmo_points = handles

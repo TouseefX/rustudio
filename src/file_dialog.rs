@@ -48,6 +48,12 @@ pub enum Purpose {
     TemplateThumb(String),
     /// … another place file for one of the person's templates.
     TemplateReplace(String),
+    /// Animation Editor > Import > From FBX Animation…
+    AnimImportFbx,
+    /// Animation Editor > Import > From File (.rbxm/.rbxmx)…
+    AnimImportRbxm,
+    /// Animation Editor > Export > Export to File (.rbxm)…
+    AnimExportRbxm,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

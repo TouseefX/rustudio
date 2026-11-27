@@ -58,10 +58,10 @@ impl Group {
 
     pub fn hint(self) -> &'static str {
         match self {
-            Group::Read => "Explorer tree, properties, script source, Output, screenshots, Team Create status",
+            Group::Read => "Explorer tree, properties, script source, Output, screenshots, profiler captures, Team Create status",
             Group::Edit => "Properties, scripts, instances, Luau in the edit DataModel, project folders and models, plugins, undo",
             Group::Play => "Play / Run / Stop, Luau on the Play server or client, keys and clicks, the camera",
-            Group::Places => "Open a place file, a Roblox place or a Team Create session; save copies to files",
+            Group::Places => "Open a place file, a Roblox place or a Team Create session; save copies to files; upload assets to Roblox",
             Group::Live => "Edits while the open place is a live Team Create session reach every collaborator; committing and discarding script drafts",
         }
     }

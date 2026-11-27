@@ -23,6 +23,7 @@ pub mod audio_scene;
 pub mod audio_capture;
 pub mod avatar;
 pub mod gui;
+pub mod font_enum;
 pub mod gui_modal;
 pub mod mouse_lock;
 pub mod touch_input;

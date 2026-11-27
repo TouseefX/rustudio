@@ -1332,6 +1332,7 @@ fn capture_output(lua: &Lua) -> mlua::Result<()> {
             rustudio_core::log::Level::Warn => 2,
             rustudio_core::log::Level::Info if info => 1,
             rustudio_core::log::Level::Info => 0,
+            rustudio_core::log::Level::System => 1,
         };
         lines.push((msg, ty, now));
     }

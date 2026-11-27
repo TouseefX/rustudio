@@ -4735,27 +4735,15 @@ pub fn install_font(lua: &Lua, g: &Table) -> LResult<()> {
     t.set(
         "fromEnum",
         lua.create_function(|_, e: Value| {
-            let name = ud::<LEnumItem>(&e)
-                .map(|i| i.name)
-                .unwrap_or_else(|| "SourceSans".into());
-            let (family, weight_num, italic) = crate::gui::legacy_face_key(&name);
-            let mut f = font_from_parts(family, None, None)?;
-            f.0.weight = match weight_num {
-                100 => rbx_types::FontWeight::Thin,
-                200 => rbx_types::FontWeight::ExtraLight,
-                300 => rbx_types::FontWeight::Light,
-                500 => rbx_types::FontWeight::Medium,
-                600 => rbx_types::FontWeight::SemiBold,
-                700 => rbx_types::FontWeight::Bold,
-                800 => rbx_types::FontWeight::ExtraBold,
-                900 => rbx_types::FontWeight::Heavy,
-                _ => rbx_types::FontWeight::Regular,
+            // Studio's face for the item (font_enum.rs): Arial.json and
+            // GothamSSm.json, as a TextLabel's FontFace gets them.
+            let item = ud::<LEnumItem>(&e)
+                .filter(|i| i.enum_type == "Font")
+                .unwrap_or_else(|| LEnumItem::from_name("Font", "SourceSans").expect("Enum.Font.SourceSans"));
+            let Some(face) = crate::font_enum::face_of_enum(item.value) else {
+                return Err(rt_err(format!("Enum.Font.{} can't be passed to Font.fromEnum", item.name)));
             };
-            f.0.style = if italic {
-                rbx_types::FontStyle::Italic
-            } else {
-                rbx_types::FontStyle::Normal
-            };
+            let f = LFont(face);
             Ok(f)
         })?,
     )?;

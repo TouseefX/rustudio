@@ -29,6 +29,9 @@ use rustudio_core::terrain::{Voxels, WATER};
 
 /// Voxels per chunk (X, Y, Z).
 pub const CHUNK: [usize; 3] = [32, 16, 32];
+/// Studs per voxel (Studio's 4-stud lighting voxels; the origin and
+/// extent arithmetic below has the 4 written out).
+pub const VOXEL: f32 = 4.0;
 
 /// The grid's size in voxels: (X, Y, Z).
 pub fn dims() -> [usize; 3] {

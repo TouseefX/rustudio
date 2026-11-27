@@ -1649,6 +1649,14 @@ fn compute_hover_sig() -> (i64, bool) {
     ((h.finish() & 0x001f_ffff_ffff_ffff) as i64, has_events)
 }
 
+/// A GuiButton's MouseButton1Down (`down`) or MouseButton1Up: the input
+/// actions bound to it through InputBinding.UIButton / UIModifier.
+pub fn ui_button(lua: &Lua, button: Value, down: bool) {
+    if let Ok(f) = module(lua).and_then(|m| m.get::<Function>("ui_button")) {
+        let _ = f.call::<()>((button, down));
+    }
+}
+
 pub fn step(lua: &Lua, dt: f64) -> mlua::Result<()> {
     let (side, edit_key) = match world(lua) {
         Ok(w) => {

@@ -602,9 +602,8 @@ impl Session {
         })
     }
 
-    /// A copy for downloads on other threads, so they don't queue on the
-    /// account's lock (it shares the connection pool; no CSRF token).
-    /// The cookie is shared, so a rotation seen by one copy is seen by all.
+    /// A copy for background threads, so they don't queue on the account's
+    /// lock (shares the connection pool, cookie rotation, and CSRF token).
     pub fn downloader(&self) -> Session {
         Session {
             cookie: self.cookie.clone(),

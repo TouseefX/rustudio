@@ -98,6 +98,12 @@ const HAS_EFFECT: &[(&str, &str)] = &[
     ("Studio", "Number Color"),
     ("Studio", "Comment Color"),
     ("Studio", "Operator Color"),
+    // Auto-indent (script_editor/indent.rs).
+    ("Studio", "Tab Width"),
+    ("Studio", "Indent Using Spaces"),
+    ("Studio", "Auto Indent Rule"),
+    ("Studio", "Format On Type"),
+    ("Studio", "Auto Clean Empty Line"),
     ("PhysicsSettings", "AllowSleep"),
 ];
 

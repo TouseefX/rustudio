@@ -10,6 +10,8 @@ use egui::{Color32, FontId, RichText, Stroke};
 use rbx_dom_weak::types::{Ref, Variant};
 
 use crate::app::Editor;
+
+mod indent;
 use crate::icons;
 use rustudio_engine::runtime;
 use rustudio_engine::theme;
@@ -235,32 +237,6 @@ pub fn highlight(src: &str, error_line: Option<usize>, font: FontId) -> LayoutJo
     job
 }
 
-/// The indentation to make after this frame's typing: what `TextEdit`
-/// inserted at the caret (`before` → `after`, the caret at `caret` right
-/// after it — found by the caret, since an insertion at the end of a run
-/// of the same characters has no one place in a plain diff), given to
-/// code_indent.rs with Studio's settings.
-fn auto_indent(before: &str, after: &str, caret: usize) -> Option<crate::code_indent::Fixup> {
-    let ind = crate::code_indent::settings()?;
-    let inserted = typed_at_caret(before, after, caret)?;
-    crate::code_indent::on_insert(after, caret, &inserted, &ind)
-}
-
-/// `after` is `before` with text inserted ending at `caret` (chars): that text.
-fn typed_at_caret(before: &str, after: &str, caret: usize) -> Option<String> {
-    let len = after.chars().count().checked_sub(before.chars().count())?;
-    if len == 0 || caret < len || after.len() < before.len() {
-        return None;
-    }
-    let a: Vec<char> = after.chars().collect();
-    if caret > a.len() {
-        return None;
-    }
-    let at = caret - len;
-    let b: Vec<char> = before.chars().collect();
-    (b[..at] == a[..at] && b[at..] == a[caret..]).then(|| a[at..caret].iter().collect())
-}
-
 pub struct ScriptBuf {
     pub text: String,
     pub error: Option<(usize, String)>,
@@ -465,7 +441,14 @@ impl Editor {
         ui.painter().rect_filled(ui.available_rect_before_wrap(), 0.0, bg);
         let error_line = buf.error.as_ref().map(|e| e.0);
         let mut changed = false;
-        let mut indent_caret: Option<usize> = None;
+        // Studio's auto-indent: Enter (and typing `end`/`else`/`}`...) run
+        // ahead of egui, which would put a bare "\n" (script_editor/indent.rs).
+        let indented = focused
+            && indent::handle_keys(ui.ctx(), editor_id, &mut buf.text, &indent::Cfg::from_settings());
+        if indented {
+            changed = true;
+            buf.edited = Instant::now();
+        }
         egui::ScrollArea::both()
             .auto_shrink([false, false])
             .id_salt(("script_scroll", r))
@@ -511,9 +494,6 @@ impl Editor {
                         }
                         ui.fonts_mut(|f| f.layout_job(job))
                     };
-                    // (the text before this frame's typing, for the
-                    // auto-indent below; the field changes only focused)
-                    let before = focused.then(|| buf.text.clone());
                     let out = egui::TextEdit::multiline(&mut buf.text)
                         .id(editor_id)
                         .code_editor()
@@ -531,26 +511,17 @@ impl Editor {
                         crate::android::keyboard::reveal_cursor(ui, &out);
                         crate::android::ime::code_field(editor_id);
                     }
-                    let caret = out.state.cursor.char_range().filter(|r| r.primary == r.secondary).map(|r| r.primary.index.0);
                     let resp = out.response.response;
+                    if indented {
+                        // (egui only follows the cursor for its own edits)
+                        if let Some(c) = out.cursor_range {
+                            let at = out.galley.pos_from_cursor(c.primary).translate(out.galley_pos.to_vec2());
+                            ui.scroll_to_rect(at, None);
+                        }
+                    }
                     if resp.changed() {
                         changed = true;
                         buf.edited = Instant::now();
-                        // Auto-indent (code_indent.rs): Enter keeps and
-                        // deepens the indentation, a closer typed steps out.
-                        // (Android's soft keyboard makes it on its mirror
-                        // inside its own operation, ime.rs
-                        // `native_code_fixup`: the text comes indented and
-                        // nothing is left to do here.)
-                        if let (Some(before), Some(caret)) = (before.as_deref(), caret) {
-                            if let Some(fix) = auto_indent(before, &buf.text, caret) {
-                                crate::code_indent::apply(&mut buf.text, &fix);
-                                let mut st = out.state.clone();
-                                st.cursor.set_char_range(Some(egui::text::CCursorRange::one(egui::text::CCursor::new(fix.cursor.0))));
-                                st.store(ui.ctx(), editor_id);
-                                indent_caret = Some(fix.cursor.0);
-                            }
-                        }
                     }
                     if let Some(line) = goto {
                         let y = resp.rect.top() + line.saturating_sub(1) as f32 * row_h;
@@ -588,7 +559,7 @@ impl Editor {
             st.store(ui.ctx(), editor_id);
         }
         // A built-in completion taken: the text and the caret after it.
-        let mut moved_caret: Option<usize> = indent_caret;
+        let mut moved_caret: Option<usize> = None;
         // The soft Tab keys (Android): the unit at the caret, or the
         // selection's lines in or out.
         if let (Some(shift), Some(st)) = (soft_tab, egui::TextEdit::load_state(ui.ctx(), editor_id)) {

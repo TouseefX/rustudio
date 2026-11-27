@@ -9,6 +9,8 @@ pub mod env_probe_gpu;
 mod sky_env_filter;
 #[path = "vf_render.rs"]
 pub mod vf;
+#[path = "warmup.rs"]
+mod warmup;
 
 use std::collections::{HashMap, HashSet};
 use std::time::Instant;
@@ -560,6 +562,19 @@ pub mod gpu_check {
         };
         r.render_viewport_frames(&rs, &std::collections::HashMap::from([(layer, req)]));
         assert!(r.vf_texture(layer).is_some(), "the ViewportFrame was not drawn");
+        // The post-processing left to the GUI pass (`postfx_after_gui`):
+        // run by `draw_world_gui` with nothing to draw (owed), by the next
+        // frame when no draw followed, and by `draw_highlights`.
+        r.render_with_gui_after(&rs, [320, 180], true, &frame);
+        assert!(r.postfx_owed, "render left the post to the GUI pass");
+        r.draw_world_gui(&rs, (0, None), &[], None, None);
+        assert!(!r.postfx_owed, "draw_world_gui ran the post it was owed");
+        r.render_with_gui_after(&rs, [320, 180], true, &frame);
+        r.render(&rs, [320, 180], &frame);
+        assert!(!r.postfx_owed && !r.postfx_after_gui, "a plain render settles and clears the flags");
+        r.render_with_gui_after(&rs, [320, 180], true, &frame);
+        r.draw_highlights(&rs, &[]);
+        assert!(!r.postfx_owed, "draw_highlights settled the post");
         // The passes made on first use by a scene that has them.
         // (a device that cannot sample multisampled textures never builds 4x)
         let sample_counts: &[u32] = if caps.sampled_msaa() { &[1, SAMPLES] } else { &[1] };
@@ -598,6 +613,46 @@ mod gpu_tests {
         for index in [0usize, MeshKind::Ball as usize, MeshKind::Cylinder as usize] {
             assert!(meshes[index].iter().all(|v| v.projection[0] == 0.0));
         }
+    }
+
+    #[test]
+    fn texture_vram_budget_steps_down_and_falls_back_cleanly() {
+        let instance = wgpu::Instance::default();
+        let adapters = pollster::block_on(instance.enumerate_adapters(wgpu::Backends::all()));
+        let Some(adapter) = crate::gpu_caps::rank_adapters(&adapters, None).into_iter().next() else {
+            return;
+        };
+        let info = adapter.get_info();
+        let limits = crate::gpu_caps::required_limits(&adapter.limits());
+        let desc = wgpu::DeviceDescriptor {
+            required_limits: limits,
+            required_features: adapter.features() & wgpu::Features::TEXTURE_ADAPTER_SPECIFIC_FORMAT_FEATURES,
+            ..Default::default()
+        };
+        let (device, queue) = pollster::block_on(adapter.request_device(&desc)).unwrap();
+        let caps = crate::gpu_caps::GpuCaps::of_adapter(&adapter, &device);
+        if info.backend == wgpu::Backend::Vulkan {
+            assert!(
+                caps.vram_bytes.is_some_and(|b| b > 0),
+                "expected Vulkan VRAM detection on {} ({:?})",
+                info.name,
+                info.backend
+            );
+            eprintln!("detected VRAM on {}: {} MiB", info.name, caps.vram_bytes.unwrap() >> 20);
+        }
+        let scope = device.push_error_scope(wgpu::ErrorFilter::Validation);
+        let mut r = Renderer::with_caps(&device, &queue, &caps);
+        // Simulate a tight 1 MiB part-texture budget: 512x512 (~1.33 MiB with mips)
+        // hits the budget after one upload, and subsequent uploads must return
+        // the valid white fallback slot (0) with zero validation errors.
+        r.texture_vram_budget = 1024 * 1024;
+        let rgba = vec![180u8; 512 * 512 * 4];
+        let first = r.add_texture(&device, &queue, 512, 512, &rgba);
+        assert!(first > 0);
+        assert!(r.texture_vram_bytes >= r.texture_vram_budget);
+        let fallback = r.add_texture(&device, &queue, 512, 512, &rgba);
+        assert_eq!(fallback, 0, "over-budget upload must fall back to valid slot 0");
+        assert!(pollster::block_on(scope.pop()).is_none());
     }
 
     #[test]
@@ -2759,6 +2814,7 @@ impl ViewportPipelines {
                 std::thread::Builder::new()
                     .name("rustudio-pipeline".into())
                     .spawn(move || {
+                        let _building = crate::pipeline_cache::building();
                         let src = (std::sync::Arc::new(spec_source(&src.0, false, false, Some(mask))), src.1, src.2);
                         let pipes = [Some(wgpu::Face::Back), None].map(|cull| opaque_part_pipeline(&device, &src, cull));
                         cache.lock().unwrap_or_else(|e| e.into_inner()).insert(mask, Some(pipes));
@@ -2768,6 +2824,12 @@ impl ViewportPipelines {
             }
         }
     }
+}
+
+/// One line on what the startup shader warm-up did (warmup.rs), once its
+/// worker finished; for View > GPU Driver.
+pub fn shader_warmup_summary() -> Option<String> {
+    warmup::summary()
 }
 
 /// The sample count the startup viewport pipelines (and the env probe and
@@ -2818,11 +2880,14 @@ pub struct Renderer {
     /// Sample count used by the env probe faces and ViewportFrame targets
     /// (`startup_samples(&caps)`: 4 with sampled MSAA, 1 on OpenGL).
     probe_samples: u32,
-    /// The one-sample pipelines being made on a worker since startup, for
-    /// a session that will draw with them (Automatic on a weak GPU, Low):
-    /// the first frame takes them instead of compiling them itself (seconds
-    /// on Mesa ANV the first time a build's shaders are seen).
-    lower_pending: Option<std::sync::mpsc::Receiver<ViewportPipelines>>,
+    /// The startup worker making the passes a session would otherwise
+    /// compile at their first use (warmup.rs): the viewport sets for the
+    /// sample counts it will draw with — the first frame takes them instead
+    /// of compiling them itself (seconds on Mesa ANV, or a phone, the first
+    /// time a build's shaders are seen) — and, on Android or with
+    /// `RUSTUDIO_SHADER_WARMUP=1`, the lazily made passes too. None once
+    /// it delivered everything.
+    warm: Option<warmup::Warmup>,
     terrain_layout: wgpu::BindGroupLayout,
     /// Skinned parts deformed on the GPU (skin_gpu.rs).
     skin: crate::skin_gpu::SkinGpu,
@@ -2849,6 +2914,20 @@ pub struct Renderer {
     gui_n_lights: u32,
     postfx: crate::postfx::PostFx,
     last_postfx: crate::postfx::PostFxParams,
+    /// Set before `render` by a caller that calls `draw_world_gui` right
+    /// after it: the post-processing (postfx.rs: DoF, bloom, sun rays,
+    /// the tone map and upscale to the display) then runs once, after the
+    /// world GUIs and effects have entered the HDR scene, instead of in
+    /// `render` and again in `draw_world_gui` (`finish_again`) — the
+    /// whole post chain twice a frame whenever a game draws a
+    /// BillboardGui or a particle, 2–4 ms of a phone's GPU. `render`
+    /// clears it (`render_with_gui_after` sets it).
+    postfx_after_gui: bool,
+    /// `render` left the post-processing to the caller's next draw over
+    /// the frame (`draw_world_gui`, else `draw_adorn` / `draw_highlights`,
+    /// else the next `render`): the HDR scene is complete, the display
+    /// texture isn't yet.
+    postfx_owed: bool,
     shadow: wgpu::RenderPipeline,
     shadow_cutout: wgpu::RenderPipeline,
     /// Each sun cascade's static casters, kept between redraws (SunCache).
@@ -2942,6 +3021,14 @@ pub struct Renderer {
     sampler: wgpu::Sampler,
     /// Texture bind groups; index 0 is plain white.
     textures: Vec<wgpu::BindGroup>,
+    /// Estimated GPU bytes held by each slot in `textures`.
+    texture_slot_bytes: Vec<usize>,
+    /// Total estimated GPU bytes across `textures`.
+    texture_vram_bytes: usize,
+    /// Soft VRAM budget for part textures (from `GpuCaps::texture_vram_budget`).
+    texture_vram_budget: usize,
+    /// Logged once when `texture_vram_budget` is reached.
+    texture_budget_warned: bool,
     /// Unsubmitted texture upload bytes since the last staging flush.
     pending_upload_bytes: usize,
     /// See-through draws in Studio's encoded blend (SeeThrough).
@@ -3008,6 +3095,7 @@ impl Renderer {
     /// (REDUCED_BINDINGS) and skips the passes that only fed those bindings.
     pub fn with_caps(device: &wgpu::Device, queue: &wgpu::Queue, caps: &crate::gpu_caps::GpuCaps) -> Self {
         let reduced = caps.reduced_bindings();
+        let texture_vram_budget = caps.texture_vram_budget();
         let caps = caps.clone();
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("rustudio viewport"),
@@ -3707,7 +3795,7 @@ impl Renderer {
         let mut r = Renderer {
             pipelines: [None, None, None],
             probe_samples,
-            lower_pending: None,
+            warm: None,
             terrain_layout: terrain_bgl,
             skin: crate::skin_gpu::SkinGpu::new(device, caps.compute()),
             gui_fog: ([0.0, 1e9, 0.0, 0.0], [0.0; 3]),
@@ -3718,6 +3806,8 @@ impl Renderer {
             gui_n_lights: 0,
             postfx: crate::postfx::PostFx::new(device, queue, HDR_FORMAT, DISPLAY_FORMAT),
             last_postfx: crate::postfx::PostFxParams::default(),
+            postfx_after_gui: false,
+            postfx_owed: false,
             world_gui: [None, None, None],
             highlight: [None, None, None],
             adorn: [None, None, None],
@@ -3778,6 +3868,10 @@ impl Renderer {
             tex_layout,
             sampler,
             textures: Vec::new(),
+            texture_slot_bytes: Vec::new(),
+            texture_vram_bytes: 0,
+            texture_vram_budget,
+            texture_budget_warned: false,
             pending_upload_bytes: 0,
             black_view,
             instance_buf: Self::make_buf(
@@ -3817,20 +3911,95 @@ impl Renderer {
         let one_sample_likely = rustudio_core::rustudio_settings::weak_gpu()
             || rustudio_core::rustudio_settings::performance_value("quality") == "automatic"
             || rustudio_core::rustudio_settings::performance_value("detail") == "low";
-        // (not when the probe's set is the one-sample set already: OpenGL,
-        // where it would be built twice)
-        if r.probe_samples != 1 && one_sample_likely && std::env::var_os("RUSTUDIO_NO_PIPELINE_PREBUILD").is_none() {
-            let (device, queue) = (device.clone(), queue.clone());
-            let (g, t, gl, tr, reduced) = (r.globals_layout.clone(), r.tex_layout.clone(), r.glass_layout.clone(), r.terrain_layout.clone(), r.reduced);
-            let (tx, rx) = std::sync::mpsc::channel();
-            let spawned = std::thread::Builder::new().name("rustudio-pipelines".into()).spawn(move || {
-                let _ = tx.send(ViewportPipelines::new(&device, &queue, &g, &t, &gl, &tr, 1, reduced));
-            });
-            if spawned.is_ok() {
-                r.lower_pending = Some(rx);
+        // The shader warm-up (warmup.rs): the one-sample viewport set when
+        // a session is likely to draw with it, and — on Android, or asked
+        // for — every pass a frame would otherwise compile at its first use.
+        // On a backend that already starts at one sample (OpenGL) the
+        // prebuilt set is the viewport's own: compiling it on a second
+        // thread holds the shared GL context, and wgpu-hal's context lock
+        // gives up after 1 s ("Could not lock adapter context").
+        let warm_env = std::env::var("RUSTUDIO_SHADER_WARMUP").ok();
+        let warm_off = warm_env.as_deref() == Some("0") || std::env::var_os("RUSTUDIO_NO_PIPELINE_PREBUILD").is_some();
+        let warm_full = !warm_off && (cfg!(target_os = "android") || warm_env.is_some());
+        if startup_samples(&r.caps) != 1 && !warm_off && (warm_full || one_sample_likely) {
+            // The sets in the order the session needs them: one sample when
+            // likely (a weak GPU's Automatic levels, Low detail), then the
+            // probe / ViewportFrame count (4x: the env probe's faces are
+            // drawn in the first frames of every place).
+            let mut viewport = Vec::new();
+            if one_sample_likely {
+                viewport.push(1);
             }
+            if warm_full && !viewport.contains(&probe_samples) {
+                viewport.push(probe_samples);
+            }
+            let (clouds_globals, _) = r.sky_globals.as_ref().cloned().unwrap_or_else(|| (r.globals_layout.clone(), r.globals_bg.clone()));
+            r.warm = warmup::Warmup::start(warmup::Job {
+                device: device.clone(),
+                queue: queue.clone(),
+                globals: r.globals_layout.clone(),
+                tex: r.tex_layout.clone(),
+                glass: r.glass_layout.clone(),
+                terrain: r.terrain_layout.clone(),
+                reduced: r.reduced,
+                clouds_globals,
+                clouds_source: shader_source(r.reduced),
+                postfx_depth: [r.postfx.depth_pipes_job(1), r.postfx.depth_pipes_job(SAMPLES)],
+                vertex_stride: std::mem::size_of::<Vertex>() as u64,
+                passes: if warm_full { viewport.clone() } else { Vec::new() },
+                viewport,
+            });
         }
         r
+    }
+
+    /// Takes what the warm-up worker delivered since the last frame
+    /// (warmup.rs); cheap once it finished.
+    fn poll_warmup(&mut self) {
+        let Some(w) = self.warm.as_mut() else { return };
+        for item in w.poll() {
+            self.install_warmed(item);
+        }
+        if self.warm.as_ref().is_some_and(|w| w.finished()) {
+            self.warm = None;
+        }
+    }
+
+    /// A pass the worker made goes into its slot, unless a frame made one
+    /// meanwhile (then it is dropped: the two are the same pipelines).
+    fn install_warmed(&mut self, item: warmup::Warmed) {
+        use warmup::Warmed;
+        match item {
+            Warmed::Viewport(s, p) => {
+                self.pipelines[sample_slot(s)].get_or_insert(p);
+            }
+            Warmed::WorldGui(s, p) => {
+                self.world_gui[sample_slot(s)].get_or_insert(p);
+            }
+            Warmed::Highlight(s, p) => {
+                self.highlight[sample_slot(s)].get_or_insert(p);
+            }
+            Warmed::Adorn(s, p) => {
+                self.adorn[sample_slot(s)].get_or_insert(p);
+            }
+            Warmed::Clouds(s, p) => {
+                self.clouds[sample_slot(s)].get_or_insert(p);
+            }
+            Warmed::PostfxDepth(s, p) => {
+                self.postfx.install_depth_pipes(s, p);
+            }
+            Warmed::VfBlit(b) => {
+                self.vf.blit.get_or_insert(b);
+            }
+        }
+    }
+
+    /// A frame is about to build `kind` for `samples` itself: the worker
+    /// skips it (warmup.rs).
+    fn warm_local(&mut self, kind: warmup::Kind, samples: u32) {
+        if let Some(w) = self.warm.as_mut() {
+            w.mark_local(kind, samples);
+        }
     }
 
     /// The last frame as shown (RGBA8, top row first): width, height,
@@ -3892,6 +4061,12 @@ impl Renderer {
 
     /// Bumps whenever the static scene is rebuilt: the scene environment
     /// probe's world revision (env_probe.rs).
+    /// The 3D view's render target as last made: size in pixels and
+    /// samples a pixel (None before the first frame).
+    pub fn target_info(&self) -> Option<([u32; 2], u32)> {
+        self.target.as_ref().map(|t| (t.size, t.samples))
+    }
+
     pub fn static_gen(&self) -> u64 {
         self.static_gen
     }
@@ -4012,29 +4187,96 @@ impl Renderer {
         width: u32, height: u32, rgba: &[u8],
         mask: Option<(u32, u32, &[u8])>, surface: Option<(u32, u32, &[u8])>,
     ) -> u32 {
-        let (sw, sh, sp) = surface.unwrap_or((1, 1, &[128, 128, 255, 0]));
-        let surface_mips = if sp.len() == (sw * sh * 4) as usize {
-            std::borrow::Cow::Owned(data_mip_chain(sw, sh, sp))
+        let reuse = REUSE_TEXTURE_SLOT.with(|c| c.take());
+        let fallback_slot = reuse.filter(|&i| (i as usize) < self.textures.len()).unwrap_or(0);
+        // Never allocate past the soft part-texture VRAM budget (except slot 0,
+        // the 1×1 white fallback made during init). Under an earlier OOM we
+        // compact resolution instead of refusing every remaining texture.
+        if !self.textures.is_empty() && self.texture_vram_bytes >= self.texture_vram_budget {
+            if !self.texture_budget_warned {
+                self.texture_budget_warned = true;
+                log::warn!(
+                    target: "rustudio::gpu",
+                    "part texture VRAM budget reached ({} / {} MiB); falling back to solid colours for additional textures",
+                    self.texture_vram_bytes >> 20,
+                    self.texture_vram_budget >> 20,
+                );
+            }
+            return fallback_slot;
+        }
+        // Step down maximum uploaded texture dimension on low-VRAM GPUs, after
+        // an OOM event, and progressively as part texture memory fills the budget.
+        let mut max_dim = self.caps.initial_texture_max_dim();
+        if crate::gpu_health::oom_seen() {
+            max_dim = max_dim.min(128);
+        }
+        if !self.textures.is_empty() && self.texture_vram_budget < usize::MAX {
+            let used = self.texture_vram_bytes;
+            let budget = self.texture_vram_budget.max(1);
+            if used.saturating_mul(5) >= budget.saturating_mul(4) {
+                max_dim = max_dim.min(128);
+            } else if used.saturating_mul(2) >= budget {
+                max_dim = max_dim.min(256);
+            }
+        }
+        let (sw0, sh0, sp) = surface.unwrap_or((1, 1, &[128, 128, 255, 0]));
+        let (sw0, sh0) = (sw0.max(1), sh0.max(1));
+        let s_full_levels = mip_levels(sw0, sh0);
+        let (surface_mips, s_levels) = if sp.len() == (sw0 * sh0 * 4) as usize {
+            (std::borrow::Cow::Owned(data_mip_chain(sw0, sh0, sp)), s_full_levels)
         } else {
-            std::borrow::Cow::Borrowed(sp)
+            let full_size: usize = (0..s_full_levels)
+                .map(|l| ((sw0 >> l).max(1) * (sh0 >> l).max(1) * 4) as usize)
+                .sum();
+            let levels = if sp.len() == full_size { s_full_levels } else { 1 };
+            (std::borrow::Cow::Borrowed(sp), levels)
         };
+        let (sw, sh, s_levels, surface_slice) =
+            downscale_mip_chain(sw0, sh0, s_levels, &surface_mips, max_dim);
+
+        let mask_down = mask.map(|(mw, mh, px)| {
+            let (mw, mh, cow) = downscale_rgba_once(mw.max(1), mh.max(1), px, max_dim);
+            (mw, mh, cow)
+        });
+
+        let (w0, h0) = (width.max(1), height.max(1));
+        let full_levels = mip_levels(w0, h0);
+        let (mips, levels) = if rgba.len() == (w0 * h0 * 4) as usize {
+            let ready = rustudio_core::texture::ready_mips(rgba);
+            let mips = ready.unwrap_or_else(|| rustudio_core::texture::mip_chain(w0, h0, rgba));
+            (std::borrow::Cow::Owned(mips), full_levels)
+        } else {
+            let full_size: usize = (0..full_levels).map(|level| {
+                ((w0 >> level).max(1) * (h0 >> level).max(1) * 4) as usize
+            }).sum();
+            let levels = if rgba.len() == full_size { full_levels } else { 1 };
+            (std::borrow::Cow::Borrowed(rgba), levels)
+        };
+        let (w, h, levels, mips_slice) = downscale_mip_chain(w0, h0, levels, &mips, max_dim);
+
+        // Guard texture + bind group creation so an OutOfMemory failure never
+        // pushes an invalid BindGroup into `self.textures` (which would
+        // invalidate the entire main 3D CommandEncoder and freeze the world).
+        let oom_scope = device.push_error_scope(wgpu::ErrorFilter::OutOfMemory);
+        let val_scope = device.push_error_scope(wgpu::ErrorFilter::Validation);
+
         let surface_view = device.create_texture_with_data(queue, &wgpu::TextureDescriptor {
             label: Some("SurfaceAppearance normal roughness metalness"),
             size: wgpu::Extent3d { width: sw, height: sh, depth_or_array_layers: 1 },
-            mip_level_count: mip_levels(sw, sh), sample_count: 1,
+            mip_level_count: s_levels, sample_count: 1,
             dimension: wgpu::TextureDimension::D2, format: wgpu::TextureFormat::Rgba8Unorm,
             usage: wgpu::TextureUsages::TEXTURE_BINDING, view_formats: &[],
-        }, wgpu::util::TextureDataOrder::LayerMajor, &surface_mips)
+        }, wgpu::util::TextureDataOrder::LayerMajor, surface_slice)
             .create_view(&Default::default());
-        let mask_view = mask.map(|(w, h, px)| {
+        let mask_view = mask_down.as_ref().map(|(mw, mh, px)| {
             device
                 .create_texture_with_data(
                     queue,
                     &wgpu::TextureDescriptor {
                         label: Some("emissive mask"),
                         size: wgpu::Extent3d {
-                            width: w.max(1),
-                            height: h.max(1),
+                            width: *mw,
+                            height: *mh,
                             depth_or_array_layers: 1,
                         },
                         mip_level_count: 1,
@@ -4049,19 +4291,6 @@ impl Renderer {
                 )
                 .create_view(&Default::default())
         });
-        let (w, h) = (width.max(1), height.max(1));
-        let full_levels = mip_levels(w, h);
-        let (mips, levels) = if rgba.len() == (w * h * 4) as usize {
-            let ready = rustudio_core::texture::ready_mips(rgba);
-            let mips = ready.unwrap_or_else(|| rustudio_core::texture::mip_chain(w, h, rgba));
-            (std::borrow::Cow::Owned(mips), full_levels)
-        } else {
-            let full_size: usize = (0..full_levels).map(|level| {
-                ((w >> level).max(1) * (h >> level).max(1) * 4) as usize
-            }).sum();
-            let levels = if rgba.len() == full_size { full_levels } else { 1 };
-            (std::borrow::Cow::Borrowed(rgba), levels)
-        };
         let tex = device.create_texture_with_data(
             queue,
             &wgpu::TextureDescriptor {
@@ -4079,15 +4308,11 @@ impl Renderer {
                 view_formats: &[],
             },
             wgpu::util::TextureDataOrder::LayerMajor,
-            &mips,
+            mips_slice,
         );
-        let uploaded = mips.len() + surface_mips.len() + mask.map_or(0, |(_, _, px)| px.len());
-        self.pending_upload_bytes += uploaded;
-        if self.pending_upload_bytes >= 32 * 1024 * 1024 {
-            queue.submit(std::iter::empty());
-            let _ = device.poll(wgpu::PollType::wait_indefinitely());
-            self.pending_upload_bytes = 0;
-        }
+        let uploaded = mips_slice.len()
+            + surface_slice.len()
+            + mask_down.as_ref().map_or(0, |(_, _, px)| px.len());
         let view = tex.create_view(&Default::default());
         let bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("part texture"),
@@ -4110,15 +4335,39 @@ impl Renderer {
                 wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::TextureView(&surface_view) },
             ],
         });
+
+        let val_err = crate::gpu_caps::block_on(val_scope.pop());
+        let oom_err = crate::gpu_caps::block_on(oom_scope.pop());
+        if let Some(err) = oom_err {
+            crate::gpu_health::mark_oom("part texture", &err.to_string());
+            return fallback_slot;
+        }
+        if let Some(err) = val_err {
+            log::warn!(target: "rustudio::gpu", "part texture upload failed: {err}");
+            return fallback_slot;
+        }
+
+        self.pending_upload_bytes += uploaded;
+        if self.pending_upload_bytes >= 32 * 1024 * 1024 {
+            queue.submit(std::iter::empty());
+            crate::gpu_health::poll(device, wgpu::PollType::wait_indefinitely());
+            self.pending_upload_bytes = 0;
+        }
         // An EditableImage texture re-uploaded: into its old slot (the old
         // bind group and its textures are freed), not a new one.
-        if let Some(i) = REUSE_TEXTURE_SLOT.with(|c| c.take()) {
+        if let Some(i) = reuse {
             if let Some(slot) = self.textures.get_mut(i as usize) {
                 *slot = bg;
+                if let Some(old_bytes) = self.texture_slot_bytes.get_mut(i as usize) {
+                    self.texture_vram_bytes = self.texture_vram_bytes.saturating_sub(*old_bytes) + uploaded;
+                    *old_bytes = uploaded;
+                }
                 return i;
             }
         }
         self.textures.push(bg);
+        self.texture_slot_bytes.push(uploaded);
+        self.texture_vram_bytes += uploaded;
         (self.textures.len() - 1) as u32
     }
 
@@ -4863,16 +5112,17 @@ impl Renderer {
     fn ensure_pipelines(&mut self, rs: &egui_wgpu::RenderState, samples: u32) -> &ViewportPipelines {
         let slot = sample_slot(samples);
         if self.pipelines[slot].is_none() {
-            if samples == 1 {
-                // (the worker's, when it was started: the same pipelines)
-                if let Some(rx) = self.lower_pending.take() {
-                    let _p = rustudio_core::bench::scope("r_pipelines_wait");
-                    if let Ok(p) = rx.recv() {
-                        self.pipelines[slot] = Some(p);
-                    }
+            // (the worker's, when it is about to deliver this set: the same
+            // pipelines, warmup.rs)
+            if self.warm.is_some() {
+                let _p = rustudio_core::bench::scope("r_pipelines_wait");
+                let items = self.warm.as_mut().map(|w| w.wait_viewport(samples)).unwrap_or_default();
+                for item in items {
+                    self.install_warmed(item);
                 }
             }
             if self.pipelines[slot].is_none() {
+                self.warm_local(warmup::Kind::Viewport, samples);
                 let t0 = Instant::now();
                 let made = ViewportPipelines::new(
                     &rs.device, &rs.queue, &self.globals_layout, &self.tex_layout, &self.glass_layout,
@@ -4891,9 +5141,32 @@ impl Renderer {
         if self.target.as_ref().is_some_and(|t| t.size == size && t.samples == samples) {
             return;
         }
+        if self.try_make_target(rs, size, samples) {
+            return;
+        }
+        // Reclaim optional mip caches, inactive sample-count passes, and old
+        // full-res targets so the 1× fallback allocation actually has room.
+        for pass in self.world_gui.iter_mut().flatten() {
+            pass.purge_mips();
+        }
+        self.postfx.drop_targets();
+        if samples > 1 {
+            // Free old 4× targets before trying 1× so we don't require both in VRAM at once.
+            self.target = None;
+            if self.try_make_target(rs, size, 1) {
+                return;
+            }
+        }
+        // Keep any existing valid target instead of overwriting it with invalid
+        // textures (which would turn the viewport permanently black).
+    }
+
+    fn try_make_target(&mut self, rs: &egui_wgpu::RenderState, size: [u32; 2], samples: u32) -> bool {
         self.ensure_pipelines(rs, samples);
         let device = &rs.device;
         let viewport = self.pipelines(samples);
+        let oom_scope = device.push_error_scope(wgpu::ErrorFilter::OutOfMemory);
+        let val_scope = device.push_error_scope(wgpu::ErrorFilter::Validation);
         let tex =
             |label: &str, format: wgpu::TextureFormat, samples: u32, usage: wgpu::TextureUsages| {
                 device.create_texture(&wgpu::TextureDescriptor {
@@ -5007,6 +5280,21 @@ impl Renderer {
                 | wgpu::TextureUsages::COPY_SRC,
         );
         let display_view = display.create_view(&Default::default());
+        let val_err = crate::gpu_caps::block_on(val_scope.pop());
+        let oom_err = crate::gpu_caps::block_on(oom_scope.pop());
+        if let Some(err) = oom_err {
+            crate::gpu_health::mark_oom("viewport target", &err.to_string());
+            return false;
+        }
+        if let Some(err) = val_err {
+            log::warn!(target: "rustudio::gpu", "viewport target creation failed ({samples}x {}x{}): {err}", size[0], size[1]);
+            return false;
+        }
+        if !self.postfx.has_depth_pipes(samples) {
+            if let Some(w) = self.warm.as_mut() {
+                w.mark_local(warmup::Kind::PostfxDepth, samples);
+            }
+        }
         self.postfx.rebuild_targets(device, size, samples, &hdr_view, &depth_view);
         let mut egui_renderer = rs.renderer.write();
         match self.texture_id {
@@ -5045,6 +5333,7 @@ impl Renderer {
             display,
             display_view,
         });
+        true
     }
 
     /// World GUIs and effects enter the HDR scene before bloom, DoF and
@@ -5058,8 +5347,20 @@ impl Renderer {
         fx: Option<&crate::world_gui::FxFrame>,
         tone_curve: Option<[f32; 5]>,
     ) {
+        let owed = std::mem::take(&mut self.postfx_owed);
         let Some(t) = self.target.as_ref() else { return };
-        let pass = self.world_gui[sample_slot(t.samples)]
+        let slot = sample_slot(t.samples);
+        for (i, other) in self.world_gui.iter_mut().enumerate() {
+            if i != slot {
+                *other = None;
+            }
+        }
+        if self.world_gui[slot].is_none() {
+            if let Some(w) = self.warm.as_mut() {
+                w.mark_local(warmup::Kind::WorldGui, t.samples);
+            }
+        }
+        let pass = self.world_gui[slot]
             .get_or_insert_with(|| crate::world_gui::WorldGuiPass::new(&rs.device, &rs.queue, DISPLAY_FORMAT, t.samples));
         pass.font_texture_update = Some(font_texture_update);
         pass.sun_atlas = self.sun.atlas_view.clone();
@@ -5070,20 +5371,42 @@ impl Renderer {
         // (effects light themselves from the frame's local lights)
         pass.lights = self.lights_buf.clone();
         pass.n_lights = self.gui_n_lights;
-        if pass.effects(rs, &t.hdr_view, t.size, &t.depth, batches, fx, tone_curve, self.gui_fog.0, self.gui_fog.1, self.gui_exposure) {
-            self.finish_again(rs);
+        let drew = pass.effects(rs, &t.hdr_view, t.size, &t.depth, batches, fx, tone_curve, self.gui_fog.0, self.gui_fog.1, self.gui_exposure);
+        if drew || owed {
+            self.finish_again(rs, owed);
+        }
+    }
+
+    /// The post-processing `render` left to `draw_world_gui`, when the
+    /// caller drew nothing in between and now draws over the display
+    /// image (or starts the next frame).
+    fn settle_postfx(&mut self, rs: &egui_wgpu::RenderState) {
+        if std::mem::take(&mut self.postfx_owed) {
+            self.finish_again(rs, true);
         }
     }
 
     /// Highlights over the finished image (highlight.rs): each one's parts
     /// as drawn this frame (their deformed / clothed meshes included).
     pub fn draw_highlights(&mut self, rs: &egui_wgpu::RenderState, list: &[crate::highlight::HighlightDraw]) {
+        self.settle_postfx(rs);
         if list.is_empty() {
             return;
         }
         self.pool.flush();
         let Some(t) = self.target.as_ref() else { return };
-        let pass = self.highlight[sample_slot(t.samples)].get_or_insert_with(|| {
+        let slot = sample_slot(t.samples);
+        for (i, other) in self.highlight.iter_mut().enumerate() {
+            if i != slot {
+                *other = None;
+            }
+        }
+        if self.highlight[slot].is_none() {
+            if let Some(w) = self.warm.as_mut() {
+                w.mark_local(warmup::Kind::Highlight, t.samples);
+            }
+        }
+        let pass = self.highlight[slot].get_or_insert_with(|| {
             crate::highlight::HighlightPass::new(&rs.device, DISPLAY_FORMAT, DEPTH_FORMAT, t.samples, std::mem::size_of::<Vertex>() as u64)
         });
         let mut work = Vec::new();
@@ -5112,18 +5435,26 @@ impl Renderer {
     /// 3D viewport adornments (collaborator camera gizmos, adorn.rs) drawn
     /// onto the finished image, depth-tested against the scene's depth buffer.
     pub fn draw_adorn(&mut self, rs: &egui_wgpu::RenderState, list: &[crate::adorn::AdornDraw]) {
+        self.settle_postfx(rs);
         if list.is_empty() {
             return;
         }
         let Some(t) = self.target.as_ref() else { return };
+        if self.adorn[sample_slot(t.samples)].is_none() {
+            if let Some(w) = self.warm.as_mut() {
+                w.mark_local(warmup::Kind::Adorn, t.samples);
+            }
+        }
         let pass = self.adorn[sample_slot(t.samples)]
             .get_or_insert_with(|| crate::adorn::AdornPass::new(&rs.device, &rs.queue, DISPLAY_FORMAT, t.samples));
         pass.draw(&rs.device, &rs.queue, &t.depth, &t.display_view, self.last_view_proj, list);
     }
 
-    /// Re-run post-processing after world GUIs and effects are drawn into HDR.
-    fn finish_again(&mut self, rs: &egui_wgpu::RenderState) {
-        let _b = rustudio_core::bench::scope("fx_post_again");
+    /// Post-processing after world GUIs and effects are drawn into HDR:
+    /// the frame's only run (`first`: `render` left it, `postfx_after_gui`)
+    /// or a second one over `render`'s.
+    fn finish_again(&mut self, rs: &egui_wgpu::RenderState, first: bool) {
+        let _b = rustudio_core::bench::scope(if first { "fx_post" } else { "fx_post_again" });
         let Some(target) = self.target.as_ref() else { return };
         let mut encoder = rs.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("effects post") });
         self.postfx.encode(
@@ -5134,7 +5465,9 @@ impl Renderer {
             &self.last_postfx,
             false,
         );
-        rs.queue.submit([encoder.finish()]);
+        // (timed as one span: the marks inside `encode` belong to
+        // `render`'s encoder)
+        crate::gpu_timing::submit(&rs.device, &rs.queue, if first { "gpu: post (after gui)" } else { "gpu: post again" }, [encoder.finish()]);
     }
 
     /// The last frame's fog (`Globals::fog`) and its linear colour, as
@@ -5153,6 +5486,20 @@ impl Renderer {
         (g.fog, c)
     }
 
+    /// `render`, with the post-processing left to the `draw_world_gui`
+    /// that follows when `gui_after` (world GUIs or effects will enter the
+    /// HDR scene first: `postfx_after_gui`).
+    pub fn render_with_gui_after(
+        &mut self,
+        rs: &egui_wgpu::RenderState,
+        size: [u32; 2],
+        gui_after: bool,
+        frame: &Frame,
+    ) -> Option<egui::TextureId> {
+        self.postfx_after_gui = gui_after;
+        self.render(rs, size, frame)
+    }
+
     /// Renders a frame at `size` physical pixels; returns the texture to show.
     pub fn render(
         &mut self,
@@ -5161,7 +5508,12 @@ impl Renderer {
         frame: &Frame,
     ) -> Option<egui::TextureId> {
         let svc_t0 = Instant::now();
+        // (a caller that drew nothing after the last frame's `render`:
+        // its post-processing now, before the scene is drawn over)
+        self.settle_postfx(rs);
+        let postfx_after_gui = std::mem::take(&mut self.postfx_after_gui);
         self.pool.flush();
+        self.poll_warmup();
         let size = [size[0].clamp(1, 8192), size[1].clamp(1, 8192)];
         crate::gpu_timing::set_automatic(frame.quality.is_some());
         // (bench: the Automatic level averaged over the run, and the share of
@@ -5183,11 +5535,17 @@ impl Renderer {
         if samples == 2 && !supports_two_samples(rs) {
             samples = 1;
         }
-        // (no multisampled textures to sample on OpenGL: gpu_caps.rs)
-        if !self.caps.sampled_msaa() {
+        // (no multisampled textures to sample on OpenGL: gpu_caps.rs; also
+        // stay at 1× once VRAM has hit OOM so Automatic quality never triggers
+        // a 4× MSAA target reallocation that fails)
+        if !self.caps.sampled_msaa() || crate::gpu_health::oom_seen() {
             samples = 1;
         }
         self.ensure_target(rs, size, samples);
+        let Some(t) = self.target.as_ref() else {
+            return self.texture_id;
+        };
+        samples = t.samples;
         if frame.probe.as_ref().is_some_and(|pf| pf.tasks.iter().any(|t| matches!(t, env_probe_gpu::Task::Face(_)))) {
             self.ensure_pipelines(rs, self.probe_samples);
         }
@@ -5653,6 +6011,11 @@ impl Renderer {
                     Some((layout, bg)) => (layout, bg),
                     None => (&self.globals_layout, &self.globals_bg),
                 };
+                if self.clouds[cloud_slot].is_none() {
+                    if let Some(w) = self.warm.as_mut() {
+                        w.mark_local(warmup::Kind::Clouds, samples);
+                    }
+                }
                 let clouds = self.clouds[cloud_slot].get_or_insert_with(|| {
                     crate::clouds::CloudsGpu::new(device, queue, globals_layout, &shader_source(self.reduced), HDR_FORMAT, DEPTH_FORMAT, samples)
                 });
@@ -6661,14 +7024,21 @@ impl Renderer {
             }
         }
         crate::gpu_timing::mark(&mut encoder, "gpu: ssao");
-        self.postfx.encode(
-            device,
-            queue,
-            &mut encoder,
-            &target.display_view,
-            &self.last_postfx,
-            true,
-        );
+        if postfx_after_gui {
+            // (the scene span for Automatic quality ends here; the post
+            // run's own is added to it: gpu_timing.rs `scene_label`)
+            crate::gpu_timing::mark(&mut encoder, "gpu: scene");
+            self.postfx_owed = true;
+        } else {
+            self.postfx.encode(
+                device,
+                queue,
+                &mut encoder,
+                &target.display_view,
+                &self.last_postfx,
+                true,
+            );
+        }
         self.probe.flush(queue);
         let r_scope = rustudio_core::bench::scope("r_finish");
         let commands = encoder.finish();
@@ -7000,6 +7370,7 @@ impl Renderer {
             })
             .collect();
         // (a skinning slot stays a list: the compute pass writes corners)
+        let oom_scope = device.push_error_scope(wgpu::ErrorFilter::OutOfMemory);
         let mesh = if storage {
             let vbuf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
                 label: Some("loaded mesh"),
@@ -7010,6 +7381,12 @@ impl Renderer {
         } else {
             Mesh::upload_pooled(&mut self.pool, device, "loaded mesh", &verts, wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST, None)
         };
+        let mesh = if let Some(err) = crate::gpu_caps::block_on(oom_scope.pop()) {
+            crate::gpu_health::mark_oom("loaded mesh", &err.to_string());
+            self.meshes[0].clone()
+        } else {
+            mesh
+        };
         self.meshes.push(mesh);
         (self.meshes.len() - 1 - BUILTIN_MESHES) as u32
     }
@@ -7017,12 +7394,19 @@ impl Renderer {
     /// Uploads ready-made vertices (an EditableMesh's live copy,
     /// runtime/editable.rs) and returns the index for `custom_mesh`.
     pub fn add_mesh_vertices(&mut self, device: &wgpu::Device, verts: &[Vertex]) -> u32 {
+        let oom_scope = device.push_error_scope(wgpu::ErrorFilter::OutOfMemory);
         let vbuf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("live mesh"),
             contents: bytemuck::cast_slice(verts),
             usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
         });
-        self.meshes.push(Mesh { vbuf, base_vertex: 0, first_index: 0, bind_key: fresh_bind_key(), _pool_range: None, count: verts.len() as u32, lod_offsets: None, high_quality_lods: 1, fidelity: MeshFidelity::Precise, ibuf: None, remap: None, bounds: None, cull: None, storage: false, occluder: None });
+        let mesh = if let Some(err) = crate::gpu_caps::block_on(oom_scope.pop()) {
+            crate::gpu_health::mark_oom("live mesh", &err.to_string());
+            self.meshes[0].clone()
+        } else {
+            Mesh { vbuf, base_vertex: 0, first_index: 0, bind_key: fresh_bind_key(), _pool_range: None, count: verts.len() as u32, lod_offsets: None, high_quality_lods: 1, fidelity: MeshFidelity::Precise, ibuf: None, remap: None, bounds: None, cull: None, storage: false, occluder: None }
+        };
+        self.meshes.push(mesh);
         (self.meshes.len() - 1 - BUILTIN_MESHES) as u32
     }
 
@@ -8694,6 +9078,102 @@ pub fn shape_triangles(kind: MeshKind) -> Option<Vec<[Vec3; 3]>> {
 
 thread_local! {
     static REUSE_TEXTURE_SLOT: std::cell::Cell<Option<u32>> = const { std::cell::Cell::new(None) };
+}
+
+/// Drop top mip levels from a packed RGBA8 mip chain until both dimensions fit
+/// within `max_dim` (zero extra filtering work: the chain is already filtered).
+fn downscale_mip_chain(
+    w: u32,
+    h: u32,
+    levels: u32,
+    mips: &[u8],
+    max_dim: u32,
+) -> (u32, u32, u32, &[u8]) {
+    if levels <= 1 || (w <= max_dim && h <= max_dim) {
+        return (w, h, levels, mips);
+    }
+    let (mut cw, mut ch, mut rem) = (w, h, levels);
+    let mut offset = 0usize;
+    while (cw > max_dim || ch > max_dim) && rem > 1 {
+        let level_bytes = (cw as usize).saturating_mul(ch as usize).saturating_mul(4);
+        if offset.saturating_add(level_bytes) >= mips.len() {
+            break;
+        }
+        offset += level_bytes;
+        cw = (cw / 2).max(1);
+        ch = (ch / 2).max(1);
+        rem -= 1;
+    }
+    (cw, ch, rem, &mips[offset..])
+}
+
+/// Box-filter downscale a single-mip RGBA8 image by powers of two until it
+/// fits within `max_dim`.
+fn downscale_rgba_once<'a>(
+    w: u32,
+    h: u32,
+    rgba: &'a [u8],
+    max_dim: u32,
+) -> (u32, u32, std::borrow::Cow<'a, [u8]>) {
+    if (w <= max_dim && h <= max_dim) || rgba.len() != (w as usize) * (h as usize) * 4 {
+        return (w, h, std::borrow::Cow::Borrowed(rgba));
+    }
+    let (mut cw, mut ch) = (w, h);
+    let mut cur = rgba.to_vec();
+    while (cw > max_dim || ch > max_dim) && (cw > 1 || ch > 1) {
+        let (nw, nh) = ((cw / 2).max(1), (ch / 2).max(1));
+        let mut next = vec![0u8; (nw * nh * 4) as usize];
+        for y in 0..nh {
+            for x in 0..nw {
+                let mut acc = [0u32; 4];
+                for dy in 0..2 {
+                    let sy = (y * 2 + dy).min(ch - 1);
+                    for dx in 0..2 {
+                        let sx = (x * 2 + dx).min(cw - 1);
+                        let o = ((sy * cw + sx) * 4) as usize;
+                        for c in 0..4 {
+                            acc[c] += cur[o + c] as u32;
+                        }
+                    }
+                }
+                let o = ((y * nw + x) * 4) as usize;
+                for c in 0..4 {
+                    next[o + c] = ((acc[c] + 2) / 4) as u8;
+                }
+            }
+        }
+        (cw, ch, cur) = (nw, nh, next);
+    }
+    (cw, ch, std::borrow::Cow::Owned(cur))
+}
+
+#[cfg(test)]
+mod texture_budget_tests {
+    use super::*;
+
+    #[test]
+    fn downscale_mip_chain_skips_top_levels() {
+        let base = vec![200u8; 64 * 64 * 4];
+        let mips = rustudio_core::texture::mip_chain(64, 64, &base);
+        let levels = mip_levels(64, 64);
+        assert_eq!(levels, 7);
+        let (w, h, l, slice) = downscale_mip_chain(64, 64, levels, &mips, 16);
+        assert_eq!((w, h, l), (16, 16, 5));
+        let expected: usize = (0..5).map(|i| ((16usize >> i).max(1)).pow(2) * 4).sum();
+        assert_eq!(slice.len(), expected);
+        // No-op when already within max_dim.
+        let (w2, h2, l2, slice2) = downscale_mip_chain(64, 64, levels, &mips, 64);
+        assert_eq!((w2, h2, l2, slice2.len()), (64, 64, 7, mips.len()));
+    }
+
+    #[test]
+    fn downscale_rgba_once_averages_to_max_dim() {
+        let base = vec![100u8; 32 * 16 * 4];
+        let (w, h, out) = downscale_rgba_once(32, 16, &base, 8);
+        assert_eq!((w, h), (8, 4));
+        assert_eq!(out.len(), 8 * 4 * 4);
+        assert!(out.iter().all(|&b| b == 100));
+    }
 }
 
 /// The next part texture upload on this thread replaces slot `index`

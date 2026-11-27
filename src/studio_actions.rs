@@ -185,10 +185,10 @@ impl Editor {
                 }
             }
             "clip_editor" => {
-                if self.builtin_tools.plugins_enabled {
+                if self.builtin_tools.use_roblox(rustudio_core::rustudio_settings::BuiltinTool::AnimationEditor) {
                     self.builtin_button_state("AnimationClipEditor", Some("Animations"), Some("Animation Editor"))
                 } else {
-                    (false, None)
+                    (true, open("Animation Editor"))
                 }
             }
             "avatar_setup" => {
@@ -614,7 +614,11 @@ impl Editor {
                 }
             }
             "clip_editor" => {
-                self.trigger_builtin_plugin_button("AnimationClipEditor", Some("Animations"), Some("Animation Editor"));
+                if self.builtin_tools.use_roblox(rustudio_core::rustudio_settings::BuiltinTool::AnimationEditor) {
+                    self.trigger_builtin_plugin_button("AnimationClipEditor", Some("Animations"), Some("Animation Editor"));
+                } else {
+                    self.ui.panel_requests.push((Tab::AnimationEditor, None));
+                }
             }
             "avatar_setup" => {
                 self.trigger_builtin_plugin_button("AvatarCompatibilityPreviewer", Some("AvatarPreviewer"), Some("previewAvatar"));

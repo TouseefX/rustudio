@@ -121,7 +121,12 @@ fn records_scripts_functions_entries_markers_and_heap() {
         .find(|f| f.script.ends_with("ProfHot") && &*f.name == "hot")
         .unwrap_or_else(|| panic!("no hot fn: {:#?}", &snap.functions[..snap.functions.len().min(10)]));
     assert_eq!(hot.line, 2);
-    assert!(hot.self_samples > 10, "{hot:?}");
+    // How many samples land depends on how often the sampler thread gets the
+    // CPU (a busy 2-core CI runner gave 10 for 79 ms at 4 kHz), so check where
+    // they land, not how many: `hot` holds the most of the script's samples.
+    assert!(hot.self_samples >= 3, "{hot:?}");
+    let busiest = snap.functions.iter().filter(|f| f.script.ends_with("ProfHot")).map(|f| f.self_samples).max().unwrap_or(0);
+    assert_eq!(hot.self_samples, busiest, "{hot:?}");
     assert!(hot.hot_lines.first().is_some_and(|(l, _)| (3..=7).contains(l)), "{hot:?}");
     let middle = snap.functions.iter().find(|f| f.script.ends_with("ProfHot") && &*f.name == "middle").unwrap();
     assert!(middle.total_samples >= hot.self_samples / 2, "{middle:?} vs {hot:?}");
@@ -170,7 +175,10 @@ fn heap_is_polled_per_script() {
     let snap = snapshot();
     let row = snap.scripts.iter().find(|s| s.path.ends_with("ProfHeap")).expect("row");
     assert!(row.heap_bytes > 500_000, "{row:?}");
-    assert!(snap.vms.iter().any(|v| v.vm == VmKind::Server && v.heap_bytes >= row.heap_bytes));
+    // The VM total is kept per kind of VM (one Server VM at a time in the
+    // editor). Tests run Server VMs in parallel, and each poll overwrites
+    // the total with its own, so it can't be compared with this script's.
+    assert!(snap.vms.iter().any(|v| v.vm == VmKind::Server && v.heap_bytes > 0), "{:?}", snap.vms.iter().map(|v| (v.vm, v.heap_bytes)).collect::<Vec<_>>());
 }
 
 #[test]

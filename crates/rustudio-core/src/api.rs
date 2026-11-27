@@ -34,7 +34,9 @@ pub struct Member {
     /// Saved in place files (Serialization.CanLoad): the value a script reads
     /// is the stored one. Not saved = the engine works it out at run time.
     pub can_load: bool,
+    pub can_save: bool,
     pub read_only: bool,
+    pub not_replicated: bool,
     pub deprecated: bool,
     /// The Properties panel's category ("Appearance", "Data"...).
     pub category: String,
@@ -131,6 +133,11 @@ pub fn parse(text: &str) -> Option<Api> {
                 .and_then(|s| s.get("CanLoad"))
                 .and_then(|b| b.as_bool())
                 .unwrap_or(false);
+            let can_save = m
+                .get("Serialization")
+                .and_then(|s| s.get("CanSave"))
+                .and_then(|b| b.as_bool())
+                .unwrap_or(false);
             class.order.push(mname.to_string());
             class.members.insert(
                 mname.to_string(),
@@ -138,7 +145,9 @@ pub fn parse(text: &str) -> Option<Api> {
                     kind,
                     security,
                     can_load,
+                    can_save,
                     read_only: mtags.contains(&"ReadOnly"),
+                    not_replicated: mtags.contains(&"NotReplicated"),
                     deprecated: mtags.contains(&"Deprecated"),
                     category: m
                         .get("Category")

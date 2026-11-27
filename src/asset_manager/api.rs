@@ -4,7 +4,7 @@
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
-use rustudio_account::cloud::{CloudApi, CloudPlace, Endpoints};
+use rustudio_account::cloud::{AssetUploadRequest, CloudApi, CloudPlace, Endpoints, UploadedAsset};
 use rustudio_account::session::Session;
 
 use super::{AssetEntry, AssetKind, ImportItem, ImportStatus};
@@ -146,8 +146,7 @@ pub fn classify_import_file(path: &Path) -> Option<ImportItem> {
         "ogg" => ("Audio", AssetKind::Audio, "audio/ogg"),
         "wav" => ("Audio", AssetKind::Audio, "audio/wav"),
         "flac" => ("Audio", AssetKind::Audio, "audio/flac"),
-        "rbxm" => ("Model", AssetKind::Model, "model/x-rbxm"),
-        "rbxmx" => ("Model", AssetKind::Model, "model/x-rbxmx"),
+        "rbxm" | "rbxmx" => ("Model", AssetKind::Model, "model/x-rbxm"),
         "fbx" => ("Model", AssetKind::MeshPart, "model/fbx"),
         "obj" => ("Model", AssetKind::MeshPart, "model/obj"),
         "gltf" => ("Model", AssetKind::MeshPart, "model/gltf+json"),
@@ -178,6 +177,19 @@ pub fn upload_import_item(
     item: &ImportItem,
     group_id: Option<u64>,
 ) -> Result<u64, String> {
+    upload_import_item_ex(session, item, group_id, None, None, false).map(|r| r.asset_id)
+}
+
+/// Full asset upload / update (`PATCH` when `asset_id` is `Some`), returning
+/// the confirmed asset ID, revision ID, and optional resolved Image ID for Decals.
+pub fn upload_import_item_ex(
+    session: &Session,
+    item: &ImportItem,
+    group_id: Option<u64>,
+    asset_id: Option<u64>,
+    expected_price: Option<u64>,
+    resolve_image_id: bool,
+) -> Result<UploadedAsset, String> {
     let bytes = std::fs::read(&item.path).map_err(|e| format!("Could not read file: {e}"))?;
     let filename = item
         .path
@@ -185,14 +197,17 @@ pub fn upload_import_item(
         .and_then(|s| s.to_str())
         .unwrap_or("asset");
     let api = CloudApi { session: session.downloader(), ep: Endpoints::default() };
-    api.upload_asset(
-        item.asset_type,
-        &item.display_name,
-        &item.description,
+    api.upload_asset_ex(&AssetUploadRequest {
+        asset_type: item.asset_type,
+        display_name: &item.display_name,
+        description: &item.description,
         group_id,
+        asset_id,
+        expected_price,
         filename,
-        item.mime,
-        &bytes,
-    )
+        mime: item.mime,
+        bytes: &bytes,
+        resolve_image_id,
+    })
     .map_err(|e| e.0)
 }

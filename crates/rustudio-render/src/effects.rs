@@ -1963,6 +1963,12 @@ impl Effects {
         std::mem::take(&mut self.fresh).then_some(&self.out)
     }
 
+    /// Whether the last frame put any effect on screen (a guess at this
+    /// one before it is built: render.rs `postfx_after_gui`).
+    pub fn drew_last(&self) -> bool {
+        !self.out.draws.is_empty()
+    }
+
     /// No effects under Workspace (as of the last frame).
     pub fn is_empty(&self) -> bool {
         self.list.is_empty()
@@ -2956,8 +2962,11 @@ mod texture_tests {
         assert_eq!(e2.spread, Vec2::new(150.0, 150.0));
         assert_eq!(e2.life, (1.7, 1.7));
 
-        let mut st1 = EmitterState::default();
-        let mut st2 = EmitterState::default();
+        // Fixed seeds: seeded from the Sparkles' Ref (random per run), about
+        // 2% of runs had no particle reach 4 studs (spread directions vary;
+        // median 5.5 over 2 000 seeds).
+        let mut st1 = EmitterState { rng: Some(Rng::seeded(1u32)), ..Default::default() };
+        let mut st2 = EmitterState { rng: Some(Rng::seeded(2u32)), ..Default::default() };
         let xf = Xform { pos: Vec3::ZERO, rot: glam::Mat3::IDENTITY };
         for _ in 0..90 {
             st1.step(&e1, sp, &xf, Vec3::ONE, 1.0 / 60.0, 0, None, Vec3::ZERO);

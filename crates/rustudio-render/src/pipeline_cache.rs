@@ -17,7 +17,7 @@
 //! turns it off.
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Mutex, OnceLock, RwLock, RwLockReadGuard};
 use std::time::Instant;
 
 use egui_wgpu::wgpu;
@@ -25,6 +25,8 @@ use egui_wgpu::wgpu;
 struct Cache {
     cache: wgpu::PipelineCache,
     path: PathBuf,
+    /// The blob's length at start (0: the first run on this driver).
+    primed: usize,
     /// Pipelines made ([`current`] calls) when the blob was last written,
     /// and its length then.
     saved: Mutex<(u64, usize)>,
@@ -33,8 +35,25 @@ struct Cache {
 static CACHE: OnceLock<Option<Cache>> = OnceLock::new();
 /// Pipeline descriptors that asked for the cache ([`current`] calls).
 static MADE: AtomicU64 = AtomicU64::new(0);
+/// The same, counted whether or not there is a cache ([`made`]).
+static ASKED: AtomicU64 = AtomicU64::new(0);
 /// When the last one asked, as milliseconds since [`epoch`].
 static LAST_MADE_MS: AtomicU64 = AtomicU64::new(0);
+/// Read-held by every thread building pipelines off the frame loop
+/// ([`building`]: the warm-up worker, the specialised-pipeline threads),
+/// write-taken by [`save`] around `get_data`: the blob is never read out
+/// of the driver's cache while another thread adds to it. (Vulkan asks
+/// drivers to allow that; a phone's vendor driver has aborted on it —
+/// `pthread_mutex_lock called on a destroyed mutex` inside a stock
+/// Adreno Vulkan — and the frame loop isn't building when it saves.)
+static BUILDS: RwLock<()> = RwLock::new(());
+
+/// Held while a thread other than the frame loop's builds pipelines.
+pub struct BuildGuard(#[allow(dead_code)] RwLockReadGuard<'static, ()>);
+
+pub fn building() -> BuildGuard {
+    BuildGuard(BUILDS.read().unwrap_or_else(|e| e.into_inner()))
+}
 
 fn epoch() -> Instant {
     static T0: OnceLock<Instant> = OnceLock::new();
@@ -66,6 +85,16 @@ pub fn init(device: &wgpu::Device, info: &wgpu::AdapterInfo, dir: PathBuf) {
             return None;
         }
         let path = file_for(&dir, info)?;
+        // RUSTUDIO_SHADER_REBUILD=1: the last run's blob goes, and the
+        // driver compiles every shader afresh this run (a slow start once;
+        // on Android the GPU Driver window's switch sets it).
+        if std::env::var_os("RUSTUDIO_SHADER_REBUILD").is_some_and(|v| v != "0") {
+            match std::fs::remove_file(&path) {
+                Ok(()) => log::info!("pipeline cache: {} removed (RUSTUDIO_SHADER_REBUILD): every shader is compiled afresh this run", path.display()),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => log::warn!("pipeline cache: removing {}: {e}", path.display()),
+            }
+        }
         let data = std::fs::read(&path).ok();
         let t0 = Instant::now();
         // SAFETY: the data is what `get_data` of a cache made here returned
@@ -89,17 +118,49 @@ pub fn init(device: &wgpu::Device, info: &wgpu::AdapterInfo, dir: PathBuf) {
         if rustudio_core::load_trace::startup_trace() {
             eprintln!("[startup] pipeline cache {}", if primed > 0 { format!("primed with {} KB", primed / 1024) } else { "empty (first run on this driver)".to_string() });
         }
-        Some(Cache { cache, path, saved: Mutex::new((0, primed)) })
+        Some(Cache { cache, path, primed, saved: Mutex::new((0, primed)) })
     });
+}
+
+/// One line on the cache's state, for View > GPU Driver: what it started
+/// with, what this run made, what is on disk.
+pub fn summary() -> String {
+    match CACHE.get() {
+        None => "Pipeline cache: not started".to_string(),
+        Some(None) => {
+            if std::env::var_os("RUSTUDIO_NO_PIPELINE_CACHE").is_some() {
+                "Pipeline cache: off (RUSTUDIO_NO_PIPELINE_CACHE)".to_string()
+            } else {
+                "Pipeline cache: none on this backend (Vulkan keeps one)".to_string()
+            }
+        }
+        Some(Some(c)) => {
+            let on_disk = c.saved.lock().map(|s| s.1).unwrap_or(0);
+            format!(
+                "Pipeline cache: {} at start; {} pipeline(s) made this run; {} KB on disk ({}).",
+                if c.primed > 0 { format!("{} KB from the last run", c.primed / 1024) } else { "empty, the first run on this driver".to_string() },
+                MADE.load(Ordering::Relaxed),
+                on_disk / 1024,
+                c.path.file_name().map(|f| f.to_string_lossy().into_owned()).unwrap_or_default()
+            )
+        }
+    }
 }
 
 /// The cache for a pipeline descriptor's `cache` field (None before
 /// [`init`], without the feature, or when switched off).
 pub fn current() -> Option<&'static wgpu::PipelineCache> {
+    ASKED.fetch_add(1, Ordering::Relaxed);
     let c = CACHE.get()?.as_ref()?;
     MADE.fetch_add(1, Ordering::Relaxed);
     LAST_MADE_MS.store(now_ms(), Ordering::Relaxed);
     Some(&c.cache)
+}
+
+/// Pipelines made so far in this process ([`current`] calls, with or
+/// without a cache).
+pub fn made() -> u64 {
+    ASKED.load(Ordering::Relaxed)
 }
 
 /// Writes the blob when pipelines were made since the last write and none
@@ -116,7 +177,20 @@ pub fn save(force: bool) {
         return;
     }
     let t0 = Instant::now();
-    let Some(data) = c.cache.get_data() else {
+    // (a worker mid-build: the next frame's call, or the wait when forced
+    // — the window is closing or losing the GPU)
+    let builds = if force {
+        BUILDS.write().unwrap_or_else(|e| e.into_inner())
+    } else {
+        match BUILDS.try_write() {
+            Ok(g) => g,
+            Err(std::sync::TryLockError::Poisoned(e)) => e.into_inner(),
+            Err(std::sync::TryLockError::WouldBlock) => return,
+        }
+    };
+    let data = c.cache.get_data();
+    drop(builds);
+    let Some(data) = data else {
         saved.0 = made;
         return;
     };

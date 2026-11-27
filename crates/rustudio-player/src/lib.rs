@@ -9,6 +9,7 @@ pub mod game_view;
 pub mod keys;
 pub mod luau_eval;
 pub mod offscreen;
+pub mod perf_report;
 pub mod play;
 pub mod play_teleport;
 mod play_worker;

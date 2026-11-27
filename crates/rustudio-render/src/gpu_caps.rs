@@ -6,10 +6,22 @@
 //! adapter to pick.
 
 use egui_wgpu::wgpu;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+
+/// Process-wide GPU VRAM & low-VRAM flags populated once `decide_lowend` runs,
+/// so `rustudio-engine` (`gui.rs`) and `world_gui.rs` share the same budgets.
+static GLOBAL_VRAM_BYTES: AtomicU64 = AtomicU64::new(0);
+static GLOBAL_LOW_VRAM: AtomicBool = AtomicBool::new(false);
+static GLOBAL_DISCRETE: AtomicBool = AtomicBool::new(false);
 
 /// Sampled textures per stage the full binding set needs (the part pass's
 /// globals, texture and glass groups: 13 + 3 + 2, rounded to wgpu's tier).
 pub const FULL_SAMPLED_TEXTURES: u32 = 24;
+
+/// Discrete GPUs at or below this dedicated VRAM (e.g. 2 GiB MX150 / GT 1030 /
+/// GTX 1050, 3 GiB GTX 1060) start in weak-GPU mode and cap part texture sizes
+/// so large places do not exhaust VRAM and starve egui_wgpu.
+pub const LOW_VRAM_BYTES: u64 = 3 * 1024 * 1024 * 1024;
 
 #[derive(Clone, Debug)]
 pub struct GpuCaps {
@@ -23,6 +35,57 @@ pub struct GpuCaps {
     /// R8Unorm storage textures (HBAO's visibility output); else it writes
     /// Rgba8Unorm.
     pub r8_storage: bool,
+    /// Dedicated device-local GPU memory in bytes, when the backend reports it
+    /// (Vulkan `VK_MEMORY_HEAP_DEVICE_LOCAL_BIT` / Linux sysfs).
+    pub vram_bytes: Option<u64>,
+}
+
+/// Query dedicated GPU memory in bytes for `adapter` (`RUSTUDIO_VRAM_MB`
+/// overrides for testing).
+pub fn adapter_vram_bytes(adapter: &wgpu::Adapter) -> Option<u64> {
+    if let Ok(v) = std::env::var("RUSTUDIO_VRAM_MB") {
+        if let Ok(mb) = v.trim().parse::<u64>() {
+            return (mb > 0).then_some(mb.saturating_mul(1024 * 1024));
+        }
+    }
+    let info = adapter.get_info();
+    #[cfg(any(target_os = "linux", target_os = "windows", target_os = "android", target_os = "freebsd"))]
+    if info.backend == wgpu::Backend::Vulkan {
+        // SAFETY: we only read the physical device's immutable memory heap
+        // properties through the live wgpu-hal Vulkan adapter.
+        if let Some(hal) = unsafe { adapter.as_hal::<wgpu::hal::api::Vulkan>() } {
+            let props = unsafe {
+                hal.shared_instance()
+                    .raw_instance()
+                    .get_physical_device_memory_properties(hal.raw_physical_device())
+            };
+            // Take the largest DEVICE_LOCAL heap (bit 0 = VK_MEMORY_HEAP_DEVICE_LOCAL_BIT)
+            // rather than summing, so a 256 MiB host-visible BAR heap is never
+            // double-counted alongside the main VRAM heap.
+            let count = (props.memory_heap_count as usize).min(props.memory_heaps.len());
+            let max_local = props.memory_heaps[..count]
+                .iter()
+                .filter(|h| (h.flags.as_raw() & 1) != 0)
+                .map(|h| h.size)
+                .max()
+                .filter(|&b| b > 0);
+            if max_local.is_some() {
+                return max_local;
+            }
+        }
+    }
+    #[cfg(target_os = "linux")]
+    if !info.device_pci_bus_id.is_empty() {
+        let path = format!("/sys/bus/pci/devices/{}/mem_info_vram_total", info.device_pci_bus_id);
+        if let Ok(text) = std::fs::read_to_string(path) {
+            if let Ok(bytes) = text.trim().parse::<u64>() {
+                if bytes > 0 {
+                    return Some(bytes);
+                }
+            }
+        }
+    }
+    None
 }
 
 impl GpuCaps {
@@ -35,6 +98,7 @@ impl GpuCaps {
                 .get_texture_format_features(wgpu::TextureFormat::R8Unorm)
                 .allowed_usages
                 .contains(wgpu::TextureUsages::STORAGE_BINDING);
+        caps.vram_bytes = adapter_vram_bytes(adapter);
         caps
     }
 
@@ -56,6 +120,7 @@ impl GpuCaps {
             limits,
             features: device.features(),
             downlevel,
+            vram_bytes: None,
         }
     }
 
@@ -87,6 +152,34 @@ impl GpuCaps {
     }
 
 
+    /// True for discrete GPUs with tight dedicated VRAM (<= 3 GiB).
+    pub fn is_low_vram(&self) -> bool {
+        self.device_type == wgpu::DeviceType::DiscreteGpu
+            && self.vram_bytes.is_some_and(|b| b <= LOW_VRAM_BYTES)
+    }
+
+    /// Approximate GPU memory budget (bytes) reserved for part textures so
+    /// large places cannot exhaust VRAM and starve viewport targets / egui.
+    /// `RUSTUDIO_TEXTURE_VRAM_MB=0` disables the cap.
+    pub fn texture_vram_budget(&self) -> usize {
+        if let Ok(v) = std::env::var("RUSTUDIO_TEXTURE_VRAM_MB") {
+            if let Ok(mb) = v.trim().parse::<u64>() {
+                return if mb == 0 { usize::MAX } else { (mb as usize).saturating_mul(1024 * 1024) };
+            }
+        }
+        texture_vram_budget_for(self.device_type, self.vram_bytes, self.weak_reason().is_some())
+    }
+
+    /// Starting maximum dimension for uploaded part textures before budget
+    /// pressure steps it down further. Capable > 3 GiB GPUs upload full size.
+    pub fn initial_texture_max_dim(&self) -> u32 {
+        if self.is_low_vram() {
+            512
+        } else {
+            u32::MAX
+        }
+    }
+
     /// Why this adapter runs in weak-GPU mode, if it does (before the
     /// RUSTUDIO_LOWEND override).
     pub fn weak_reason(&self) -> Option<String> {
@@ -106,6 +199,9 @@ impl GpuCaps {
         if old_intel(self.vendor, &self.name) {
             return Some("pre-Skylake Intel graphics".into());
         }
+        if self.is_low_vram() {
+            return Some(format!("low VRAM ({} MiB)", self.vram_bytes.unwrap_or(0) >> 20));
+        }
         if self.limits.max_sampled_textures_per_shader_stage < FULL_SAMPLED_TEXTURES
             || self.limits.max_texture_dimension_2d < 8192
         {
@@ -116,6 +212,90 @@ impl GpuCaps {
         }
         None
     }
+}
+
+pub(crate) fn texture_vram_budget_for(
+    device_type: wgpu::DeviceType,
+    vram_bytes: Option<u64>,
+    weak: bool,
+) -> usize {
+    const MIB: u64 = 1024 * 1024;
+    let bytes = match vram_bytes {
+        Some(v) if device_type == wgpu::DeviceType::DiscreteGpu => {
+            // Keep headroom for GUI/FX textures, render targets, shadow maps,
+            // meshes, pipelines, egui and driver overhead:
+            //   2 GiB MX150 -> 512 MiB parts (+ 256 MiB GUI/FX + 128 MiB mips = 896 MiB)
+            //   4 GiB       -> 1433 MiB parts
+            //  16 GiB       -> 6553 MiB parts
+            let pct = if v <= LOW_VRAM_BYTES { 25 } else { 40 };
+            let share = v * pct / 100;
+            let headroom = v.saturating_sub(1024 * MIB);
+            let floor = if v >= 512 * MIB { 192 * MIB } else { v / 4 };
+            share.min(headroom).max(floor)
+        }
+        Some(v) => (v * 35 / 100).clamp(256 * MIB, 4096 * MIB),
+        None => if weak { 384 * MIB } else { 2048 * MIB },
+    };
+    bytes.min(usize::MAX as u64) as usize
+}
+
+/// GPU memory budget (bytes) for GUI + 3D effect (`egui_texid_Managed`)
+/// textures. `RUSTUDIO_GUI_VRAM_MB=0` disables the cap.
+pub(crate) fn gui_vram_budget_for(
+    device_type: wgpu::DeviceType,
+    vram_bytes: Option<u64>,
+    weak: bool,
+) -> usize {
+    const MIB: u64 = 1024 * 1024;
+    let bytes = match vram_bytes {
+        Some(v) if device_type == wgpu::DeviceType::DiscreteGpu => {
+            // 2 GiB -> 256 MiB, 4 GiB -> 512 MiB, 8 GiB -> 1024 MiB, 16 GiB -> 2048 MiB.
+            (v / 8).clamp(128 * MIB, 2048 * MIB)
+        }
+        Some(v) => (v / 10).clamp(192 * MIB, 2048 * MIB),
+        None => if weak { 256 * MIB } else { 1024 * MIB },
+    };
+    bytes.min(usize::MAX as u64) as usize
+}
+
+/// True when the active adapter is a low-VRAM discrete GPU (<= 3 GiB).
+pub fn is_low_vram_global() -> bool {
+    GLOBAL_LOW_VRAM.load(Ordering::Relaxed)
+}
+
+/// Process-wide GPU memory budget (bytes) for GUI & 3D effect textures.
+pub fn gui_vram_budget() -> usize {
+    if let Ok(v) = std::env::var("RUSTUDIO_GUI_VRAM_MB") {
+        if let Ok(mb) = v.trim().parse::<u64>() {
+            return if mb == 0 { usize::MAX } else { (mb as usize).saturating_mul(1024 * 1024) };
+        }
+    }
+    let raw = GLOBAL_VRAM_BYTES.load(Ordering::Relaxed);
+    let vram = (raw > 0).then_some(raw);
+    let dtype = if GLOBAL_DISCRETE.load(Ordering::Relaxed) {
+        wgpu::DeviceType::DiscreteGpu
+    } else {
+        wgpu::DeviceType::IntegratedGpu
+    };
+    gui_vram_budget_for(dtype, vram, rustudio_core::rustudio_settings::weak_gpu())
+}
+
+/// Process-wide GPU memory budget (bytes) for `WorldGuiPass` mipmap copies.
+/// A phone's GPU reports the system's memory as its one heap (Turnip on an
+/// 8 GB Snapdragon 865: ~800 MiB of GUI budget, 400 MiB of copies), which
+/// everything else shares and the driver reclaims under pressure (the
+/// 2026-11-2x device-lost reports): there the copies keep to 64 MiB, the
+/// cap the port ran with before, unless `RUSTUDIO_GUI_VRAM_MB` says more.
+pub fn world_gui_mips_budget() -> usize {
+    let b = gui_vram_budget();
+    if b == usize::MAX {
+        return usize::MAX;
+    }
+    let budget = (b / 2).max(64 * 1024 * 1024);
+    if cfg!(target_os = "android") && std::env::var_os("RUSTUDIO_GUI_VRAM_MB").is_none() {
+        return budget.min(64 * 1024 * 1024);
+    }
+    budget
 }
 
 /// Intel's Gen7/Gen7.5/Gen8 graphics (HD 2500/4000, HD 4200-5200 Haswell,
@@ -182,6 +362,9 @@ pub fn lowend_override() -> Option<bool> {
 /// Decide weak-GPU mode for this device and log it under `rustudio::gpu`.
 /// Returns whether it is on.
 pub fn decide_lowend(caps: &GpuCaps) -> bool {
+    GLOBAL_VRAM_BYTES.store(caps.vram_bytes.unwrap_or(0), Ordering::Relaxed);
+    GLOBAL_LOW_VRAM.store(caps.is_low_vram(), Ordering::Relaxed);
+    GLOBAL_DISCRETE.store(caps.device_type == wgpu::DeviceType::DiscreteGpu, Ordering::Relaxed);
     let reason = caps.weak_reason();
     let forced = lowend_override();
     let on = forced.unwrap_or(reason.is_some());
@@ -192,6 +375,16 @@ pub fn decide_lowend(caps: &GpuCaps) -> bool {
         (None, Some(r)) => r.clone(),
         (None, None) => "capable GPU".to_string(),
     };
+    if let Some(vram) = caps.vram_bytes {
+        log::info!(
+            target: "rustudio::gpu",
+            "GPU memory: {} MiB (part textures {} MiB, GUI/FX textures {} MiB, FX mips {} MiB)",
+            vram >> 20,
+            caps.texture_vram_budget() >> 20,
+            gui_vram_budget() >> 20,
+            world_gui_mips_budget() >> 20,
+        );
+    }
     if on {
         log::info!(
             target: "rustudio::gpu",
@@ -434,5 +627,39 @@ mod tests {
         let asked = required_limits(&big);
         assert_eq!(asked.max_sampled_textures_per_shader_stage, 24);
         assert_eq!(asked.max_texture_dimension_2d, 8192);
+    }
+
+    #[test]
+    fn low_vram_discrete_triggers_weak_mode_and_tight_budget() {
+        const GIB: u64 = 1024 * 1024 * 1024;
+        const MIB: usize = 1024 * 1024;
+        let mx150 = GpuCaps {
+            name: "NVIDIA GeForce MX150".into(),
+            vendor: 0x10de,
+            backend: wgpu::Backend::Vulkan,
+            device_type: wgpu::DeviceType::DiscreteGpu,
+            limits: wgpu::Limits {
+                max_sampled_textures_per_shader_stage: FULL_SAMPLED_TEXTURES,
+                max_texture_dimension_2d: 8192,
+                ..wgpu::Limits::default()
+            },
+            features: wgpu::Features::empty(),
+            downlevel: wgpu::DownlevelFlags::compliant(),
+            r8_storage: true,
+            vram_bytes: Some(2 * GIB),
+        };
+        assert!(mx150.is_low_vram());
+        assert!(mx150.weak_reason().unwrap().contains("low VRAM"));
+        assert_eq!(mx150.initial_texture_max_dim(), 512);
+        let b2 = texture_vram_budget_for(mx150.device_type, mx150.vram_bytes, true);
+        assert!(b2 >= 384 * MIB && b2 <= 600 * MIB, "unexpected 2 GiB part budget: {b2}");
+        let g2 = gui_vram_budget_for(mx150.device_type, mx150.vram_bytes, true);
+        assert_eq!(g2, 256 * MIB);
+
+        let rx9070 = GpuCaps { vram_bytes: Some(16 * GIB), ..mx150.clone() };
+        assert!(!rx9070.is_low_vram());
+        assert!(rx9070.weak_reason().is_none());
+        assert_eq!(rx9070.initial_texture_max_dim(), u32::MAX);
+        assert!(texture_vram_budget_for(rx9070.device_type, rx9070.vram_bytes, false) > 4096 * MIB);
     }
 }

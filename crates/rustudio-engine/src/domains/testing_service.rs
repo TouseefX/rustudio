@@ -79,6 +79,7 @@ pub fn report_test_run(value: &str, log: &[rustudio_core::log::LogLine]) {
                 Level::Info => "info",
                 Level::Warn => "warning",
                 Level::Error => "error",
+                Level::System => "system",
             };
             serde_json::json!([lv, l.text])
         })

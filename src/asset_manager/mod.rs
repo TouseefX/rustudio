@@ -722,6 +722,46 @@ impl AssetManager {
         }
     }
 
+    /// Records a completed upload (e.g. from MCP) into Recent Uploads and the
+    /// user inventory cache so it appears in the Asset Manager immediately.
+    pub fn record_upload(
+        &mut self,
+        id: u64,
+        name: String,
+        description: String,
+        kind: AssetKind,
+        group_id: Option<u64>,
+    ) {
+        let entry = AssetEntry {
+            id,
+            name,
+            kind,
+            creator_name: if group_id.is_some() { String::new() } else { self.user_name.clone() },
+            creator_id: group_id.unwrap_or(self.user_id),
+            creator_verified: false,
+            created: now_iso(),
+            updated: now_iso(),
+            description,
+            is_start_place: false,
+            usages: Vec::new(),
+            is_creation: true,
+            raw: None,
+        };
+        self.persist.recent_uploads.retain(|a| a.id != entry.id);
+        self.persist.recent_uploads.insert(0, entry.clone());
+        if self.persist.recent_uploads.len() > 200 {
+            self.persist.recent_uploads.truncate(200);
+        }
+        if group_id.is_none() {
+            if let Some(cache) = self.inventories.get_mut("user") {
+                if !cache.items.iter().any(|a| a.id == entry.id) {
+                    cache.items.insert(0, entry);
+                }
+            }
+        }
+        self.mark_dirty();
+    }
+
     pub fn save_if_changed(&mut self, force: bool) {
         let Some(t) = self.dirty_since else { return };
         if !force && t.elapsed() < Duration::from_secs(2) {

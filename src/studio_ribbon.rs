@@ -395,7 +395,9 @@ impl Editor {
             "weld" => self.builtin_plugin_button("ConstraintTool", Some("WeldConstraint"), Some("Place")),
             "align" => self.builtin_plugin_button("AlignmentTool", Some("Alignment"), Some("AlignTool")),
             "avatar_setup" => self.builtin_plugin_button("AvatarCompatibilityPreviewer", Some("AvatarPreviewer"), Some("previewAvatar")),
-            "clip_editor" => self.builtin_plugin_button("AnimationClipEditor", Some("Animations"), Some("Animation Editor")),
+            "clip_editor" if self.builtin_tools.use_roblox(BuiltinTool::AnimationEditor) => {
+                self.builtin_plugin_button("AnimationClipEditor", Some("Animations"), Some("Animation Editor"))
+            }
             "style_editor" => self.builtin_plugin_button("StyleEditor", Some("StyleEditor"), Some("StyleEditorToolbarButton")),
             _ => None,
         }?;

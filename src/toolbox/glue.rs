@@ -242,19 +242,44 @@ impl Editor {
                 } else {
                     let lighting = self.game.doc.find_child(self.game.doc.dom.root_ref(), "Lighting");
                     let material = self.game.doc.find_child(self.game.doc.dom.root_ref(), "MaterialService");
+                    let terrain = self.game.doc.workspace().and_then(|w| {
+                        self.game
+                            .doc
+                            .dom
+                            .get_by_ref(w)?
+                            .children()
+                            .iter()
+                            .copied()
+                            .find(|r| self.game.doc.class_of(*r).is_some_and(|c| c == "Terrain"))
+                    });
                     let world_parent = tool_parent.or(explicit).unwrap_or(ws);
-                    let mut world = Vec::new();
                     let mut groups: Vec<(Vec<u8>, Ref)> = Vec::new();
-                    let mut light = Vec::new();
-                    let mut mats = Vec::new();
-                    for r in &roots {
-                        let Some(i) = dom.get_by_ref(*r) else { continue };
-                        match insert::home_of(i.class.as_str(), &asset.sub_types) {
-                            Home::Lighting if explicit.is_none() && lighting.is_some() => light.push(*r),
-                            Home::MaterialService if explicit.is_none() && material.is_some() => mats.push(*r),
-                            _ => world.push(*r),
+                    let (world, light, terr, mats) = if explicit.is_none() && tool_parent.is_none() {
+                        let mut routed = insert::route_roots(&dom, &roots, &asset.sub_types);
+                        if lighting.is_none() {
+                            routed.world.append(&mut routed.lighting);
                         }
-                    }
+                        if terrain.is_none() {
+                            routed.world.append(&mut routed.terrain);
+                        }
+                        if material.is_none() {
+                            routed.world.append(&mut routed.material);
+                        }
+                        for r in routed
+                            .world
+                            .iter()
+                            .chain(routed.lighting.iter())
+                            .chain(routed.terrain.iter())
+                            .chain(routed.material.iter())
+                        {
+                            if let Some(i) = dom.get_by_ref_mut(*r) {
+                                i.properties.insert("SourceAssetId".into(), source_id.clone());
+                            }
+                        }
+                        (routed.world, routed.lighting, routed.terrain, routed.material)
+                    } else {
+                        (roots.clone(), Vec::new(), Vec::new(), Vec::new())
+                    };
                     // Placement: only what goes into Workspace, and not when it
                     // was dropped on an Explorer row (Studio keeps the
                     // model's own position there).
@@ -278,6 +303,9 @@ impl Editor {
                     }
                     if !light.is_empty() {
                         groups.push((insert::encode(&dom, &light), lighting.unwrap_or(ws)));
+                    }
+                    if !terr.is_empty() {
+                        groups.push((insert::encode(&dom, &terr), terrain.unwrap_or(ws)));
                     }
                     if !mats.is_empty() {
                         groups.push((insert::encode(&dom, &mats), material.unwrap_or(ws)));
@@ -1070,4 +1098,136 @@ fn variant_text(v: &Variant) -> String {
 /// AABBs of the parts under `root` (what an insert must not overlap).
 fn insert_boxes(doc: &rustudio_core::doc::Document, root: Ref) -> Vec<(Vec3, Vec3)> {
     insert_boxes_except(doc, root, &std::collections::HashSet::new())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rbx_dom_weak::types::ContentId;
+    use rbx_dom_weak::WeakDom;
+
+    #[test]
+    fn toolbox_skybox_insert_routes_lighting_and_overrides_existing_sky() {
+        let mut doc = rustudio_core::doc::Document::new_place();
+        let root = doc.dom.root_ref();
+        let ws = doc.workspace().unwrap();
+        let lighting = doc.find_child(root, "Lighting").unwrap();
+        let terrain = doc
+            .find_child(ws, "Terrain")
+            .unwrap_or_else(|| doc.insert(ws, InstanceBuilder::new("Terrain").with_name("Terrain")));
+        // Pre-existing Baseplate-like Sky and Atmosphere.
+        doc.insert(
+            lighting,
+            InstanceBuilder::new("Sky")
+                .with_name("Sky")
+                .with_property("SkyboxBk", ContentId::from("rbxassetid://1001")),
+        );
+        doc.insert(
+            lighting,
+            InstanceBuilder::new("Atmosphere")
+                .with_name("Atmosphere")
+                .with_property("Offset", 0.25f32),
+        );
+
+        let ctx = egui::Context::default();
+        let mut app = crate::app::RustudioApp::new_in(
+            &ctx,
+            None,
+            None,
+            None,
+            crate::app::Harness::test_empty(),
+            false,
+        );
+        app.ed.game.doc = doc;
+        let ed = &mut app.ed;
+        ed.toolbox.dry_run = true;
+        assert_eq!(rustudio_render::lighting::sky_faces(&ed.game.doc)[0], "rbxassetid://1001");
+        assert!((rustudio_render::lighting::atmosphere(&ed.game.doc).unwrap().offset - 0.25).abs() < 1e-5);
+
+        // Build a Toolbox skybox asset like 7108851308 ("Aesthetic sky"):
+        // Sky + renamed Atmosphere + BloomEffect + BlurEffect + ColorCorrectionEffect + SunRaysEffect + Clouds.
+        let mut asset_dom = WeakDom::new(InstanceBuilder::new("DataModel"));
+        let ar = asset_dom.root_ref();
+        asset_dom.insert(
+            ar,
+            InstanceBuilder::new("Sky")
+                .with_name("AestheticSky")
+                .with_property("SkyboxBk", ContentId::from("http://www.roblox.com/asset/?id=777777")),
+        );
+        asset_dom.insert(
+            ar,
+            InstanceBuilder::new("Atmosphere")
+                .with_name("AestheticAtmosphere")
+                .with_property("Offset", 0.65f32)
+                .with_property("Density", 0.55f32),
+        );
+        asset_dom.insert(ar, InstanceBuilder::new("BloomEffect").with_property("Intensity", 0.42f32));
+        asset_dom.insert(ar, InstanceBuilder::new("BlurEffect").with_property("Size", 6.0f32));
+        asset_dom.insert(
+            ar,
+            InstanceBuilder::new("ColorCorrectionEffect").with_property("Contrast", 0.18f32),
+        );
+        asset_dom.insert(
+            ar,
+            InstanceBuilder::new("SunRaysEffect").with_property("Intensity", 0.12f32),
+        );
+        asset_dom.insert(ar, InstanceBuilder::new("Clouds").with_property("Cover", 0.8f32));
+
+        let ready = Ready {
+            job: 1,
+            asset: crate::toolbox::model::Asset {
+                id: 7108851308,
+                name: "Aesthetic sky".into(),
+                type_id: 10,
+                ..Default::default()
+            },
+            kind: Kind::Model,
+            target: Target::Click,
+            prepared: Prepared::Model { dom: asset_dom, scripts: 0 },
+        };
+        ed.toolbox_apply(ready, None);
+
+        // Nothing leaked into Workspace besides Terrain/Baseplate/etc.
+        let ws_classes: Vec<String> = ed
+            .game
+            .doc
+            .dom
+            .get_by_ref(ws)
+            .unwrap()
+            .children()
+            .iter()
+            .filter_map(|r| ed.game.doc.class_of(*r).map(|c| c.to_string()))
+            .collect();
+        for cls in ["Sky", "Atmosphere", "BloomEffect", "BlurEffect", "ColorCorrectionEffect", "SunRaysEffect", "Clouds"] {
+            assert!(!ws_classes.iter().any(|c| c == cls), "{cls} leaked into Workspace: {ws_classes:?}");
+        }
+
+        // Lighting received Sky, Atmosphere, and all PostEffects; Terrain received Clouds.
+        assert_eq!(
+            rustudio_render::lighting::sky_faces(&ed.game.doc)[0],
+            "http://www.roblox.com/asset/?id=777777"
+        );
+        assert!((rustudio_render::lighting::atmosphere(&ed.game.doc).unwrap().offset - 0.65).abs() < 1e-5);
+        let fx = rustudio_render::lighting::effects(&ed.game.doc, None);
+        assert!(fx.bloom.is_some());
+        assert!((fx.blur - 6.0).abs() < 1e-5);
+        assert!(fx.cc.is_some());
+        assert!(fx.sun_rays.is_some());
+        let terrain_kids: Vec<String> = ed
+            .game
+            .doc
+            .dom
+            .get_by_ref(terrain)
+            .unwrap()
+            .children()
+            .iter()
+            .filter_map(|r| ed.game.doc.class_of(*r).map(|c| c.to_string()))
+            .collect();
+        assert!(terrain_kids.iter().any(|c| c == "Clouds"), "Clouds missing from Terrain: {terrain_kids:?}");
+
+        // Single undo restores the original Sky and Atmosphere cleanly.
+        ed.undo();
+        assert_eq!(rustudio_render::lighting::sky_faces(&ed.game.doc)[0], "rbxassetid://1001");
+        assert!((rustudio_render::lighting::atmosphere(&ed.game.doc).unwrap().offset - 0.25).abs() < 1e-5);
+    }
 }

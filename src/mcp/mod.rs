@@ -34,7 +34,7 @@ pub mod ui;
 
 use std::collections::VecDeque;
 use std::path::PathBuf;
-use std::sync::mpsc::Sender;
+use std::sync::mpsc::{Receiver, Sender};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -100,6 +100,7 @@ impl OutputMirror {
                 crate::output_panel::Kind::Info => "info",
                 crate::output_panel::Kind::Warn => "warn",
                 crate::output_panel::Kind::Error => "error",
+                crate::output_panel::Kind::System => "system",
             };
             self.lines.push_back(OutLine { seq: self.next, at: l.at.clone(), level: l.level, kind, text: l.text.clone() });
             self.next += 1;
@@ -129,6 +130,100 @@ impl OutputMirror {
     }
 }
 
+pub(crate) struct UploadMeta {
+    pub display_name: String,
+    pub description: String,
+    pub asset_type: &'static str,
+    pub kind: crate::asset_manager::AssetKind,
+    pub group_id: Option<u64>,
+    pub user_id: u64,
+    pub updated: bool,
+}
+
+pub(crate) struct BatchUploadEntry {
+    pub file: PathBuf,
+    pub display_name: String,
+    pub description: String,
+    pub asset_type: &'static str,
+    pub kind: crate::asset_manager::AssetKind,
+    pub updated: bool,
+    pub ms: u128,
+    pub result: Result<rustudio_account::cloud::UploadedAsset, String>,
+}
+
+pub(crate) struct BatchUploadOutcome {
+    pub entries: Vec<BatchUploadEntry>,
+    pub skipped: Vec<String>,
+    pub elapsed_s: f64,
+    pub group_id: Option<u64>,
+    pub user_id: u64,
+    pub manifest_path: Option<PathBuf>,
+}
+
+/// Restores the global profiler and Luau script profiler settings when an MCP
+/// capture finishes, times out, or is cancelled.
+pub(crate) struct ProfileGuard {
+    active: bool,
+    prev_cfg: rustudio_core::profiler::Config,
+    was_paused: bool,
+    scripts_changed: bool,
+    prev_script_live: bool,
+    prev_script_recording: bool,
+    prev_script_exact: bool,
+    prev_sample_hz: u32,
+}
+
+impl ProfileGuard {
+    pub(crate) fn new(
+        prev_cfg: rustudio_core::profiler::Config,
+        was_paused: bool,
+        scripts_changed: bool,
+        prev_script_live: bool,
+        prev_script_recording: bool,
+        prev_script_exact: bool,
+        prev_sample_hz: u32,
+    ) -> Self {
+        Self {
+            active: true,
+            prev_cfg,
+            was_paused,
+            scripts_changed,
+            prev_script_live,
+            prev_script_recording,
+            prev_script_exact,
+            prev_sample_hz,
+        }
+    }
+
+    pub(crate) fn restore(&mut self) {
+        if !self.active {
+            return;
+        }
+        self.active = false;
+        if self.scripts_changed {
+            if !self.prev_script_recording {
+                rustudio_engine::script_profiler::stop_recording();
+            }
+            rustudio_engine::script_profiler::set_exact(self.prev_script_exact);
+            rustudio_engine::script_profiler::set_live(self.prev_script_live);
+            rustudio_engine::script_profiler::set_sample_hz(self.prev_sample_hz);
+        }
+        rustudio_core::profiler::set_config(self.prev_cfg.clone());
+        if self.was_paused {
+            rustudio_core::profiler::pause();
+        } else {
+            rustudio_core::profiler::resume();
+        }
+        rustudio_core::profiler::disable();
+    }
+}
+
+impl Drop for ProfileGuard {
+    fn drop(&mut self) {
+        self.restore();
+    }
+}
+
 pub(crate) enum Op {
     /// Luau running; `side` None = the edit DataModel.
     /// `done`: the outcome and frames since (prints arrive a frame or two later).
@@ -140,6 +235,20 @@ pub(crate) enum Op {
     Load { live: bool, frames: u32 },
     /// `failed_before`: the session's sync_failed when the wait began.
     TcWait { quiet: f32, out_from: u64, failed_before: bool },
+    /// Asset upload running on a background thread.
+    Upload { rx: Receiver<Result<rustudio_account::cloud::UploadedAsset, String>>, meta: UploadMeta },
+    /// Batch asset upload running in a worker pool on background threads.
+    UploadBatch { rx: Receiver<BatchUploadOutcome> },
+    /// Live MicroProfiler + optional Script Profiler recording.
+    Profile {
+        started: Instant,
+        duration: Duration,
+        top: usize,
+        spikes: usize,
+        save_path: Option<PathBuf>,
+        capture_scripts: bool,
+        guard: ProfileGuard,
+    },
 }
 
 pub(crate) struct Pending {

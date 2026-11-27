@@ -1462,6 +1462,75 @@ impl Document {
         false
     }
 
+    /// Reads an explicitly stored enum/integer property on `r` without falling
+    /// back to reflection class defaults.
+    pub fn explicit_enum_u32(&self, r: Ref, name: &str) -> Option<u32> {
+        let inst = self.dom.get_by_ref(r)?;
+        match inst.properties.get(&ustr(name))? {
+            Variant::Enum(e) => Some(e.to_u32()),
+            Variant::Int32(n) if *n >= 0 => Some(*n as u32),
+            Variant::Int64(n) if *n >= 0 => u32::try_from(*n).ok(),
+            _ => None,
+        }
+    }
+
+    /// All `AvatarBodyRules` instances that hold the place's `AvatarType`
+    /// (`AvatarSettings/DefaultAvatarRules/AvatarBodyRules` and, if present,
+    /// `StarterPlayer/PlaceAvatarRules/AvatarBodyRules`).
+    pub fn avatar_body_rules_refs(&self) -> Vec<Ref> {
+        let mut out = Vec::new();
+        let root = self.dom.root_ref();
+        if let Some(sp) = self.find_child(root, "StarterPlayer") {
+            if let Some(rules) = self.find_child(sp, "AvatarRules") {
+                if let Some(body) = self.find_child(rules, "AvatarBodyRules") {
+                    out.push(body);
+                }
+            }
+        }
+        if let Some(avs) = self.find_child(root, "AvatarSettings") {
+            if let Some(rules) = self.find_child(avs, "AvatarRules") {
+                if let Some(body) = self.find_child(rules, "AvatarBodyRules") {
+                    if !out.contains(&body) {
+                        out.push(body);
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    /// Explicit `Enum.GameAvatarType` stored in the place (`0` = R6, `1` = R15,
+    /// `2` = PlayerChoice), checking `StarterPlayer.GameSettingsAvatar` first
+    /// and then `AvatarBodyRules.AvatarType` / `AvatarRules.AvatarType`.
+    /// Returns `None` when the place has no explicit avatar type property set.
+    pub fn explicit_avatar_type(&self) -> Option<u32> {
+        let root = self.dom.root_ref();
+        if let Some(sp) = self.find_child(root, "StarterPlayer") {
+            if let Some(v) = self.explicit_enum_u32(sp, "GameSettingsAvatar").filter(|&v| v <= 2) {
+                return Some(v);
+            }
+        }
+        for body in self.avatar_body_rules_refs() {
+            if let Some(v) = self.explicit_enum_u32(body, "AvatarType").filter(|&v| v <= 2) {
+                return Some(v);
+            }
+        }
+        if let Some(avs) = self.find_child(root, "AvatarSettings") {
+            if let Some(rules) = self.find_child(avs, "AvatarRules") {
+                if let Some(v) = self.explicit_enum_u32(rules, "AvatarType").filter(|&v| v <= 2) {
+                    return Some(v);
+                }
+            }
+        }
+        None
+    }
+
+    /// Effective `Enum.GameAvatarType` for the place (`0` = R6, `1` = R15,
+    /// `2` = PlayerChoice), defaulting to Studio's R15 (`1`).
+    pub fn avatar_type(&self) -> u32 {
+        self.explicit_avatar_type().unwrap_or(1)
+    }
+
     /// Drops refs whose ancestor is also in the list (for copy/move/delete).
     pub fn top_level(&self, refs: &[Ref]) -> Vec<Ref> {
         refs.iter()

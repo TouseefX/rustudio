@@ -56,6 +56,14 @@ crate (Cargo's dev profile): several times slower in the physics, the Luau
 runtime and the renderer's CPU side, and a phone shows it first. The
 start line in logcat says which one is running (`rustudio … starting
 (Android API 33; debug build, aarch64 android)` / `release build, …`).
+The release profile (root `Cargo.toml`) builds with thin LTO and one
+codegen unit a crate: a frame crosses the crate boundaries thousands of
+times (rustudio-engine into rustudio-core's document and variants for
+every property a script reads, the physics solver's modules, the
+renderer's), and without LTO none of those calls can be inlined. It costs
+build time (the final crate's codegen is serial) and CI's link step
+memory; `CARGO_PROFILE_RELEASE_LTO=off CARGO_PROFILE_RELEASE_CODEGEN_UNITS=16`
+restores Cargo's defaults for a quick local build.
 
 `x build` without `--pem` signs with xbuild's debug key (installs with
 adb). A release key goes in as `--pem key.pem` or the `X_PEM` environment
@@ -129,7 +137,7 @@ xbuild quirks worth knowing (commit e67b501):
 | Graphics quality (File > Studio Settings > rustudio > Performance) | Manual at the full profile, 100% 3D resolution; Automatic from level 5 | weak-GPU mode (`gpu_caps.rs`: every Android device): Automatic from level 1 — no shadows, SSAO, clouds, bloom, DoF, probe or grass until the frame times allow — and 75% 3D resolution (`rustudio_settings::choice_default`); "Frame time on a phone" below. View > GPU Driver names the adapter and holds the Mesa driver switch |
 | Logging | stderr | logcat tag `rustudio` (`log` → android_logger), stdout/stderr forwarded by android-activity |
 | Crash reports | `~/.cache/rustudio/crash/` | `Android/data/dev.rustudio.studio/files/crash/<timestamp>-<pid>.txt` on the shared volume (`adb pull`, or a PC over USB; the private cache folder needed root — and since Android 11 the Files apps can't open `Android/data` either, so the start after a crash copies the report, the session logs (`src/android/logcat.rs`: this run's and the crashed run's) and the app's own `logcat -d` into **`Download/rustudio/rustudio-logs-<stamp>.txt`**, a file any Files app shows and a user can send; Help > Copy Logs to Download does the same at any time: `src/android/logs.rs`, a `MediaStore.Downloads` row the app inserts, no permission needed). Same `crates/rustudio-core/src/crash.rs`: panic hook + signal handlers chain to debuggerd; the next start names the report in Output and logcat (`rustudio crashed last time: panic in thread … at file:line — message`). A report ends with the last 24 notes (`crash::note`): the GPU errors wgpu reported, a lost device, so it says what led up to it |
-| GPU device lost, GPU out of memory | wgpu's default: a panic | The device gets an uncaptured-error handler and a device-lost callback (`android/mod.rs install_gpu_error_handler`): errors go to logcat and the report notes, the frame goes on. The vendored egui-wgpu (upstream's `renderer.rs` `upload_failed`, since 0.3.3-alpha.2) skips a frame whose index/vertex upload the device refuses instead of panicking (`renderer.rs:984 Failed to create staging buffer for index data` — what a reset Adreno driver looked like). A lost device, or out-of-memory errors every frame for 5 s, ends the run in order (`gpu_watch`): the open place is written to `Android/data/dev.rustudio.studio/files/recovery/<name>-<stamp>.rbxl`, a report says so for the next start, and the activity is relaunched (`jni::relaunch`). The desktop's own check (`gpu_health::check` in `App::ui`, which panics on a lost device so a desktop run ends with a report) is not run on Android: it ran before `gpu_watch` got its turn, and a 2026-11-24 device — 7.2 GB resident after four minutes of a 288,000-instance place, the driver out of memory — crashed in it (`gpu_health.rs:88`) instead of saving the place and relaunching |
+| GPU device lost, GPU out of memory | wgpu's default: a panic | The device gets an uncaptured-error handler and a device-lost callback (`android/mod.rs install_gpu_error_handler`): errors go to logcat and the report notes, the frame goes on. The vendored egui-wgpu (upstream's `renderer.rs` `upload_failed`, since 0.3.3-alpha.2) skips a frame whose index/vertex upload the device refuses instead of panicking (`renderer.rs:984 Failed to create staging buffer for index data` — what a reset Adreno driver looked like). A lost device, or out-of-memory errors every frame for 5 s, ends the run in order (`gpu_watch`): the open place is written to `Android/data/dev.rustudio.studio/files/recovery/<name>-<stamp>.rbxl`, a report says so for the next start, and the activity is relaunched (`jni::relaunch`). The desktop's own check (`gpu_health::check` in `App::ui`, which panics on a lost device so a desktop run ends with a report) is not run on Android: it ran before `gpu_watch` got its turn, and a 2026-11-24 device — 7.2 GB resident after four minutes of a 288,000-instance place, the driver out of memory — crashed in it (`gpu_health.rs:88`) instead of saving the place and relaunching. The same frame's later wgpu calls must not be fatal either: `Device::poll` on a lost device is one of wgpu's panics ("Error in Device::poll: Parent device is lost" — a 2026-11-26 report, `gpu_timing::end_frame` resolving the frame's timestamps three beams into a fight), so the per-frame polls go through `gpu_health::poll`, which skips a lost device (gpu_timing, the cloud readback, the texture upload flush); the world GUI's staging upload skips too (`world_gui.rs stage`, which also marks the loss when the belt's buffer can't be mapped). Since the 0.6.0 rebase upstream's own low-VRAM handling (`gpu_caps.rs` budgets, `gpu_health::mark_oom`, `world_gui.rs` `purge_mips` / `evict_mips_for`) is in; on Android the world-GUI mip copies keep to 64 MiB (`gpu_caps::world_gui_mips_budget`; `RUSTUDIO_GUI_VRAM_MB` lifts it) because a phone's GPU reports the whole system memory as its heap |
 | Studio content download | ureq + rustls (ring) | the same, three packages at a time; Play can use the content once the packages are in (the retired textures and View Selector follow in the background). Without a network at start (ConnectivityManager, INTERNET capability — not VALIDATED, which some networks never get) it starts when one comes. A `network check: …` line in Output (and logcat) at every start says how Roblox's servers are reached, phase by phase — DNS, a TCP connect to the first IPv4 and the first IPv6 address, an HTTPS GET — with the time each took; `rustudio --network-check` prints the same on a desktop. Every agent resolves a host IPv4 first (`rustudio_account::http`): a network that advertises an IPv6 that doesn't route — some phones' Wi-Fi and mobile networks — otherwise cost every new connection a connect timeout, and the app "worked, but very slowly". Connects time out after 10 s; one agent (connection pool) per purpose for the process, so an asset doesn't pay DNS, TCP and TLS twice over |
 | Login keyring | `keyring` 4 (Secret Service / Keychain / Credential Manager) | `keyring-core` + `android-native-keyring-store` (SharedPreferences + Android Keystore) behind the same `Entry` API (`crates/rustudio-account/src/store.rs`) |
 | TLS roots (`rustudio-account` MessagingService socket) | OS store (`rustls-native-certs`) | Mozilla's (`webpki-roots`, enabled alongside): Android's CA store isn't in a form `rustls-native-certs` reads; `ureq` already used `webpki-roots` |
@@ -744,9 +752,10 @@ line of its own at the outer level; a closer typed at the start of a line
 (`end`, `else`, `elseif`, `until`, `}`) steps out to its opener's
 indentation (a small Luau lexer skips strings and `--` comments; typing on
 past it, `endTime`, steps back in). On the desktop (and a hardware
-keyboard) the script editor applies it after egui's `TextEdit` handled
-the key (`script_editor::auto_indent`: the text inserted is found by the
-caret). The soft keyboard's text, though, goes through the mirror: had
+keyboard) upstream 0.6.0's own auto-indent does it: `script_editor/indent.rs`
+`handle_keys` takes the frame's Enter / typing events ahead of egui's
+`TextEdit` (the port's earlier after-the-fact hook went with the 0.6.0
+rebase; the two rules agree). The soft keyboard's text, though, goes through the mirror: had
 the editor indented after the fact, the mirror would have been a frame
 behind and the keyboard's next letter placed by the unindented text. So
 `Conn.codeFixup` asks the native side *inside* the keyboard's operation
@@ -847,6 +856,53 @@ Settings > rustudio, and the MicroProfiler). What a phone gets from it:
   cache besides (`MESA_SHADER_CACHE_DIR`, the Turnip section), so they
   gained less from this than the vendor drivers, which keep nothing
   between processes. `RUSTUDIO_NO_PIPELINE_CACHE=1` turns it off.
+  The blob is never read out of the driver's cache (`get_data`) while
+  another thread builds pipelines into it (`pipeline_cache::building`,
+  held by the shader warm-up worker per pass set and by the
+  specialised-pipeline threads; `save` skips a frame or, forced at
+  exit, waits): Vulkan asks drivers to allow the two at once, but a
+  stock Adreno Vulkan has aborted on it (`pthread_mutex_lock called on
+  a destroyed mutex`, seen in another Android port of rustudio).
+- **Shaders are compiled on the phone, never precompiled**: every shader
+  is WGSL (`shader.wgsl`, `clouds.wgsl`, `postfx*.wgsl`, the inline ones)
+  that this device's driver compiles at run time; the APK carries no
+  compiled shaders, and the two caches above are written by the phone
+  for its own adapter and driver version (a desktop's blob would fail
+  wgpu's header check and start empty). What the port adds is *when* the
+  compiling happens: the **shader warm-up**
+  (`crates/rustudio-render/src/warmup.rs`). Upstream's worker made only
+  the 1x viewport set; on Android (or with `RUSTUDIO_SHADER_WARMUP=1` on
+  a desktop) it goes on to everything a frame would otherwise compile at
+  its first use — the `probe_samples` (4x) viewport set the scene probe
+  needs in every place's first frames, the depth post passes, the world
+  GUI and highlight passes at the session's first sample count, the
+  cloud and adornment passes at both, the ViewportFrame blit — handing
+  each over on a channel as it is done (`Renderer::poll_warmup` each
+  frame). A frame that needs a viewport set the worker is about to
+  deliver waits for it (`ensure_pipelines` → `Warmup::wait_viewport`:
+  the same thirty pipelines, not made twice); anything else it builds
+  itself and the worker skips (`mark_local`). So the first run on a
+  driver fills the caches in the background instead of on the UI
+  thread, and a primed run has every pass ready a few hundred
+  milliseconds in — no first-Play, first-selection or first-clouds
+  compile hitch, and none when Automatic quality steps to a level that
+  draws 4x (a compile there was a slow frame the controller read as
+  "too slow", stepping back down). logcat: `[startup] shader warm-up: N
+  pass set(s) built on the worker in T ms (S made by a frame first; P
+  pipeline(s) through the cache; viewport sets at [1, 4] sample(s) a
+  pixel)`. `RUSTUDIO_SHADER_WARMUP=0` (or `RUSTUDIO_NO_PIPELINE_PREBUILD`)
+  turns the worker off; not on OpenGL either way (the shared context).
+  **View > GPU Driver > Shaders** shows the warm-up line, the pipeline
+  cache's state (primed KB, pipelines made this run, KB on disk) and
+  the switch **Rebuild shader caches at the next start**
+  (`src/android/shader_cache.rs`: a marker; the next start deletes
+  `<cache>/rustudio/pipelines/` and Mesa's `turnip_shader_cache` /
+  `panvk_shader_cache` before any driver loads, logs `[startup] Shader
+  caches rebuilt this start: N file(s), K KB removed (…)`, and compiles
+  everything afresh — a slower first frame once; for after a driver
+  update, or when frames stutter where they didn't).
+  `RUSTUDIO_SHADER_REBUILD=1` in `debug.rustudio.env` does the same (on
+  a desktop it removes the pipeline cache blob, `pipeline_cache::init`).
 - **Play's start** (the "game loads slowly" of the second phone report)
   is timed the same way: `[startup] Play started in N ms: runtimes made
   A, server DataModel copied B, client DataModel replicated C, physics
@@ -1070,7 +1126,56 @@ frame thread; below), `RUSTUDIO_TURNIP` (0|1|force), `RUSTUDIO_GPU_TURBO`
 `RUSTUDIO_SYSTEM_BARS` (1: the navigation and status bars stay, instead of
 immersive mode), `RUSTUDIO_PHYSICS_THREADS` (the physics pool; 2 on a
 phone by default, "Frame time on a phone" above), `RUSTUDIO_PHYSICS_HURRY`,
-`RUSTUDIO_PHYSICS_CATCHUP`.
+`RUSTUDIO_PHYSICS_CATCHUP`, `RUSTUDIO_SHADER_WARMUP` (0: no startup
+shader warm-up worker; on by default on a phone), `RUSTUDIO_SHADER_REBUILD`
+(1: this start deletes the pipeline cache and Mesa's shader cache first;
+"Shaders are compiled on the phone" above), `RUSTUDIO_PERF_LOG` (0: no
+frame report; below).
+
+### The frame report
+
+Every five seconds the phone logs one line on where its frames went
+(`crates/rustudio-player/src/perf_report.rs`; logcat tag `rustudio`,
+`perf: …`; the same line under View > GPU Driver > Frame report, with
+a Copy button — paste it into a bug report). It reads:
+
+```
+perf: 296 frames in 5.0 s: 16.9 ms apart (p95 21.6, worst 43); CPU 10.9 ms a frame
+= app 9.8 + egui/present 1.1; GPU 4.5 ms a drawn frame (296 measured) = post 3.5
++ shadows 0.5 + scene 0.5; 3D view 845x349 px at level 3; sections (ms a frame):
+viewport 6.1, vp_after 4.5, plugin_tick 2.0, gui_world_pass 1.2; frames asked by:
+viewport.rs:3172 x296, widgets_ui.rs:943 x167
+```
+
+- *apart*: the time between frames (mean, 95th percentile, the worst
+  one in the window). A 60 Hz phone that keeps up reads 16.7.
+- *CPU*: eframe's measure of the whole frame on the UI thread, split
+  into the app's own update (`app`: the editor, the 3D view's
+  preparation, the game's GUI) and the rest (egui's tessellation, the
+  UI's draw, the present); `slept` is the frame limit's sleep, left out.
+- *GPU*: the 3D view's passes from the GPU's own timestamps (needs the
+  adapter's timestamp queries; "GPU not timed" without), per drawn
+  frame, the heaviest first: `scene` (the parts, terrain, sky), `post`
+  (the tone map and upscale; bloom, DoF), `shadows`, `ssao`, `see-through`,
+  `world gui`, `post (after gui)`. A GPU-bound phone shows the GPU total
+  near or over the frame spacing; a CPU-bound one a small GPU total next
+  to a large CPU one.
+- *3D view*: the render target's pixels, Automatic's level (1–21) and
+  the MSAA count when above 1.
+- *pipeline(s) built*: shaders the driver compiled in the window (a
+  hitch each, on the first frames and at a new quality tier).
+- *sections*: the UI thread's `bench::scope`s, ms a frame, the ten
+  heaviest at 0.3 ms or more (`viewport` holds the 3D view's frame,
+  `vp_render` the GPU command encoding, `lighting` the lights and grids,
+  `plugin_tick` the plugins, `dock_panels` the editor's panels with the
+  viewport inside them).
+- *frames asked by*: what requested egui repaints (file:line in rustudio
+  or egui), the four most frequent. A frame loop that never rests shows
+  its instigator here.
+
+`RUSTUDIO_PERF_LOG=0` turns it off (`=1` turns it on on a computer, to
+stderr through the log). Its cost is the GPU timestamps (a few per
+frame) and one string every five seconds.
 
 ### The frame's pacing on Android
 
@@ -1094,6 +1199,48 @@ phone by default, "Frame time on a phone" above), `RUSTUDIO_PHYSICS_HURRY`,
   refresh rate (`Display.getRefreshRate`, `app.rs display_refresh_hz`: a
   phone that switches between 60 and 120 Hz says which it is on) is the
   governor hint's budget.
+- **Post-processing once a frame** (`render.rs` `postfx_after_gui`,
+  `Game::draw_world` in game_view.rs): the post chain — depth of field,
+  bloom, sun rays, the tone map and the upscale to the display size —
+  ran in `render` and then again after the world GUIs and effects had
+  been drawn into the HDR scene (`finish_again`), so a game showing a
+  BillboardGui or a particle paid it twice every frame: 2–4 ms of a
+  phone's GPU at FHD+. When the GUI pass will follow (the frame's GUI
+  batches, or effects drawn the frame before), `render` leaves the post
+  to it; a caller that draws nothing after `render` gets it at its next
+  highlight, adornment or frame. (ViewportFrames keep their own.)
+- **Light grids and moving parts**: parts that only moved refresh the
+  light grid (the sun and sky occupancy voxels, 4 studs) at most every
+  1.5 s and the light-occlusion grid (shadowed local lights, 2–4 studs)
+  every 0.5 s — each a gather over the place's parts on the UI thread, a
+  worker and a 3D texture upload. In Play on a phone a move only counts
+  when a voxel could see it (`game_view.rs` `moves_matter`: an opaque
+  part of a quarter of a voxel's volume or more, or 256 movers at once),
+  so characters' limbs, debris and bullets — moving every frame of every
+  game — no longer rebuild both grids for as long as anyone walks. A
+  walking character's own voxel shade stays where the last rebuild put
+  it until a door, a vehicle or an edit moves the grid on. The editor
+  and the desktop keep every move.
+- **The frame limit: 60 on a phone** (Performance > Editor frame limit;
+  `rustudio_settings::choice_default_for`, `RUSTUDIO_PERF_FPS` overrides,
+  Unlimited can be picked). A 90 or 120 Hz display otherwise ran the
+  game — Heartbeat and RenderStepped scripts, the physics steps, the
+  render snapshot, egui — at the display's rate, up to twice the CPU
+  work of Roblox's phone client, which caps at 60 unless the player opts
+  in, for the battery and the heat that throttles the cores a minute in.
+  The limit is first asked of the panel (`src/android/frame_rate.rs`:
+  `ANativeWindow_setFrameRate`, Android 11+, looked up at run time): on
+  an adaptive display setting SurfaceFlinger moves a 120 Hz panel to 60
+  and vsync paces the frames with nothing slept, at half the panel's
+  power (logcat `display: 60 Hz asked for the frame limit`, then
+  `display: 60 Hz` once it switched; the rate is read again every few
+  seconds). Where the panel stays faster (a fixed 120 Hz setting, an
+  older Android), `app.rs pace_frame` sleeps the rest of the period
+  before each frame — the desktop's pacing is `src/native_loop.rs`'s,
+  which the activity's eframe loop hasn't (its sleep is left out of the
+  governor's hint and the hint's budget becomes the limit's period).
+  Nothing happens when the limit is at or above the display's rate, so a
+  60 Hz phone at the default never sleeps and vsync paces it as before.
 - **The CPU governor told the frame budget** (`src/android/perf_hint.rs`;
   `RUSTUDIO_NO_PERF_HINT` turns it off): Android's performance hints
   (ADPF, `PerformanceHintManager`, API 31+). A frame loop that works for

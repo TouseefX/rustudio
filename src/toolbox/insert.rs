@@ -287,14 +287,37 @@ pub fn face_of(xf: &Xform, size: Vec3, p: Vec3) -> u32 {
 pub enum Home {
     World,
     Lighting,
+    Terrain,
     MaterialService,
     /// Tool / HopperBin: Studio asks.
     AskToolHome,
 }
 
+pub fn is_lighting_class(class: &str) -> bool {
+    matches!(
+        class,
+        "Sky"
+            | "Atmosphere"
+            | "BloomEffect"
+            | "BlurEffect"
+            | "ColorCorrectionEffect"
+            | "DepthOfFieldEffect"
+            | "SunRaysEffect"
+            | "ColorGradingEffect"
+    ) || rustudio_core::doc::is_a(class, "Sky")
+        || rustudio_core::doc::is_a(class, "Atmosphere")
+        || rustudio_core::doc::is_a(class, "PostEffect")
+}
+
+pub fn is_terrain_class(class: &str) -> bool {
+    class == "Clouds" || rustudio_core::doc::is_a(class, "Clouds")
+}
+
 pub fn home_of(class: &str, sub_types: &[String]) -> Home {
-    if rustudio_core::doc::is_a(class, "Sky") || rustudio_core::doc::is_a(class, "Atmosphere") || class == "Sky" || class == "Atmosphere" {
+    if is_lighting_class(class) {
         Home::Lighting
+    } else if is_terrain_class(class) {
+        Home::Terrain
     } else if sub_types.iter().any(|s| s == "MaterialPack") {
         Home::MaterialService
     } else if class == "Tool" || class == "HopperBin" {
@@ -302,6 +325,87 @@ pub fn home_of(class: &str, sub_types: &[String]) -> Home {
     } else {
         Home::World
     }
+}
+
+/// Top-level refs split by destination service for a Toolbox model insert.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct RoutedRoots {
+    pub world: Vec<Ref>,
+    pub lighting: Vec<Ref>,
+    pub terrain: Vec<Ref>,
+    pub material: Vec<Ref>,
+}
+
+fn collect_lighting_pack_leaves(
+    dom: &WeakDom,
+    container: Ref,
+    sub_types: &[String],
+    lighting: &mut Vec<Ref>,
+    terrain: &mut Vec<Ref>,
+) -> bool {
+    let Some(inst) = dom.get_by_ref(container) else {
+        return false;
+    };
+    if inst.children().is_empty() {
+        return false;
+    }
+    let start_l = lighting.len();
+    let start_t = terrain.len();
+    for &child in inst.children() {
+        let Some(ci) = dom.get_by_ref(child) else {
+            lighting.truncate(start_l);
+            terrain.truncate(start_t);
+            return false;
+        };
+        let cls = ci.class.as_str();
+        match home_of(cls, sub_types) {
+            Home::Lighting => lighting.push(child),
+            Home::Terrain => terrain.push(child),
+            _ if matches!(cls, "Model" | "Folder" | "Lighting" | "Configuration") => {
+                if !collect_lighting_pack_leaves(dom, child, sub_types, lighting, terrain) {
+                    lighting.truncate(start_l);
+                    terrain.truncate(start_t);
+                    return false;
+                }
+            }
+            _ => {
+                lighting.truncate(start_l);
+                terrain.truncate(start_t);
+                return false;
+            }
+        }
+    }
+    lighting.len() > start_l || terrain.len() > start_t
+}
+
+/// Routes inserted top-level refs to their target services.
+///
+/// Direct `Sky`, `Atmosphere`, and `PostEffect` instances route to `Lighting`,
+/// and `Clouds` routes to `Workspace.Terrain`. If a top-level container
+/// (`Model`, `Folder`, `Lighting`, `Configuration`) contains *exclusively*
+/// lighting/terrain items (a wrapped skybox/lighting pack), its leaf items are
+/// unpacked directly into `Lighting` / `Terrain` so they activate immediately.
+pub fn route_roots(dom: &WeakDom, roots: &[Ref], sub_types: &[String]) -> RoutedRoots {
+    let mut out = RoutedRoots::default();
+    let is_mat_pack = sub_types.iter().any(|s| s == "MaterialPack");
+    for &r in roots {
+        let Some(i) = dom.get_by_ref(r) else { continue };
+        let cls = i.class.as_str();
+        match home_of(cls, sub_types) {
+            Home::Lighting => out.lighting.push(r),
+            Home::Terrain => out.terrain.push(r),
+            Home::MaterialService => out.material.push(r),
+            _ if !is_mat_pack
+                && matches!(cls, "Model" | "Folder" | "Lighting" | "Configuration") =>
+            {
+                if !collect_lighting_pack_leaves(dom, r, sub_types, &mut out.lighting, &mut out.terrain) {
+                    out.world.push(r);
+                }
+            }
+            _ => out.world.push(r),
+        }
+    }
+    out
 }
 
 /// Encodes `refs` of `dom` as binary model bytes (for Document::paste_groups).
@@ -355,10 +459,61 @@ mod tests {
         assert_eq!(face_of(&xf, s, Vec3::new(-2.0, 0.0, 0.0)), 3);
         assert_eq!(face_of(&xf, s, Vec3::new(0.0, 0.0, -3.0)), 5);
         assert_eq!(home_of("Sky", &[]), Home::Lighting);
+        assert_eq!(home_of("Atmosphere", &[]), Home::Lighting);
+        assert_eq!(home_of("BloomEffect", &[]), Home::Lighting);
+        assert_eq!(home_of("BlurEffect", &[]), Home::Lighting);
+        assert_eq!(home_of("ColorCorrectionEffect", &[]), Home::Lighting);
+        assert_eq!(home_of("DepthOfFieldEffect", &[]), Home::Lighting);
+        assert_eq!(home_of("SunRaysEffect", &[]), Home::Lighting);
+        assert_eq!(home_of("ColorGradingEffect", &[]), Home::Lighting);
+        assert_eq!(home_of("Clouds", &[]), Home::Terrain);
         assert_eq!(home_of("Tool", &[]), Home::AskToolHome);
         assert_eq!(home_of("Model", &["MaterialPack".into()]), Home::MaterialService);
         assert_eq!(home_of("Model", &[]), Home::World);
         assert_eq!(snap(Vec3::new(1.4, 2.2, -0.6), 1.0), Vec3::new(1.0, 2.2, -1.0));
         assert_eq!(waypoint(5, Kind::Model), "After insert asset 5");
+    }
+
+    #[test]
+    fn route_roots_handles_multi_item_skybox_and_wrapped_pack() {
+        // 1. Multi-root skybox asset (e.g. 7108851308: Sky + Atmosphere + PostEffects + Clouds).
+        let mut dom = WeakDom::new(InstanceBuilder::new("DataModel"));
+        let root = dom.root_ref();
+        let sky = dom.insert(root, InstanceBuilder::new("Sky"));
+        let atmos = dom.insert(root, InstanceBuilder::new("Atmosphere"));
+        let bloom = dom.insert(root, InstanceBuilder::new("BloomEffect"));
+        let cc = dom.insert(root, InstanceBuilder::new("ColorCorrectionEffect"));
+        let rays = dom.insert(root, InstanceBuilder::new("SunRaysEffect"));
+        let clouds = dom.insert(root, InstanceBuilder::new("Clouds"));
+        let roots = dom.root().children().to_vec();
+        let routed = route_roots(&dom, &roots, &[]);
+        assert!(routed.world.is_empty());
+        assert_eq!(routed.lighting, vec![sky, atmos, bloom, cc, rays]);
+        assert_eq!(routed.terrain, vec![clouds]);
+
+        // 2. Wrapped Model skybox pack (only lighting/terrain items inside).
+        let mut dom2 = WeakDom::new(InstanceBuilder::new("DataModel"));
+        let root2 = dom2.root_ref();
+        let pack = dom2.insert(root2, InstanceBuilder::new("Model").with_name("SkyPack"));
+        let sub = dom2.insert(pack, InstanceBuilder::new("Folder").with_name("Lighting"));
+        let p_sky = dom2.insert(sub, InstanceBuilder::new("Sky"));
+        let p_atmos = dom2.insert(sub, InstanceBuilder::new("Atmosphere"));
+        let p_blur = dom2.insert(pack, InstanceBuilder::new("BlurEffect"));
+        let p_clouds = dom2.insert(pack, InstanceBuilder::new("Clouds"));
+        let routed2 = route_roots(&dom2, &[pack], &[]);
+        assert!(routed2.world.is_empty());
+        assert_eq!(routed2.lighting, vec![p_sky, p_atmos, p_blur]);
+        assert_eq!(routed2.terrain, vec![p_clouds]);
+
+        // 3. Mixed Model (contains a Part alongside a Sky): stays intact in World.
+        let mut dom3 = WeakDom::new(InstanceBuilder::new("DataModel"));
+        let root3 = dom3.root_ref();
+        let mixed = dom3.insert(root3, InstanceBuilder::new("Model").with_name("Mixed"));
+        dom3.insert(mixed, InstanceBuilder::new("Sky"));
+        dom3.insert(mixed, InstanceBuilder::new("Part"));
+        let routed3 = route_roots(&dom3, &[mixed], &[]);
+        assert_eq!(routed3.world, vec![mixed]);
+        assert!(routed3.lighting.is_empty());
+        assert!(routed3.terrain.is_empty());
     }
 }

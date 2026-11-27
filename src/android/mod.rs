@@ -36,6 +36,7 @@
 mod assets;
 pub mod clipboard;
 pub mod cutout;
+pub mod frame_rate;
 pub mod ime;
 pub mod intent;
 pub mod jni;
@@ -46,6 +47,7 @@ pub mod logs;
 pub mod memory;
 pub mod perf_hint;
 pub mod sensors;
+pub mod shader_cache;
 pub mod storage;
 pub mod system_bars;
 pub mod text_bar;
@@ -174,6 +176,9 @@ pub fn run(app: AndroidApp) {
     export_env();
     // The session log file (logcat.rs): the lines logged so far go in first.
     logcat::open_session();
+    // "Rebuild shader caches at the next start" (shader_cache.rs): the
+    // pipeline cache and Mesa's shader cache go before any driver loads.
+    shader_cache::apply_at_start();
     // The motion sensors behind UserInputService (sensors.rs), for the
     // engine's device_sensors.
     rustudio_engine::device_sensors::install(sensors::source());

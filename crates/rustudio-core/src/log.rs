@@ -6,6 +6,8 @@ pub enum Level {
     Info,
     Warn,
     Error,
+    /// Studio's `RBX::MESSAGE_SYSTEM` (purple, bold): save / publish / system notices.
+    System,
 }
 
 pub struct LogLine {

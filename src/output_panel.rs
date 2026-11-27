@@ -26,6 +26,7 @@ pub const PRINT: Color32 = Color32::from_rgb(188, 190, 200);
 pub const WARN: Color32 = Color32::from_rgb(245, 118, 48);
 pub const ERROR: Color32 = Color32::from_rgb(231, 87, 80);
 pub const INFO: Color32 = Color32::from_rgb(143, 180, 255);
+pub const SYSTEM: Color32 = Color32::from_rgb(223, 106, 247);
 pub const SERVER_BAR: Color32 = Color32::from_rgb(0, 204, 103);
 pub const CLIENT_BAR: Color32 = Color32::from_rgb(52, 154, 213);
 const LINE_H: f32 = 15.0;
@@ -50,6 +51,7 @@ pub enum Kind {
     Info,
     Warn,
     Error,
+    System,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -107,10 +109,12 @@ pub fn parse(l: &LogLine) -> Shown<'_> {
         return Shown { kind: Kind::Info, context: Context::None, message, source };
     }
     // Script output (from a side, or with a source) prints in the normal
-    // colour; rustudio's own lines are Studio's blue info lines.
+    // colour; rustudio's own lines are Studio's blue info lines; publish /
+    // save / system lines are Studio's purple System lines (MESSAGE_SYSTEM).
     let kind = match l.level {
         Level::Warn => Kind::Warn,
         Level::Error => Kind::Error,
+        Level::System => Kind::System,
         Level::Info if context != Context::None || source.is_some() => Kind::Print,
         Level::Info => Kind::Info,
     };
@@ -176,6 +180,7 @@ pub fn kind_color(k: Kind) -> Color32 {
         Kind::Info => INFO,
         Kind::Warn => WARN,
         Kind::Error => ERROR,
+        Kind::System => SYSTEM,
     }
 }
 
@@ -186,6 +191,7 @@ pub enum MessageFilter {
     Info,
     Warnings,
     Errors,
+    System,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -298,6 +304,7 @@ fn wanted(st: &OutputState, filter: &str, s: &Shown, l: &LogLine) -> bool {
         MessageFilter::Info => s.kind == Kind::Info,
         MessageFilter::Warnings => s.kind == Kind::Warn,
         MessageFilter::Errors => s.kind == Kind::Error,
+        MessageFilter::System => s.kind == Kind::System,
     };
     let ctx_ok = match st.contexts {
         ContextFilter::All => true,
@@ -308,7 +315,7 @@ fn wanted(st: &OutputState, filter: &str, s: &Shown, l: &LogLine) -> bool {
     kind_ok && ctx_ok && text_ok
 }
 
-/// The line as one LayoutJob in Studio's colours (bold for warnings / errors).
+/// The line as one LayoutJob in Studio's colours (bold for warnings / errors / system).
 pub fn line_job(st: &OutputState, l: &LogLine, s: &Shown) -> egui::text::LayoutJob {
     let mut job = egui::text::LayoutJob::default();
     let mono = mono_font();
@@ -321,9 +328,10 @@ pub fn line_job(st: &OutputState, l: &LogLine, s: &Shown) -> egui::text::LayoutJ
         job.append(&format!("{c} - "), 0.0, plain(PRINT));
     }
     let mut fmt = plain(kind_color(s.kind));
-    if matches!(s.kind, Kind::Warn | Kind::Error) {
-        // (Studio draws them bold; egui's monospace has no bold face, so a
-        // heavier look comes from the "bold" family when it is installed)
+    if matches!(s.kind, Kind::Warn | Kind::Error | Kind::System) {
+        // (Studio draws types above Information DemiBold; egui's
+        // monospace has no semi-bold face, so a heavier look comes from the
+        // "mono-bold" family when it is installed)
         fmt.font_id = FontId::new(mono_px(), egui::FontFamily::Name("mono-bold".into()));
     }
     job.append(s.message, 0.0, fmt);
@@ -350,6 +358,7 @@ impl Editor {
                     MessageFilter::Info => "Info",
                     MessageFilter::Warnings => "Warnings",
                     MessageFilter::Errors => "Errors",
+                    MessageFilter::System => "System",
                 })
                 .show_ui(ui, |ui| {
                     for (v, n) in [
@@ -358,6 +367,7 @@ impl Editor {
                         (MessageFilter::Info, "Info"),
                         (MessageFilter::Warnings, "Warnings"),
                         (MessageFilter::Errors, "Errors"),
+                        (MessageFilter::System, "System"),
                     ] {
                         ui.selectable_value(&mut st.messages, v, n);
                     }
@@ -728,6 +738,24 @@ mod tests {
         assert_eq!(text, "hello from a script - RefScript:1");
         st.show_timestamp = true;
         assert_eq!(line_job(&st, &p, &s).text, "20:50:23.591  hello from a script - RefScript:1");
+
+        // Studio System messages (save / publish): SensitiveText purple, bold, filtered under All / System.
+        let sysl = line(Level::System, "Published new changes in \"Baseplate\" to Roblox.");
+        let sys = parse(&sysl);
+        assert!(sys.kind == Kind::System && sys.context == Context::None && sys.source.is_none());
+        assert_eq!(kind_color(sys.kind), SYSTEM);
+        st.show_timestamp = false;
+        let sys_job = line_job(&st, &sysl, &sys);
+        assert_eq!(sys_job.text, "Published new changes in \"Baseplate\" to Roblox.");
+        assert_eq!(sys_job.sections.len(), 1);
+        assert_eq!(sys_job.sections[0].format.color, SYSTEM);
+        assert_eq!(sys_job.sections[0].format.font_id.family, egui::FontFamily::Name("mono-bold".into()));
+        assert!(wanted(&st, "", &sys, &sysl));
+        st.messages = MessageFilter::System;
+        assert!(wanted(&st, "", &sys, &sysl));
+        assert!(!wanted(&st, "", &i, &il));
+        st.messages = MessageFilter::Info;
+        assert!(!wanted(&st, "", &sys, &sysl));
     }
 
     /// Drives `log_view` headless with mouse / key events.

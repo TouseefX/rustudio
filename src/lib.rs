@@ -21,6 +21,7 @@
 //! kind of system has is behind `#[cfg(target_os = "android")]` /
 //! `#[cfg(not(target_os = "android"))]`.
 
+pub mod anim_editor;
 pub mod asset_manager;
 pub mod plugin_store;
 pub mod toolbox;

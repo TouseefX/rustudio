@@ -34,6 +34,9 @@ pub(super) struct TextFitCache {
     probe_building: Option<std::sync::mpsc::Receiver<Fonts>>,
     probe_frame: Option<u64>,
     galleys: TextMemo<Arc<egui::Galley>, 1024>,
+    // Each object's last drawn text, drawn again while its new size or
+    // layout waits for a later frame's budget.
+    drawn: rustc_hash::FxHashMap<Ref, Arc<egui::Galley>>,
     frame: Option<u64>,
     // Reserve time for HUD text even when world signs fill their budget.
     spent: [Duration; 2],
@@ -251,6 +254,24 @@ impl TextFitCache {
 
     pub(super) fn clear_galleys(&mut self) {
         self.galleys = Default::default();
+        self.drawn.clear();
+    }
+
+    /// `galley` as `r`'s text this frame, or (None: deferred) the text it
+    /// last drew, so a label being resized never goes blank.
+    fn drawn(&mut self, r: Ref, galley: Option<Arc<egui::Galley>>) -> Option<Arc<egui::Galley>> {
+        match galley {
+            Some(galley) => {
+                self.drawn.insert(r, galley.clone());
+                Some(galley)
+            }
+            None => self.drawn.get(&r).cloned(),
+        }
+    }
+
+    /// Forgets the last drawn text of objects that are gone.
+    pub(super) fn retain_drawn(&mut self, mut keep: impl FnMut(Ref) -> bool) {
+        self.drawn.retain(|r, _| keep(*r));
     }
 
     fn size(
@@ -2130,7 +2151,7 @@ impl Walk<'_, '_> {
             let mesh = match gradient {
                 Some(g) => {
                     let gr = Grad::new(d, g, rect);
-                    let f = move |p: Pos2| {
+                    let f = |p: Pos2| {
                         let (c, t) = gr.at(p);
                         rgba(
                             [
@@ -2141,14 +2162,16 @@ impl Walk<'_, '_> {
                             a * (1.0 - t),
                         )
                     };
-                    if has_corner {
+                    // The shape in white (alpha = coverage), then cut and
+                    // coloured along the gradient's keypoints.
+                    let shape = if has_corner {
                         fill_rounded_aa_mesh(
                             fill_rect,
                             fill_r,
                             fill_feather,
                             None,
                             egui::TextureId::default(),
-                            &f,
+                            &|_| Color32::WHITE,
                             true,
                         )
                     } else {
@@ -2156,10 +2179,11 @@ impl Walk<'_, '_> {
                             rect,
                             Rect::from_min_max(egui::epaint::WHITE_UV, egui::epaint::WHITE_UV),
                             egui::TextureId::default(),
-                            &f,
-                            8,
+                            &|_| Color32::WHITE,
+                            1,
                         )
-                    }
+                    };
+                    gr.mesh(shape, &f)
                 }
                 None => {
                     let c = rgba([bg[0] * tint[0], bg[1] * tint[1], bg[2] * tint[2]], a);
@@ -2640,7 +2664,7 @@ impl Walk<'_, '_> {
         let alpha = (1.0 - it) * me.alpha;
         let tint = me.tint;
         let grad = gradient.map(|g| Grad::new(d, g, rect));
-        let col = move |p: Pos2| match &grad {
+        let paint = |p: Pos2| match &grad {
             Some(g) => {
                 let (c, t) = g.at(p);
                 rgba(
@@ -2654,7 +2678,9 @@ impl Walk<'_, '_> {
             }
             None => rgba([ic[0] * tint[0], ic[1] * tint[1], ic[2] * tint[2]], alpha),
         };
-        let steps = if gradient.is_some() { 8 } else { 1 };
+        // Under a UIGradient the shapes are built in white (alpha =
+        // coverage), then cut along its keypoints and coloured (Grad::mesh).
+        let col = |p: Pos2| if grad.is_some() { Color32::WHITE } else { paint(p) };
         let mut meshes: Vec<Mesh> = Vec::new();
         // ScaleType: Stretch 0, Slice 1, Tile 2, Fit 3, Crop 4.
         let scale_type = enum_u32(d.prop(r, "ScaleType")).unwrap_or(0);
@@ -2670,7 +2696,7 @@ impl Walk<'_, '_> {
         let feather = 1.0 / self.ctx.pixels_per_point().max(1e-3);
         let quad = |dst: Rect, uv: Rect| match corner.filter(|c| *c >= 0.5) {
             Some(c) => rounded_quad_mesh(dst, uv, tex, &col, c, feather),
-            None => quad_mesh(dst, uv, tex, &col, steps),
+            None => quad_mesh(dst, uv, tex, &col, 1),
         };
         match scale_type {
             1 => {
@@ -2730,7 +2756,7 @@ impl Walk<'_, '_> {
                                 )),
                                 tex,
                                 &col,
-                                steps,
+                                1,
                             ));
                         }
                     }
@@ -2767,7 +2793,7 @@ impl Walk<'_, '_> {
                                     src.top() + (vis.bottom() - dst.top()) / tsz.y * src.height(),
                                 ),
                             );
-                            meshes.push(quad_mesh(vis, uv_of(s), tex, &col, steps));
+                            meshes.push(quad_mesh(vis, uv_of(s), tex, &col, 1));
                         }
                     }
                 }
@@ -2787,6 +2813,10 @@ impl Walk<'_, '_> {
             _ => meshes.push(quad(rect, uv_of(src))),
         }
         for m in meshes {
+            let m = match &grad {
+                Some(g) => g.mesh(m, &paint),
+                None => m,
+            };
             self.push(Shape::Mesh(m.into()), me);
         }
     }
@@ -2978,23 +3008,25 @@ impl Walk<'_, '_> {
             return (Some([0.0, size]), size <= rect.height() + 0.5);
         }
         let simple = !rich && !truncate && single_line_ascii(&text);
+        let mut fitted = Some(size);
         if scaled {
             let max = tsc
                 .map(|c| num(d, c, "MaxTextSize", 100.0))
                 .unwrap_or(100.0)
                 .min(100.0)
                 * me.scale.max(1.0);
-            let Some(fitted) = self.gui.text_fit.size(ctx, rect.size(), max, simple, &build) else {
-                self.gui.no_cache = Some("text deferred");
-                return (None, false);
-            };
-            size = fitted;
-            if let Some(c) = tsc {
-                size = size.max(num(d, c, "MinTextSize", 1.0) * me.scale);
+            fitted = self.gui.text_fit.size(ctx, rect.size(), max, simple, &build);
+            if let Some(fitted) = fitted {
+                size = fitted;
+                if let Some(c) = tsc {
+                    size = size.max(num(d, c, "MinTextSize", 1.0) * me.scale);
+                }
             }
         }
         size = safe_font_size(size);
-        let galley = {
+        let galley = if fitted.is_none() {
+            None
+        } else {
             let _p = rustudio_core::bench::scope("gui_text_layout");
             if scaled && simple {
                 self.gui.text_fit.layout(ctx, build(size, false)).and_then(|single| {
@@ -3008,8 +3040,12 @@ impl Walk<'_, '_> {
                 self.gui.text_fit.layout(ctx, build(size, wrapped || scaled))
             }
         };
-        let Some(galley) = galley else {
+        if galley.is_none() {
             self.gui.no_cache = Some("text deferred");
+        }
+        // A deferred size or layout (a press's UIScale dip, a tween) draws
+        // the text as it was until its turn comes.
+        let Some(galley) = self.gui.text_fit.drawn(r, galley) else {
             return (None, false);
         };
         let gs = galley.size();
@@ -3839,6 +3875,47 @@ mod layout_tests {
             assert!(l.size[0] <= 250.0 && l.size[0] > 200.0 && l.size[1] > 40.0, "wrapped at the parent's width: {:?}", l.size);
         });
         out.textures_delta.clear();
+    }
+
+    /// A TextScaled label whose new size misses the frame's text budget (a
+    /// press's UIScale dip on a slow machine) draws its last text, not
+    /// nothing, and is walked again next frame (a menu's tab buttons
+    /// went blank on click).
+    #[test]
+    fn deferred_scaled_text_keeps_its_last_text() {
+        let mut doc = Document::new_place();
+        let root = doc.dom.root_ref();
+        let holder = doc.dom.insert(root, InstanceBuilder::new("Frame"));
+        let label = doc.dom.insert(holder, InstanceBuilder::new("TextLabel")
+            .with_property("Text", "CODEX")
+            .with_property("TextScaled", true)
+            .with_property("Size", UDim2::new(UDim::new(1.0, 0), UDim::new(1.0, 0))));
+        let ctx = egui::Context::default();
+        let mut gui = Gui::default();
+        let cam = Camera::default();
+        let mut store = AssetStore::default();
+        let texts = |items: &[Item]| items.iter().filter(|i| i.by == label && matches!(i.shape, Shape::Text(_))).count();
+        for (frame, scale) in [(0, 1.0), (1, 0.9)] {
+            let rect = Rect::from_min_size(Pos2::ZERO, egui::vec2(120.0, 30.0) * scale);
+            let mut input = DrawIn { render_state: None, doc: &doc, cam: &cam, rect, store: &mut store, doc_dir: None, playing: false, fixed_step: true, roots: Default::default() };
+            let mut out = ctx.run_ui(Default::default(), |ui| {
+                let ctx = ui.ctx();
+                gui.text_fit.begin_frame(ctx, frame == 1);
+                gui.no_cache = None;
+                if frame == 1 {
+                    // This frame's budget is already spent.
+                    gui.text_fit.spent = [Duration::from_secs(1); 2];
+                }
+                let mut walk = Walk { gui: &mut gui, ctx, input: &mut input, items: Vec::new(), hits: Vec::new(), seq: 0, boxes: Vec::new(), global_z: false, abs_offset: [0.0; 2], screen: None, cur: Ref::none(), rec: Vec::new(), replaying: 0, table_cells: HashMap::new() };
+                walk.children(holder, rect, Down { aff: Aff::ID, clip: rect, alpha: 1.0, tint: [1.0; 3], scale: 1.0, z: 0, turn: 0.0 });
+                assert_eq!(texts(&walk.items), 1, "frame {frame}: the label's text is drawn");
+                if frame == 1 {
+                    assert_eq!(walk.gui.no_cache, Some("text deferred"));
+                    assert_eq!(walk.gui.text_fit.take_deferred(), 1);
+                }
+            });
+            out.textures_delta.clear();
+        }
     }
 
     /// An AutomaticSize Y list of RelativeXX cards ({1, 0}, {0.5, 0}: as

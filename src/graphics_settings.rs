@@ -52,7 +52,25 @@ impl Editor {
         ui.small(RichText::new("Graphics quality, 3D resolution, shading detail, shadows and the frame limit: File > Studio Settings > rustudio > Performance.").weak());
         #[cfg(target_os = "android")]
         gpu_driver_section(ui);
+        #[cfg(target_os = "android")]
+        shader_section(ui);
+        frame_report_section(ui);
     }
+}
+
+/// The last frame report (perf_report.rs: the same line that goes to the
+/// log every few seconds), to read on the phone and to copy.
+fn frame_report_section(ui: &mut egui::Ui) {
+    let Some(line) = rustudio_player::perf_report::last_line() else { return };
+    ui.separator();
+    ui.horizontal(|ui| {
+        ui.label(RichText::new("Frame report").strong());
+        if ui.small_button("Copy").on_hover_text("Copies the line below (also in the log every few seconds).").clicked() {
+            ui.ctx().copy_text(line.clone());
+        }
+    });
+    ui.small(RichText::new("The last few seconds: frame spacing, CPU and GPU time per frame and where it went, the 3D view's level and size, and what asked for the frames.").weak());
+    ui.add(egui::Label::new(RichText::new(&line).small()).wrap());
 }
 
 /// Android: which Vulkan driver this run has, and the switch for the
@@ -99,6 +117,34 @@ fn gpu_driver_section(ui: &mut egui::Ui) {
     // none of which the window offers yet)
     if st.active && mesa == turnip::Mesa::Turnip {
         turnip_switches(ui);
+    }
+}
+
+/// Android: the shaders are compiled on this device (nothing comes
+/// precompiled), what the startup warm-up and the driver's caches did
+/// this run, and the switch that has the next start compile everything
+/// afresh (src/android/shader_cache.rs).
+#[cfg(target_os = "android")]
+fn shader_section(ui: &mut egui::Ui) {
+    use crate::android::shader_cache;
+    ui.separator();
+    ui.label(RichText::new("Shaders").strong());
+    ui.small(RichText::new("Every shader is compiled on this phone by its driver: at the start, on a worker thread (the warm-up), and at a pass's first use. Nothing comes precompiled from a desktop; the driver's caches below are this phone's own, kept between runs.").weak());
+    ui.small(rustudio_render::render::shader_warmup_summary().unwrap_or_else(|| "Shader warm-up: off this run (RUSTUDIO_SHADER_WARMUP=0, or an OpenGL adapter).".to_string()));
+    ui.small(rustudio_render::pipeline_cache::summary());
+    if let Some(note) = shader_cache::note() {
+        ui.small(note);
+    }
+    let mut rebuild = shader_cache::rebuild_wanted();
+    if ui
+        .checkbox(&mut rebuild, "Rebuild shader caches at the next start")
+        .on_hover_text("Deletes the pipeline cache and Mesa's shader cache, so the next start compiles every shader afresh on this phone (a slower first frame once; the caches fill again). For after a driver update, or when frames stutter where they didn't.")
+        .changed()
+    {
+        shader_cache::set_rebuild(rebuild);
+    }
+    if rebuild {
+        ui.small(RichText::new("Takes effect at the next start.").weak());
     }
 }
 

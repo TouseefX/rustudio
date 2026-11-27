@@ -304,6 +304,9 @@ impl HighlightPass {
             return;
         }
         if self.target.as_ref().is_none_or(|t| t.0 != size) {
+            self.target = None;
+            let oom = device.push_error_scope(wgpu::ErrorFilter::OutOfMemory);
+            let val = device.push_error_scope(wgpu::ErrorFilter::Validation);
             let tex = |label: &str, n: u32, usage: wgpu::TextureUsages| {
                 device
                     .create_texture(&wgpu::TextureDescriptor {
@@ -335,6 +338,16 @@ impl HighlightPass {
                     wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(&one) },
                 ],
             });
+            let val_err = crate::gpu_caps::block_on(val.pop());
+            let oom_err = crate::gpu_caps::block_on(oom.pop());
+            if let Some(err) = oom_err {
+                crate::gpu_health::mark_oom("highlight mask", &err.to_string());
+                return;
+            }
+            if let Some(err) = val_err {
+                log::warn!(target: "rustudio::gpu", "highlight mask creation failed: {err}");
+                return;
+            }
             self.target = Some((size, ms, one, bg));
         }
         let n_inst: usize = list.iter().map(|(_, m)| m.len()).sum();

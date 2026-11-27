@@ -10,7 +10,7 @@ use rustudio_engine::runtime::Side;
 use serde_json::{json, Value as J};
 
 use super::server::ToolResult;
-use super::{project_apply, sessions, tree, Op, Step};
+use super::{project_apply, sessions, tree, BatchUploadEntry, BatchUploadOutcome, Op, ProfileGuard, Step, UploadMeta};
 use crate::app::Editor;
 
 type R<T> = Result<T, String>;
@@ -86,6 +86,8 @@ impl Editor {
             "screenshot" => Ok(Step::Wait(Op::Shot { save: s(a, "path").map(PathBuf::from), requested: false, settled: false, asked: Instant::now() }, Duration::from_secs(40))),
             "list_plugins" => Ok(ToolResult::json(&self.plugins.result_json()).into()),
             "team_create_status" => Ok(ToolResult::json(&self.mcp_live_status()).into()),
+            "capture_profile" => self.mcp_capture_profile(a),
+            "profile_diff" => self.mcp_profile_diff(a).map(Into::into),
             "run_luau" => self.mcp_run_luau(a),
             "set_properties" => self.mcp_writable().and_then(|_| self.mcp_set_properties(a)).map(Into::into),
             "set_source" => self.mcp_writable().and_then(|_| self.mcp_set_source(a)).map(Into::into),
@@ -106,6 +108,8 @@ impl Editor {
             "open_roblox_place" => self.mcp_open_roblox(a),
             "join_team_create" => self.mcp_join(a),
             "save_place" => self.mcp_save_place(a).map(Into::into),
+            "upload_asset" => self.mcp_upload_asset(a),
+            "upload_assets" => self.mcp_upload_assets(a),
             "team_create_commit_drafts" => self.mcp_drafts(a, true).map(Into::into),
             "team_create_discard_drafts" => self.mcp_drafts(a, false).map(Into::into),
             "team_create_wait" => self.mcp_tc_wait(a),
@@ -852,6 +856,301 @@ impl Editor {
         Ok(ToolResult::text(format!("Saved to {} (now the place's file)", file.display())))
     }
 
+    fn mcp_upload_asset(&mut self, a: &J) -> R<Step> {
+        let file = path_arg(a, "file")?;
+        if !file.is_file() {
+            return Err(format!("{} doesn't exist or isn't a file", file.display()));
+        }
+        let mut item = crate::asset_manager::api::classify_import_file(&file).ok_or_else(|| {
+            format!(
+                "Unsupported file format for {} (supported: png, jpg, jpeg, bmp, tga, mp3, ogg, wav, flac, rbxm, rbxmx, fbx, obj, gltf, glb)",
+                file.display()
+            )
+        })?;
+        if let Some(name) = s(a, "display_name").map(str::trim).filter(|n| !n.is_empty()) {
+            item.display_name = name.to_string();
+        }
+        if let Some(desc) = s(a, "description") {
+            item.description = desc.to_string();
+        }
+        if let Some(at) = s(a, "asset_type") {
+            let (asset_type, kind) = parse_asset_type(at)?;
+            item.asset_type = asset_type;
+            item.kind = kind;
+        }
+        let group_id = match a.get("group_id") {
+            None | Some(J::Null) => None,
+            Some(v) => {
+                let g = v.as_u64().filter(|&id| id > 0).ok_or("group_id must be a positive integer")?;
+                Some(g)
+            }
+        };
+        let asset_id = match a.get("asset_id") {
+            None | Some(J::Null) => None,
+            Some(v) => {
+                let id = v.as_u64().filter(|&id| id > 0).ok_or("asset_id must be a positive integer")?;
+                Some(id)
+            }
+        };
+        let expected_price = match a.get("expected_price") {
+            None | Some(J::Null) => None,
+            Some(v) => Some(v.as_u64().ok_or("expected_price must be a non-negative integer")?),
+        };
+        let resolve_image_id = flag(a, "resolve_image_id", true);
+        let (session, user_id) = if std::env::var_os("RUSTUDIO_NO_SESSION").is_some() {
+            None
+        } else {
+            self.game
+                .account
+                .shared_client()
+                .and_then(|c| c.lock().ok().and_then(|g| g.as_ref().map(|c| (c.session.downloader(), c.user_id()))))
+        }
+        .ok_or("Not signed in to a Roblox account (sign in via the account button in the top-right corner).")?;
+        let meta = UploadMeta {
+            display_name: item.display_name.clone(),
+            description: item.description.clone(),
+            asset_type: item.asset_type,
+            kind: item.kind,
+            group_id,
+            user_id,
+            updated: asset_id.is_some(),
+        };
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::Builder::new()
+            .name("rustudio-mcp-upload".into())
+            .spawn(move || {
+                let res = crate::asset_manager::api::upload_import_item_ex(
+                    &session,
+                    &item,
+                    group_id,
+                    asset_id,
+                    expected_price,
+                    resolve_image_id,
+                );
+                let _ = tx.send(res);
+            })
+            .map_err(|e| format!("Could not start upload thread: {e}"))?;
+        Ok(Step::Wait(Op::Upload { rx, meta }, Duration::from_secs(180)))
+    }
+
+    fn mcp_upload_assets(&mut self, a: &J) -> R<Step> {
+        let (jobs, skipped) = collect_batch_upload_items(a)?;
+        if jobs.is_empty() {
+            return Err(format!(
+                "No supported asset files to upload{}",
+                if skipped.is_empty() { String::new() } else { format!(" (skipped {} unsupported file(s))", skipped.len()) }
+            ));
+        }
+        let group_id = match a.get("group_id") {
+            None | Some(J::Null) => None,
+            Some(v) => Some(v.as_u64().filter(|&id| id > 0).ok_or("group_id must be a positive integer")?),
+        };
+        let expected_price = match a.get("expected_price") {
+            None | Some(J::Null) => None,
+            Some(v) => Some(v.as_u64().ok_or("expected_price must be a non-negative integer")?),
+        };
+        let resolve_image_id = flag(a, "resolve_image_id", true);
+        let concurrency = num(a, "concurrency").unwrap_or(12.0).clamp(1.0, 32.0) as usize;
+        let manifest_path = match a.get("manifest_path") {
+            None | Some(J::Null) => None,
+            Some(_) => Some(path_arg(a, "manifest_path")?),
+        };
+        let (session, user_id) = if std::env::var_os("RUSTUDIO_NO_SESSION").is_some() {
+            None
+        } else {
+            self.game
+                .account
+                .shared_client()
+                .and_then(|c| c.lock().ok().and_then(|g| g.as_ref().map(|c| (c.session.downloader(), c.user_id()))))
+        }
+        .ok_or("Not signed in to a Roblox account (sign in via the account button in the top-right corner).")?;
+
+        let total = jobs.len();
+        let timeout_secs = (total as u64 * 15).clamp(180, 1140);
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::Builder::new()
+            .name("rustudio-mcp-upload-batch".into())
+            .spawn(move || {
+                use std::sync::atomic::{AtomicUsize, Ordering};
+                use std::sync::{Arc, Mutex};
+
+                let started = Instant::now();
+                let slots: Arc<Mutex<Vec<Option<BatchUploadEntry>>>> =
+                    Arc::new(Mutex::new((0..total).map(|_| None).collect()));
+                let jobs = Arc::new(jobs);
+
+                let run_one = |sess: &rustudio_account::session::Session, idx: usize| -> BatchUploadEntry {
+                    let (item, asset_id) = &jobs[idx];
+                    let t0 = Instant::now();
+                    let result = crate::asset_manager::api::upload_import_item_ex(
+                        sess,
+                        item,
+                        group_id,
+                        *asset_id,
+                        expected_price,
+                        resolve_image_id,
+                    );
+                    BatchUploadEntry {
+                        file: item.path.clone(),
+                        display_name: item.display_name.clone(),
+                        description: item.description.clone(),
+                        asset_type: item.asset_type,
+                        kind: item.kind,
+                        updated: asset_id.is_some(),
+                        ms: t0.elapsed().as_millis(),
+                        result,
+                    }
+                };
+
+                // Warm CSRF on the first item if the session doesn't hold a token yet so the
+                // worker pool doesn't all race into duplicate 403 uploads simultaneously.
+                let start_idx = if !session.csrf_token_held() && total > 1 {
+                    let entry = run_one(&session, 0);
+                    slots.lock().unwrap()[0] = Some(entry);
+                    1
+                } else {
+                    0
+                };
+
+                let remaining = total.saturating_sub(start_idx);
+                let workers = concurrency.min(remaining.max(1));
+                let next = Arc::new(AtomicUsize::new(start_idx));
+                let mut handles = Vec::with_capacity(workers);
+                for w in 0..workers {
+                    let sess = session.downloader();
+                    let jobs = jobs.clone();
+                    let slots = slots.clone();
+                    let next = next.clone();
+                    let builder = std::thread::Builder::new().name(format!("rustudio-mcp-up-{w}"));
+                    if let Ok(h) = builder.spawn(move || loop {
+                        let idx = next.fetch_add(1, Ordering::Relaxed);
+                        if idx >= jobs.len() {
+                            break;
+                        }
+                        let (item, asset_id) = &jobs[idx];
+                        let t0 = Instant::now();
+                        let result = crate::asset_manager::api::upload_import_item_ex(
+                            &sess,
+                            item,
+                            group_id,
+                            *asset_id,
+                            expected_price,
+                            resolve_image_id,
+                        );
+                        let entry = BatchUploadEntry {
+                            file: item.path.clone(),
+                            display_name: item.display_name.clone(),
+                            description: item.description.clone(),
+                            asset_type: item.asset_type,
+                            kind: item.kind,
+                            updated: asset_id.is_some(),
+                            ms: t0.elapsed().as_millis(),
+                            result,
+                        };
+                        slots.lock().unwrap()[idx] = Some(entry);
+                    }) {
+                        handles.push(h);
+                    }
+                }
+                for h in handles {
+                    let _ = h.join();
+                }
+
+                let entries: Vec<BatchUploadEntry> = slots
+                    .lock()
+                    .unwrap()
+                    .iter_mut()
+                    .filter_map(Option::take)
+                    .collect();
+                let _ = tx.send(BatchUploadOutcome {
+                    entries,
+                    skipped,
+                    elapsed_s: started.elapsed().as_secs_f64(),
+                    group_id,
+                    user_id,
+                    manifest_path,
+                });
+            })
+            .map_err(|e| format!("Could not start batch upload thread: {e}"))?;
+        Ok(Step::Wait(Op::UploadBatch { rx }, Duration::from_secs(timeout_secs)))
+    }
+
+    // ---------------------------------------------------------------- profiling
+
+    fn mcp_capture_profile(&mut self, a: &J) -> R<Step> {
+        if self.mcp.pending.iter().any(|p| matches!(p.op, Op::Profile { .. })) {
+            return Err("A profile capture is already in progress in this window.".into());
+        }
+        let seconds = num(a, "seconds").unwrap_or(3.0).clamp(0.2, 60.0);
+        let exact = flag(a, "exact", false);
+        let capture_scripts = flag(a, "scripts", true) || exact;
+        let sample_hz = num(a, "sample_hz").map(|h| h.clamp(50.0, 10_000.0) as u32);
+        let instr = flag(a, "instr", false);
+        let gpu = flag(a, "gpu", true);
+        let top = num(a, "top").unwrap_or(25.0).clamp(1.0, 200.0) as usize;
+        let spikes = num(a, "spikes").unwrap_or(5.0).clamp(0.0, 50.0) as usize;
+        let save_path = match a.get("save_path") {
+            None | Some(J::Null) => None,
+            Some(_) => Some(path_arg(a, "save_path")?),
+        };
+
+        let prev_cfg = rustudio_core::profiler::config();
+        let was_paused = rustudio_core::profiler::status().paused;
+        let prev_script_live = rustudio_engine::script_profiler::live();
+        let prev_script_recording = rustudio_engine::script_profiler::recording();
+        let prev_script_exact = rustudio_engine::script_profiler::exact();
+        let prev_sample_hz = rustudio_engine::script_profiler::sample_hz();
+
+        let mut cfg = prev_cfg.clone();
+        cfg.history_secs = cfg.history_secs.max(seconds as f32 + 2.0);
+        cfg.instr_mode = instr;
+        cfg.gpu_timing = gpu;
+        rustudio_core::profiler::set_context(&format!("{} · {}", self.mcp_mode(), self.game.doc.title));
+        rustudio_core::profiler::set_config(cfg);
+        rustudio_core::profiler::enable();
+        rustudio_core::profiler::resume();
+        rustudio_core::profiler::clear();
+
+        if capture_scripts {
+            if let Some(hz) = sample_hz {
+                rustudio_engine::script_profiler::set_sample_hz(hz);
+            }
+            if exact {
+                rustudio_engine::script_profiler::set_exact(true);
+                rustudio_engine::script_profiler::clear_recording();
+            } else {
+                rustudio_engine::script_profiler::set_exact(false);
+                rustudio_engine::script_profiler::start_recording(true);
+            }
+        }
+
+        let guard = ProfileGuard::new(
+            prev_cfg,
+            was_paused,
+            capture_scripts,
+            prev_script_live,
+            prev_script_recording,
+            prev_script_exact,
+            prev_sample_hz,
+        );
+        Ok(Step::Wait(
+            Op::Profile {
+                started: Instant::now(),
+                duration: Duration::from_secs_f64(seconds),
+                top,
+                spikes,
+                save_path,
+                capture_scripts,
+                guard,
+            },
+            Duration::from_secs_f64(seconds + 30.0),
+        ))
+    }
+
+    fn mcp_profile_diff(&self, a: &J) -> R<ToolResult> {
+        profile_diff(a)
+    }
+
     // ---------------------------------------------------------------- live
 
     fn mcp_drafts(&mut self, a: &J, commit: bool) -> R<ToolResult> {
@@ -988,6 +1287,168 @@ impl Editor {
                 r.is_error = !ok;
                 Some(r)
             }
+            Op::Upload { rx, meta } => match rx.try_recv() {
+                Ok(Ok(uploaded)) => {
+                    let asset_id = uploaded.asset_id;
+                    self.asset_manager.record_upload(
+                        asset_id,
+                        meta.display_name.clone(),
+                        meta.description.clone(),
+                        meta.kind,
+                        meta.group_id,
+                    );
+                    self.info(format!(
+                        "{} \"{}\" (rbxassetid://{asset_id})",
+                        if meta.updated { "Updated" } else { "Uploaded" },
+                        meta.display_name
+                    ));
+                    let creator = match meta.group_id {
+                        Some(gid) => json!({ "group_id": gid }),
+                        None => json!({ "user_id": meta.user_id }),
+                    };
+                    let mut body = json!({
+                        "asset_id": asset_id,
+                        "content_id": format!("rbxassetid://{asset_id}"),
+                        "asset_type": meta.asset_type,
+                        "display_name": meta.display_name,
+                        "updated": meta.updated,
+                        "creator": creator,
+                    });
+                    if let Some(rev) = uploaded.revision_id {
+                        body["revision_id"] = json!(rev);
+                    }
+                    if let Some(img_id) = uploaded.image_asset_id {
+                        body["image_asset_id"] = json!(img_id);
+                        body["image_content_id"] = json!(format!("rbxassetid://{img_id}"));
+                    }
+                    Some(ToolResult::json(&body))
+                }
+                Ok(Err(e)) => {
+                    self.error(format!("Upload failed for \"{}\": {e}", meta.display_name));
+                    Some(ToolResult::error(e))
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => None,
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    Some(ToolResult::error("Asset upload thread stopped unexpectedly"))
+                }
+            },
+            Op::UploadBatch { rx } => match rx.try_recv() {
+                Ok(outcome) => {
+                    let mut assets = Vec::new();
+                    let mut errors = Vec::new();
+                    for e in outcome.entries {
+                        match e.result {
+                            Ok(uploaded) => {
+                                self.asset_manager.record_upload(
+                                    uploaded.asset_id,
+                                    e.display_name.clone(),
+                                    e.description.clone(),
+                                    e.kind,
+                                    outcome.group_id,
+                                );
+                                let mut row = json!({
+                                    "file": e.file.display().to_string(),
+                                    "display_name": e.display_name,
+                                    "asset_type": e.asset_type,
+                                    "asset_id": uploaded.asset_id,
+                                    "content_id": format!("rbxassetid://{}", uploaded.asset_id),
+                                    "updated": e.updated,
+                                    "ms": e.ms,
+                                });
+                                if let Some(rev) = uploaded.revision_id {
+                                    row["revision_id"] = json!(rev);
+                                }
+                                if let Some(img_id) = uploaded.image_asset_id {
+                                    row["image_asset_id"] = json!(img_id);
+                                    row["image_content_id"] = json!(format!("rbxassetid://{img_id}"));
+                                }
+                                assets.push(row);
+                            }
+                            Err(err) => {
+                                errors.push(json!({
+                                    "file": e.file.display().to_string(),
+                                    "display_name": e.display_name,
+                                    "error": err,
+                                    "ms": e.ms,
+                                }));
+                            }
+                        }
+                    }
+                    let succeeded = assets.len();
+                    let failed = errors.len();
+                    let total = succeeded + failed;
+                    if failed == 0 {
+                        self.info(format!("Uploaded {succeeded}/{total} assets in {:.2}s", outcome.elapsed_s));
+                    } else {
+                        self.warn(format!("Uploaded {succeeded}/{total} assets ({failed} failed) in {:.2}s", outcome.elapsed_s));
+                    }
+                    let creator = match outcome.group_id {
+                        Some(gid) => json!({ "group_id": gid }),
+                        None => json!({ "user_id": outcome.user_id }),
+                    };
+                    let mut body = json!({
+                        "total": total,
+                        "succeeded": succeeded,
+                        "failed": failed,
+                        "skipped": outcome.skipped,
+                        "elapsed_s": (outcome.elapsed_s * 100.0).round() / 100.0,
+                        "creator": creator,
+                        "assets": assets,
+                        "errors": errors,
+                    });
+                    if let Some(p) = outcome.manifest_path.as_deref() {
+                        if let Some(dir) = p.parent() {
+                            if let Err(e) = std::fs::create_dir_all(dir) {
+                                return Some(ToolResult::error(format!("{}: {e}", dir.display())));
+                            }
+                        }
+                        match serde_json::to_string_pretty(&body)
+                            .map_err(|e| e.to_string())
+                            .and_then(|txt| std::fs::write(p, txt).map_err(|e| e.to_string()))
+                        {
+                            Ok(()) => body["manifest_path"] = json!(p.display().to_string()),
+                            Err(e) => body["manifest_error"] = json!(e),
+                        }
+                    }
+                    let mut r = ToolResult::json(&body);
+                    r.is_error = succeeded == 0 && failed > 0;
+                    Some(r)
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => None,
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    Some(ToolResult::error("Batch asset upload thread stopped unexpectedly"))
+                }
+            },
+            Op::Profile { started, duration, top, spikes, save_path, capture_scripts, guard } => {
+                ctx.request_repaint();
+                if started.elapsed() < *duration {
+                    return None;
+                }
+                rustudio_core::profiler::pause();
+                let mut cap = rustudio_core::profiler::snapshot();
+                if *capture_scripts && !cap.extensions.contains_key("scripts") {
+                    let snap = rustudio_engine::script_profiler::snapshot();
+                    if !snap.scripts.is_empty() || snap.samples > 0 {
+                        cap.extensions.insert("scripts".into(), snap.to_json());
+                    }
+                }
+                guard.restore();
+                if let Some(p) = save_path.as_deref() {
+                    if let Some(dir) = p.parent() {
+                        if let Err(e) = std::fs::create_dir_all(dir) {
+                            return Some(ToolResult::error(format!("{}: {e}", dir.display())));
+                        }
+                    }
+                    if let Err(e) = rustudio_core::profiler::export::save(&cap, p) {
+                        return Some(ToolResult::error(format!("{}: {e}", p.display())));
+                    }
+                }
+                let mut report = rustudio_core::profiler::report::report_json(&cap, *top, *spikes);
+                if let Some(p) = save_path.as_deref() {
+                    report["saved_to"] = json!(p.display().to_string());
+                }
+                Some(ToolResult::json(&report))
+            }
         }
     }
 
@@ -1020,6 +1481,9 @@ impl Editor {
                 r.is_error = true;
                 r
             }
+            Op::Upload { .. } => ToolResult::error("Asset upload timed out after 3 minutes"),
+            Op::UploadBatch { .. } => ToolResult::error("Batch asset upload timed out"),
+            Op::Profile { .. } => ToolResult::error("Profile capture timed out"),
         }
     }
 
@@ -1090,8 +1554,125 @@ fn shot_result(w: u32, h: u32, mut rgba: Vec<u8>, save: Option<&Path>, settled: 
     }
 }
 
+fn profile_diff(a: &J) -> R<ToolResult> {
+    let before = path_arg(a, "before")?;
+    let after = path_arg(a, "after")?;
+    let top = num(a, "top").unwrap_or(25.0).clamp(1.0, 200.0) as usize;
+    let ca = rustudio_core::profiler::export::open(&before).map_err(|e| format!("{}: {e}", before.display()))?;
+    let cb = rustudio_core::profiler::export::open(&after).map_err(|e| format!("{}: {e}", after.display()))?;
+    Ok(ToolResult::json(&rustudio_core::profiler::report::diff_json(&ca, &cb, top)))
+}
+
+fn collect_dir_files(dir: &Path, recursive: bool, out: &mut Vec<PathBuf>) -> R<()> {
+    let entries = std::fs::read_dir(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+    let mut paths: Vec<PathBuf> = entries.flatten().map(|e| e.path()).collect();
+    paths.sort();
+    for p in paths {
+        if p.is_dir() {
+            if recursive {
+                collect_dir_files(&p, true, out)?;
+            }
+        } else if p.is_file() {
+            out.push(p);
+        }
+    }
+    Ok(())
+}
+
+/// Parses `dir` and/or `files` for `upload_assets` into `(upload_jobs, skipped_files)`.
+fn collect_batch_upload_items(a: &J) -> R<(Vec<(crate::asset_manager::ImportItem, Option<u64>)>, Vec<String>)> {
+    let has_dir = a.get("dir").is_some_and(|v| !v.is_null());
+    let has_files = a.get("files").is_some_and(|v| !v.is_null());
+    if !has_dir && !has_files {
+        return Err("Provide \"dir\" and/or \"files\" to upload_assets".into());
+    }
+    let mut jobs = Vec::new();
+    let mut skipped = Vec::new();
+    if has_dir {
+        let dir = path_arg(a, "dir")?;
+        if !dir.is_dir() {
+            return Err(format!("{} doesn't exist or isn't a directory", dir.display()));
+        }
+        let recursive = flag(a, "recursive", false);
+        let mut found = Vec::new();
+        collect_dir_files(&dir, recursive, &mut found)?;
+        for p in found {
+            match crate::asset_manager::api::classify_import_file(&p) {
+                Some(item) => jobs.push((item, None)),
+                None => skipped.push(p.display().to_string()),
+            }
+        }
+    }
+    if has_files {
+        let arr = a
+            .get("files")
+            .and_then(|v| v.as_array())
+            .ok_or("\"files\" must be an array of file paths or objects")?;
+        for entry in arr {
+            let (file, display_name, description, asset_type, asset_id) = match entry {
+                J::String(p) => {
+                    let pb = PathBuf::from(p);
+                    if !pb.is_absolute() {
+                        return Err(format!("{p:?} must be an absolute path"));
+                    }
+                    (pb, None, None, None, None)
+                }
+                J::Object(_) => {
+                    let pb = path_arg(entry, "file")?;
+                    let dn = s(entry, "display_name").map(str::trim).filter(|n| !n.is_empty()).map(str::to_string);
+                    let desc = s(entry, "description").map(str::to_string);
+                    let at = s(entry, "asset_type").map(str::to_string);
+                    let aid = match entry.get("asset_id") {
+                        None | Some(J::Null) => None,
+                        Some(v) => Some(v.as_u64().filter(|&id| id > 0).ok_or("asset_id must be a positive integer")?),
+                    };
+                    (pb, dn, desc, at, aid)
+                }
+                _ => return Err("Each entry in \"files\" must be a string path or an object with \"file\"".into()),
+            };
+            if !file.is_file() {
+                return Err(format!("{} doesn't exist or isn't a file", file.display()));
+            }
+            let mut item = crate::asset_manager::api::classify_import_file(&file).ok_or_else(|| {
+                format!(
+                    "Unsupported file format for {} (supported: png, jpg, jpeg, bmp, tga, mp3, ogg, wav, flac, rbxm, rbxmx, fbx, obj, gltf, glb)",
+                    file.display()
+                )
+            })?;
+            if let Some(name) = display_name {
+                item.display_name = name;
+            }
+            if let Some(desc) = description {
+                item.description = desc;
+            }
+            if let Some(at) = asset_type {
+                let (t, k) = parse_asset_type(&at)?;
+                item.asset_type = t;
+                item.kind = k;
+            }
+            jobs.push((item, asset_id));
+        }
+    }
+    Ok((jobs, skipped))
+}
+
+/// Maps an explicit `asset_type` override to the Roblox Assets API type and
+/// Asset Manager kind.
+fn parse_asset_type(s: &str) -> R<(&'static str, crate::asset_manager::AssetKind)> {
+    use crate::asset_manager::AssetKind;
+    match s {
+        "Decal" | "Image" => Ok(("Decal", AssetKind::Image)),
+        "Audio" => Ok(("Audio", AssetKind::Audio)),
+        "Model" => Ok(("Model", AssetKind::Model)),
+        "Animation" => Ok(("Animation", AssetKind::Animation)),
+        other => Err(format!("Unsupported asset_type {other:?} (expected Decal, Image, Audio, Model, or Animation)")),
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use serde_json::json;
+
     #[test]
     fn base64_matches_the_standard() {
         assert_eq!(super::base64(b""), "");
@@ -1099,5 +1680,119 @@ mod tests {
         assert_eq!(super::base64(b"fo"), "Zm8=");
         assert_eq!(super::base64(b"foo"), "Zm9v");
         assert_eq!(super::base64(b"foobar"), "Zm9vYmFy");
+    }
+
+    #[test]
+    fn parse_asset_type_maps_known_types_and_rejects_unknown() {
+        use crate::asset_manager::AssetKind;
+        assert_eq!(super::parse_asset_type("Decal").unwrap(), ("Decal", AssetKind::Image));
+        assert_eq!(super::parse_asset_type("Image").unwrap(), ("Decal", AssetKind::Image));
+        assert_eq!(super::parse_asset_type("Audio").unwrap(), ("Audio", AssetKind::Audio));
+        assert_eq!(super::parse_asset_type("Model").unwrap(), ("Model", AssetKind::Model));
+        assert_eq!(super::parse_asset_type("Animation").unwrap(), ("Animation", AssetKind::Animation));
+        assert!(super::parse_asset_type("Place").is_err());
+    }
+
+    #[test]
+    fn profile_diff_compares_saved_rsprof_captures() {
+        let dir = std::env::temp_dir().join(format!("rustudio-mcp-prof-diff-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let a_path = dir.join("a.rsprof");
+        let b_path = dir.join("b.rsprof");
+        let cap = rustudio_core::profiler::Capture::new();
+        rustudio_core::profiler::export::save(&cap, &a_path).unwrap();
+        rustudio_core::profiler::export::save(&cap, &b_path).unwrap();
+
+        let res = super::profile_diff(&json!({
+            "before": a_path.display().to_string(),
+            "after": b_path.display().to_string(),
+            "top": 5
+        }))
+        .unwrap();
+        assert!(!res.is_error);
+        let text = res.summary();
+        let v: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(v["schema"].as_str(), Some("rustudio-profile-diff/1"));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn profile_guard_restores_profiler_on_drop() {
+        let prev_cfg = rustudio_core::profiler::config();
+        let was_enabled = rustudio_core::profiler::is_enabled();
+        let was_paused = rustudio_core::profiler::status().paused;
+        let prev_live = rustudio_engine::script_profiler::live();
+        let prev_rec = rustudio_engine::script_profiler::recording();
+        let prev_exact = rustudio_engine::script_profiler::exact();
+        let prev_hz = rustudio_engine::script_profiler::sample_hz();
+
+        rustudio_core::profiler::enable();
+        rustudio_engine::script_profiler::set_sample_hz(500);
+        rustudio_engine::script_profiler::start_recording(true);
+        {
+            let _guard = super::ProfileGuard::new(
+                prev_cfg.clone(),
+                was_paused,
+                true,
+                prev_live,
+                prev_rec,
+                prev_exact,
+                prev_hz,
+            );
+            assert!(rustudio_core::profiler::is_enabled());
+            assert!(rustudio_engine::script_profiler::recording());
+        }
+        assert_eq!(rustudio_core::profiler::is_enabled(), was_enabled);
+        assert_eq!(rustudio_engine::script_profiler::recording(), prev_rec);
+        assert_eq!(rustudio_engine::script_profiler::live(), prev_live);
+        assert_eq!(rustudio_engine::script_profiler::exact(), prev_exact);
+        assert_eq!(rustudio_engine::script_profiler::sample_hz(), prev_hz);
+    }
+
+    #[test]
+    fn collect_batch_upload_items_scans_dir_and_parses_file_objects() {
+        let dir = std::env::temp_dir().join(format!("rustudio-mcp-batch-{}", std::process::id()));
+        let sub = dir.join("nested");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&sub).unwrap();
+        let a_png = dir.join("a.png");
+        let b_txt = dir.join("notes.txt");
+        let c_glb = sub.join("c.glb");
+        std::fs::write(&a_png, b"png").unwrap();
+        std::fs::write(&b_txt, b"ignore").unwrap();
+        std::fs::write(&c_glb, b"glb").unwrap();
+
+        // Non-recursive scan skips notes.txt and nested/c.glb
+        let (jobs, skipped) = super::collect_batch_upload_items(&json!({
+            "dir": dir.display().to_string(),
+        }))
+        .unwrap();
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(jobs[0].0.display_name, "a");
+        assert_eq!(skipped.len(), 1);
+
+        // Recursive scan picks up nested/c.glb too
+        let (jobs, skipped) = super::collect_batch_upload_items(&json!({
+            "dir": dir.display().to_string(),
+            "recursive": true,
+        }))
+        .unwrap();
+        assert_eq!(jobs.len(), 2);
+        assert_eq!(skipped.len(), 1);
+
+        // Explicit files array with object overrides
+        let (jobs, _) = super::collect_batch_upload_items(&json!({
+            "files": [
+                a_png.display().to_string(),
+                { "file": c_glb.display().to_string(), "display_name": "HeroMesh", "asset_id": 42 }
+            ]
+        }))
+        .unwrap();
+        assert_eq!(jobs.len(), 2);
+        assert_eq!(jobs[1].0.display_name, "HeroMesh");
+        assert_eq!(jobs[1].1, Some(42));
+
+        assert!(super::collect_batch_upload_items(&json!({})).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

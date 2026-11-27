@@ -191,6 +191,7 @@ fn compute(class: rbx_dom_weak::Ustr, key: &str) -> Route {
         _ => Special::None,
     };
     let core_special = (c == "Bone" && matches!(key, "TransformedCFrame" | "TransformedWorldCFrame"))
+        || (key == "Font" && crate::font_enum::has_font_view(c))
         || (doc::is_a(c, "Attachment")
             && matches!(
                 key,

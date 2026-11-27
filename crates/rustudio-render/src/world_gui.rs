@@ -820,6 +820,80 @@ fn fs_fx_sparkles(in: VOut) -> @location(0) vec4<f32> {
     let f19 = 1.0 - fog_amount(in.dist);
     return vec4<f32>(f15 * f19, (in.alpha_mul * f2) * (in.color.a * f19));
 }
+
+// Direct-to-HDR fallback entry points used when VRAM is too tight to allocate
+// the intermediate R10G10B10A2 sqrt-blend target: keeps all particles, beams,
+// trails, sparkles, and world GUIs rendering with zero extra target VRAM.
+@fragment
+fn fs_hdr_gui(in: VOut) -> @location(0) vec4<f32> {
+    let t = textureSample(tex, samp, in.uv);
+    let g = in.color * t;
+    let s = textureLoad(scene_depth, vec2<i32>(floor(in.pos.xy)), 0);
+    if (g.a <= 0.0 || in.depth < s * (1.0 - 0.0015)) {
+        discard;
+    }
+    var lin = (g.rgb / g.a) * (g.rgb / g.a) * in.light;
+    lin = mix(lin, tone.fog_rgb.rgb, fog_amount(in.dist));
+    let cap = 1.0 / max(tone.fog_rgb.w, 1e-6);
+    let out_c = clamp(lin, vec3<f32>(0.0), vec3<f32>(cap));
+    return vec4<f32>(out_c * g.a, g.a);
+}
+
+@fragment
+fn fs_hdr_strip(in: VOut) -> @location(0) vec4<f32> {
+    let f0 = textureSample(tex, samp, in.uv);
+    let s = textureLoad(scene_depth, vec2<i32>(floor(in.pos.xy)), 0);
+    let base_a = in.color.a * f0.a;
+    if (base_a <= 0.0 || in.pos.z < s * (1.0 - 0.0015)) {
+        discard;
+    }
+    let c = f0.rgb * in.color.rgb;
+    let lin = c * c * beam_light(in);
+    let a = base_a * (1.0 - fog_amount(in.dist));
+    let cap = 1.0 / max(tone.fog_rgb.w, 1e-6);
+    let out_c = clamp(lin, vec3<f32>(0.0), vec3<f32>(cap));
+    return vec4<f32>(out_c * a, a * in.alpha_mul);
+}
+
+@fragment
+fn fs_hdr_particle(in: VOut) -> @location(0) vec4<f32> {
+    let f0 = textureSample(tex, samp, in.uv);
+    let f1 = textureSample(tex, samp, in.uv2);
+    let s = textureLoad(scene_depth, vec2<i32>(floor(in.pos.xy)), 0);
+    let tex_a = mix(f0.a, f1.a, in.blend);
+    if (in.color.a * tex_a <= 0.0 || in.pos.z < s * (1.0 - 0.0015)) {
+        discard;
+    }
+    let c = mix(f0.rgb * f0.a, f1.rgb * f1.a, in.blend) * in.color.rgb;
+    let lin = c * c * in.light;
+    let cap = 1.0 / max(tone.fog_rgb.w, 1e-6);
+    let out_c = clamp(lin, vec3<f32>(0.0), vec3<f32>(cap));
+    var v_a = in.color.a * (1.0 - fog_amount(in.dist));
+    if (in.soft.x > 0.0) {
+        let sd = select(SOFT_DEPTH_MAX, min(tone.e_on.z / max(s, 1e-9), SOFT_DEPTH_MAX), s > 0.0);
+        let pd = min(in.vw - in.soft.y, SOFT_DEPTH_MAX - 1.0 / in.soft.x);
+        v_a *= clamp(abs(sd - pd) * in.soft.x, 0.0, 1.0);
+    }
+    return vec4<f32>(out_c * v_a, v_a * tex_a * in.alpha_mul);
+}
+
+@fragment
+fn fs_hdr_sparkles(in: VOut) -> @location(0) vec4<f32> {
+    let f0 = textureSample(tex, samp, in.uv);
+    let s = textureLoad(scene_depth, vec2<i32>(floor(in.pos.xy)), 0);
+    let f2 = f0.a;
+    if (in.color.a * f2 <= 0.0 || in.pos.z < s * (1.0 - 0.0015)) {
+        discard;
+    }
+    let f1 = in.light;
+    let f3 = f2 * 2.0;
+    let f7 = select(mix(f1, f0.rgb, vec3<f32>(f3 - 1.0)), f1 * f3, f2 < 0.5);
+    let f11 = f7 * in.color.a;
+    let cap = 1.0 / max(tone.fog_rgb.w, 1e-6);
+    let out_c = clamp(f11 * f11, vec3<f32>(0.0), vec3<f32>(cap));
+    let f19 = 1.0 - fog_amount(in.dist);
+    return vec4<f32>(out_c * f19, (in.alpha_mul * f2) * (in.color.a * f19));
+}
 "#;
 
 /// The effects' buffer: encodes linear HDR into Studio's R10G10B10A2 scene
@@ -891,16 +965,8 @@ pub struct WorldGuiPass {
     /// on first use. Keyed by egui's texture; the copy, its view, and the
     /// frame each was last used (and, for the font atlas, refilled).
     mips: std::collections::HashMap<wgpu::Texture, (wgpu::Texture, wgpu::TextureView, u64, TextureRevision)>,
-    /// Static textures' mip copies being made on another thread (None: the
-    /// device refused the copy's memory).
-    mips_making: std::collections::HashMap<wgpu::Texture, std::sync::mpsc::Receiver<Option<(wgpu::Texture, wgpu::TextureView)>>>,
-    /// Textures whose mip copy the device refused (out of memory, or over
-    /// [`mip_budget`]) and the frame it did: drawn from egui's own texture,
-    /// unmipped, until [`MIP_RETRY_FRAMES`] later — not asked again every
-    /// frame (a refused copy left in `mips` fails every view and bind group
-    /// made from it, and a phone's driver gives up the device after enough
-    /// of those: 2026-11-23 crash reports).
-    mips_refused: std::collections::HashMap<wgpu::Texture, u64>,
+    /// Static textures' mip copies being made on another thread.
+    mips_making: std::collections::HashMap<wgpu::Texture, std::sync::mpsc::Receiver<(wgpu::Texture, wgpu::TextureView)>>,
     /// Let-go mip copies waiting to be freed a few at a time (and whether
     /// they may be destroyed).
     mips_release: std::collections::VecDeque<(wgpu::Texture, bool)>,
@@ -917,6 +983,11 @@ pub struct WorldGuiPass {
     strip_pipeline: wgpu::RenderPipeline,
     particle_pipeline: wgpu::RenderPipeline,
     sparkles_pipeline: wgpu::RenderPipeline,
+    /// Direct-to-HDR fallback pipelines when `fx_tex` cannot be allocated.
+    hdr_fx_pipeline: wgpu::RenderPipeline,
+    hdr_strip_pipeline: wgpu::RenderPipeline,
+    hdr_particle_pipeline: wgpu::RenderPipeline,
+    hdr_sparkles_pipeline: wgpu::RenderPipeline,
     /// The frame's local lights (render.rs lights_buf) and how many.
     pub lights: wgpu::Buffer,
     pub n_lights: u32,
@@ -936,6 +1007,10 @@ pub struct WorldGuiPass {
     fx_in: wgpu::RenderPipeline,
     fx_out: wgpu::RenderPipeline,
     fx_tex: Option<([u32; 2], wgpu::TextureView)>,
+    /// Frame at which to retry allocating `fx_tex` after an OOM fallback.
+    fx_tex_retry_at: u64,
+    /// Last `gpu_health::oom_epoch()` reacted to by purging optional mips.
+    last_oom_epoch: u64,
 }
 
 /// The scene's HDR format (render.rs HDR_FORMAT) and Studio's R10G10B10A2
@@ -965,22 +1040,24 @@ enum Kind {
     Sparkles,
 }
 
-/// Copies `data` into `target` through the staging belt. False when the
-/// belt's buffer can't be mapped: wgpu destroys every buffer once the device
-/// is lost (a phone's driver reclaiming the GPU after an out-of-memory,
-/// Android crash report 2026-11-24), and `StagingBelt::write_buffer` panics
-/// on one ("Failed to get mapped range for staging belt buffer") in the
-/// frame the loss is reported, before the frame's watch can end the run in
-/// order (src/android gpu_watch). The caller draws nothing instead.
+/// Copies `data` into `target` through the staging belt. Nothing is copied
+/// when the belt's buffer can't be mapped: wgpu destroys every buffer once
+/// the device is lost (a phone's driver reclaiming the GPU after an
+/// out-of-memory, Android crash report 2026-11-24), and
+/// `StagingBelt::write_buffer` panics on one ("Failed to get mapped range
+/// for staging belt buffer") in the frame the loss is reported, before the
+/// frame's watch can end the run in order (src/android gpu_watch). The
+/// loss is marked (`gpu_health::mark_lost`) and the frame draws stale data,
+/// which the watch replaces with the recovery screen.
 fn stage(
     staging: &mut wgpu::util::StagingBelt,
     target: &wgpu::Buffer,
     encoder: &mut wgpu::CommandEncoder,
     data: &[u8],
-) -> bool {
-    let Some(size) = wgpu::BufferSize::new(data.len() as u64) else { return true };
+) {
+    let Some(size) = wgpu::BufferSize::new(data.len() as u64) else { return };
     if crate::gpu_health::lost().is_some() {
-        return false;
+        return;
     }
     let slice = staging.allocate(size, wgpu::BufferSize::new(wgpu::COPY_BUFFER_ALIGNMENT).expect("non-zero"));
     match slice.get_mapped_range_mut() {
@@ -988,13 +1065,11 @@ fn stage(
             view.copy_from_slice(data);
             drop(view);
             encoder.copy_buffer_to_buffer(slice.buffer(), slice.offset(), target, 0, size.get());
-            true
         }
         Err(e) => {
             static ONCE: std::sync::Once = std::sync::Once::new();
             ONCE.call_once(|| log::error!(target: "rustudio::gpu", "world GUI upload: staging buffer can't be mapped ({e}); the world GUIs and effects stop drawing"));
             crate::gpu_health::mark_lost(format!("GPU buffers are gone (staging buffer can't be mapped: {e})"));
-            false
         }
     }
 }
@@ -1016,31 +1091,92 @@ fn fx_constants() -> String {
     )
 }
 
-/// Writes `data` into the kept buffer `slot`, growing it (to the next power
-/// of two) when it doesn't fit.
-fn fill(
+fn mip_tex_bytes(tex: &wgpu::Texture) -> usize {
+    let s = tex.size();
+    (s.width as usize).saturating_mul(s.height as usize).saturating_mul(16) / 3
+}
+
+/// Ensures `slot` holds a buffer of at least `len` bytes (growing to the next
+/// power of two), catching `OutOfMemory` so an invalid buffer never poisons
+/// the command encoder. On OOM, drops the old buffer first and retries exact /
+/// reduced capacities so partial effects still draw instead of vanishing.
+fn ensure_buf(
     device: &wgpu::Device,
-    staging: &mut wgpu::util::StagingBelt,
-    encoder: &mut wgpu::CommandEncoder,
     slot: &mut Option<wgpu::Buffer>,
     usage: wgpu::BufferUsages,
-    data: &[u8],
-) -> bool {
-    if data.is_empty() {
-        return true;
+    len: usize,
+) -> usize {
+    if len == 0 {
+        return slot.as_ref().map_or(0, |b| b.size() as usize);
     }
-    let need = (data.len() as u64).next_power_of_two().max(4096);
-    if slot.as_ref().is_none_or(|b| b.size() < data.len() as u64) {
-        *slot = Some(device.create_buffer(&wgpu::BufferDescriptor {
+    if let Some(existing) = slot.as_ref() {
+        if existing.size() >= len as u64 {
+            return existing.size() as usize;
+        }
+    }
+    let try_alloc = |size: u64| -> Option<wgpu::Buffer> {
+        let oom = device.push_error_scope(wgpu::ErrorFilter::OutOfMemory);
+        let buf = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("world gui / effects"),
-            size: need,
+            size,
             usage: usage | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
-        }));
+        });
+        if let Some(err) = crate::gpu_caps::block_on(oom.pop()) {
+            crate::gpu_health::mark_oom("world gui / effects", &err.to_string());
+            None
+        } else {
+            Some(buf)
+        }
+    };
+    let need = (len as u64).next_power_of_two().max(4096);
+    if let Some(buf) = try_alloc(need) {
+        let cap = buf.size() as usize;
+        *slot = Some(buf);
+        return cap;
     }
-    match slot {
-        Some(b) => stage(staging, b, encoder, data),
-        None => true,
+    // Keep existing buffer if it already has usable capacity and exact alloc
+    // fails, or free old buffer first so exact/reduced size has room.
+    let exact = ((len as u64).div_ceil(256) * 256).max(256);
+    let old_size = slot.as_ref().map_or(0, |b| b.size());
+    if exact < need {
+        if let Some(buf) = try_alloc(exact) {
+            let cap = buf.size() as usize;
+            *slot = Some(buf);
+            return cap;
+        }
+    }
+    if old_size > 0 {
+        // Reclaim old buffer before retrying exact size; if that still fails,
+        // fall back to smaller capacities down to 4 KiB.
+        *slot = None;
+    }
+    let mut attempt = exact;
+    loop {
+        if let Some(buf) = try_alloc(attempt) {
+            let cap = buf.size() as usize;
+            *slot = Some(buf);
+            return cap;
+        }
+        if attempt <= 4096 {
+            return 0;
+        }
+        attempt = (attempt / 2).max(4096);
+    }
+}
+
+/// Writes `data` into an already-sized buffer `slot` (see [`ensure_buf`]).
+fn fill_existing(
+    staging: &mut wgpu::util::StagingBelt,
+    encoder: &mut wgpu::CommandEncoder,
+    slot: &Option<wgpu::Buffer>,
+    data: &[u8],
+) {
+    if data.is_empty() {
+        return;
+    }
+    if let Some(b) = slot {
+        stage(staging, b, encoder, data);
     }
 }
 
@@ -1123,49 +1259,6 @@ fn draw_mips(
         pass.set_pipeline(pipeline);
         pass.set_bind_group(0, &bg, &[]);
         pass.draw(0..3, 0..1);
-    }
-}
-
-/// Frames a refused mip copy waits before it is asked for again (~30 s).
-const MIP_RETRY_FRAMES: u64 = 1800;
-
-/// The memory the mip copies may hold together: beyond it the least
-/// recently used are let go first, and a copy that still does not fit is
-/// refused (its texture draws unmipped). Phones share the GPU's memory with
-/// everything else and refuse allocations long before a desktop would.
-/// `RUSTUDIO_GUI_MIP_BUDGET_MB` overrides.
-pub fn mip_budget() -> u64 {
-    static BUDGET: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
-    *BUDGET.get_or_init(|| {
-        let default_mb: u64 = if cfg!(target_os = "android") { 64 } else { 512 };
-        std::env::var("RUSTUDIO_GUI_MIP_BUDGET_MB").ok().and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(default_mb) << 20
-    })
-}
-
-/// The bytes a `width` x `height` RGBA8 texture with a full mip chain holds.
-pub fn mip_copy_bytes(width: u32, height: u32) -> u64 {
-    u64::from(width) * u64::from(height) * 16 / 3
-}
-
-/// `device.create_texture` inside an out-of-memory error scope: None when
-/// the device refused the memory (wgpu otherwise hands back a texture that
-/// is invalid for everything after, and reports the failure only to the
-/// uncaptured-error handler).
-pub fn try_create_texture(device: &wgpu::Device, desc: &wgpu::TextureDescriptor<'_>) -> Option<wgpu::Texture> {
-    let scope = device.push_error_scope(wgpu::ErrorFilter::OutOfMemory);
-    let texture = device.create_texture(desc);
-    match crate::gpu_caps::block_on(scope.pop()) {
-        None => Some(texture),
-        Some(e) => {
-            log::warn!(
-                "rustudio: no GPU memory for a {}x{} {} texture ({}): drawn without it — {e}",
-                desc.size.width,
-                desc.size.height,
-                desc.label.unwrap_or("unnamed"),
-                desc.mip_level_count
-            );
-            None
-        }
     }
 }
 
@@ -1417,9 +1510,10 @@ impl WorldGuiPass {
             multiview_mask: None,
             cache: crate::pipeline_cache::current(),
         });
-        // Into the R10G10B10A2 effects buffer (`effects`): world GUIs, strips,
+        // Into the R10G10B10A2 effects buffer (`effects`) or direct-to-HDR
+        // fallback when VRAM cannot fit `fx_tex`: world GUIs, strips,
         // particles and sparkles, premultiplied, alpha kept.
-        let fx_into = |label: &str, vs_entry: &str, fs_entry: &str, stride: usize, step: wgpu::VertexStepMode, attributes: &[wgpu::VertexAttribute]| {
+        let fx_into = |label: &str, format: wgpu::TextureFormat, vs_entry: &str, fs_entry: &str, stride: usize, step: wgpu::VertexStepMode, attributes: &[wgpu::VertexAttribute]| {
             device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
                 label: Some(label),
                 layout: Some(&layout),
@@ -1434,7 +1528,7 @@ impl WorldGuiPass {
                     entry_point: Some(fs_entry),
                     compilation_options: Default::default(),
                     targets: &[Some(wgpu::ColorTargetState {
-                        format: FX_BUF_FORMAT,
+                        format,
                         blend: Some(wgpu::BlendState {
                             color: wgpu::BlendComponent {
                                 src_factor: wgpu::BlendFactor::One,
@@ -1457,10 +1551,14 @@ impl WorldGuiPass {
                 cache: crate::pipeline_cache::current(),
             })
         };
-        let fx_pipeline = fx_into("world gui effects", "vs", "fs_fx_gui", std::mem::size_of::<GuiVertex>(), wgpu::VertexStepMode::Vertex, &attrs);
-        let strip_pipeline = fx_into("effects strips", "vs_strip", "fs_fx_strip", std::mem::size_of::<FxVertex>(), wgpu::VertexStepMode::Vertex, &strip_attrs);
-        let particle_pipeline = fx_into("effects particles", "vs_particle", "fs_fx_particle", std::mem::size_of::<FxParticle>(), wgpu::VertexStepMode::Instance, &particle_attrs);
-        let sparkles_pipeline = fx_into("effects sparkles", "vs_sparkles", "fs_fx_sparkles", std::mem::size_of::<FxParticle>(), wgpu::VertexStepMode::Instance, &particle_attrs);
+        let fx_pipeline = fx_into("world gui effects", FX_BUF_FORMAT, "vs", "fs_fx_gui", std::mem::size_of::<GuiVertex>(), wgpu::VertexStepMode::Vertex, &attrs);
+        let strip_pipeline = fx_into("effects strips", FX_BUF_FORMAT, "vs_strip", "fs_fx_strip", std::mem::size_of::<FxVertex>(), wgpu::VertexStepMode::Vertex, &strip_attrs);
+        let particle_pipeline = fx_into("effects particles", FX_BUF_FORMAT, "vs_particle", "fs_fx_particle", std::mem::size_of::<FxParticle>(), wgpu::VertexStepMode::Instance, &particle_attrs);
+        let sparkles_pipeline = fx_into("effects sparkles", FX_BUF_FORMAT, "vs_sparkles", "fs_fx_sparkles", std::mem::size_of::<FxParticle>(), wgpu::VertexStepMode::Instance, &particle_attrs);
+        let hdr_fx_pipeline = fx_into("world gui effects hdr", HDR_FORMAT, "vs", "fs_hdr_gui", std::mem::size_of::<GuiVertex>(), wgpu::VertexStepMode::Vertex, &attrs);
+        let hdr_strip_pipeline = fx_into("effects strips hdr", HDR_FORMAT, "vs_strip", "fs_hdr_strip", std::mem::size_of::<FxVertex>(), wgpu::VertexStepMode::Vertex, &strip_attrs);
+        let hdr_particle_pipeline = fx_into("effects particles hdr", HDR_FORMAT, "vs_particle", "fs_hdr_particle", std::mem::size_of::<FxParticle>(), wgpu::VertexStepMode::Instance, &particle_attrs);
+        let hdr_sparkles_pipeline = fx_into("effects sparkles hdr", HDR_FORMAT, "vs_sparkles", "fs_hdr_sparkles", std::mem::size_of::<FxParticle>(), wgpu::VertexStepMode::Instance, &particle_attrs);
         let fx_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("world gui effects buffer"),
             source: wgpu::ShaderSource::Wgsl(FX_SHADER.into()),
@@ -1559,6 +1657,10 @@ impl WorldGuiPass {
             strip_pipeline,
             particle_pipeline,
             sparkles_pipeline,
+            hdr_fx_pipeline,
+            hdr_strip_pipeline,
+            hdr_particle_pipeline,
+            hdr_sparkles_pipeline,
             lights: no_lights,
             n_lights: 0,
             bufs: Default::default(),
@@ -1569,6 +1671,8 @@ impl WorldGuiPass {
             fx_in,
             fx_out,
             fx_tex: None,
+            fx_tex_retry_at: 0,
+            last_oom_epoch: crate::gpu_health::oom_epoch(),
             sun_atlas: device.create_texture(&wgpu::TextureDescriptor {
                 label: Some("unshadowed GUI fallback"), size: wgpu::Extent3d { width: 1, height: 1, depth_or_array_layers: 1 },
                 mip_level_count: 1, sample_count: 1, dimension: wgpu::TextureDimension::D2,
@@ -1598,7 +1702,6 @@ impl WorldGuiPass {
             sampler_wrap,
             mips: Default::default(),
             mips_making: Default::default(),
-            mips_refused: Default::default(),
             mips_release: Default::default(),
             mip_pipeline,
             mip_bgl,
@@ -1609,61 +1712,87 @@ impl WorldGuiPass {
         }
     }
 
-    /// Whether `tex`'s mip copy was refused lately (`mips_refused`).
-    fn mip_refused(&mut self, tex: &wgpu::Texture) -> bool {
-        let frame = self.frame;
-        match self.mips_refused.get(tex) {
-            Some(at) if frame.saturating_sub(*at) < MIP_RETRY_FRAMES => true,
-            Some(_) => {
-                self.mips_refused.remove(tex);
-                false
-            }
-            None => false,
+    /// Copy and downsample a texture when its uploaded contents change.
+    fn mips_vram_bytes(&self) -> usize {
+        self.mips.values().map(|(c, ..)| mip_tex_bytes(c)).sum()
+    }
+
+    /// Immediately frees all optional mipmap copies (and pending releases) so
+    /// effects keep drawing directly from egui's base textures with zero extra
+    /// mip VRAM.
+    pub fn purge_mips(&mut self) {
+        let mut freed = 0usize;
+        let mut destroy = Vec::new();
+        for (_, (copy, ..)) in self.mips.drain() {
+            freed = freed.saturating_add(mip_tex_bytes(&copy));
+            destroy.push(copy);
+        }
+        self.mips_making.clear();
+        while let Some((copy, _)) = self.mips_release.pop_front() {
+            freed = freed.saturating_add(mip_tex_bytes(&copy));
+            destroy.push(copy);
+        }
+        // Clear cached bind groups so subsequent draws rebind to egui's base
+        // texture rather than holding views into destroyed mip copies.
+        let old_groups: Vec<_> = self.tex_groups.drain().collect();
+        if !old_groups.is_empty() {
+            egui_wgpu::prewarm::drop_later(old_groups);
+        }
+        if !destroy.is_empty() {
+            egui_wgpu::prewarm::destroy_later(destroy, ());
+            crate::gpu_health::note_vram_reclaimed("world gui effect mips", freed);
         }
     }
 
-    /// Makes room under [`mip_budget`] for a copy of `bytes`: the copies
-    /// not used this frame go, least recently used first. False when it
-    /// still does not fit.
-    fn mip_room_for(&mut self, bytes: u64) -> bool {
-        let budget = mip_budget();
-        if bytes > budget {
-            return false;
+    /// Evicts least-recently-used mipmap copies (not used on the current frame)
+    /// until `need` bytes fit within `world_gui_mips_budget()`.
+    fn evict_mips_for(&mut self, need: usize) {
+        let budget = crate::gpu_caps::world_gui_mips_budget();
+        if budget == usize::MAX || self.mips_vram_bytes().saturating_add(need) <= budget {
+            return;
         }
-        let held = |mips: &std::collections::HashMap<wgpu::Texture, (wgpu::Texture, wgpu::TextureView, u64, TextureRevision)>| {
-            mips.values().map(|(c, ..)| mip_copy_bytes(c.size().width, c.size().height)).sum::<u64>()
-        };
-        if held(&self.mips) + bytes <= budget {
-            return true;
-        }
-        let frame = self.frame;
-        let mut by_age: Vec<(u64, wgpu::Texture)> =
-            self.mips.iter().filter(|(_, (_, _, used, _))| *used != frame).map(|(t, (_, _, used, _))| (*used, t.clone())).collect();
-        by_age.sort_by_key(|(used, _)| *used);
-        for (_, t) in by_age {
-            if held(&self.mips) + bytes <= budget {
+        let target = budget.saturating_sub(need);
+        let cur = self.frame;
+        let mut candidates: Vec<(u64, usize, wgpu::Texture)> = self
+            .mips
+            .iter()
+            .filter(|(_, (_, _, used, _))| *used < cur)
+            .map(|(k, (copy, _, used, _))| (*used, mip_tex_bytes(copy), k.clone()))
+            .collect();
+        candidates.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| b.1.cmp(&a.1)));
+        let mut used_bytes = self.mips_vram_bytes();
+        let mut freed = 0usize;
+        for (_, bytes, key) in candidates {
+            if used_bytes <= target {
                 break;
             }
-            if let Some((copy, view, ..)) = self.mips.remove(&t) {
-                let sampled = self.tex_groups.values().any(|(s, _, _)| *s == t);
-                self.tex_groups.retain(|_, (s, _, _)| *s != t);
-                egui_wgpu::prewarm::drop_later(view);
-                self.mips_release.push_back((copy, !sampled));
+            if let Some((copy, ..)) = self.mips.remove(&key) {
+                self.tex_groups.retain(|_, (t, _, _)| *t != key);
+                self.mips_release.push_back((copy, true));
+                used_bytes = used_bytes.saturating_sub(bytes);
+                freed = freed.saturating_add(bytes);
             }
         }
-        held(&self.mips) + bytes <= budget
+        if freed > 0 {
+            crate::gpu_health::note_vram_reclaimed("world gui effect mips (LRU)", freed);
+        }
     }
 
-    /// Copy and downsample a texture when its uploaded contents change.
-    /// None when the device has no memory for the copy (`mips_refused`):
-    /// the caller samples egui's texture unmipped.
-    fn mipped(&mut self, device: &wgpu::Device, encoder: &mut wgpu::CommandEncoder, tex: &wgpu::Texture, revision: TextureRevision) -> Option<wgpu::TextureView> {
+    fn sync_oom_pressure(&mut self) {
+        let epoch = crate::gpu_health::oom_epoch();
+        if epoch != self.last_oom_epoch {
+            self.last_oom_epoch = epoch;
+            self.purge_mips();
+        }
+    }
+
+    fn mipped(&mut self, device: &wgpu::Device, encoder: &mut wgpu::CommandEncoder, tex: &wgpu::Texture, revision: TextureRevision) -> wgpu::TextureView {
         let frame = self.frame;
         let mut dirty = None;
         let reuse = if let Some((copy, view, used, last)) = self.mips.get_mut(tex) {
             *used = frame;
             if *last == revision {
-                return Some(view.clone());
+                return view.clone();
             }
             // The Context only tracks its latest delta. After skipped
             // revisions, refill the full copy to include every missed write.
@@ -1686,16 +1815,21 @@ impl WorldGuiPass {
         let mipped = if let Some((copy, _)) = &reuse {
             copy.clone()
         } else {
-            if self.mip_refused(tex) {
-                return None;
+            let need = mip_tex_bytes(tex);
+            if !crate::gpu_health::oom_seen() {
+                self.evict_mips_for(need);
+            }
+            if crate::gpu_health::oom_seen()
+                || self.mips_vram_bytes().saturating_add(need) > crate::gpu_caps::world_gui_mips_budget()
+            {
+                return tex.create_view(&Default::default());
             }
             // (a grown font atlas's copy is made ahead of time: mip_copy_key)
-            let made = match egui_wgpu::prewarm::take(mip_copy_key(size.width, size.height)) {
-                Some(t) => Some(t),
-                None if !self.mip_room_for(mip_copy_bytes(size.width, size.height)) => None,
-                None => try_create_texture(
-                    device,
-                    &wgpu::TextureDescriptor {
+            match egui_wgpu::prewarm::take(mip_copy_key(size.width, size.height)) {
+                Some(t) => t,
+                None => {
+                    let oom = device.push_error_scope(wgpu::ErrorFilter::OutOfMemory);
+                    let t = device.create_texture(&wgpu::TextureDescriptor {
                         label: Some("world gui effect texture"),
                         size: wgpu::Extent3d { width: size.width, height: size.height, depth_or_array_layers: 1 },
                         mip_level_count: levels,
@@ -1704,24 +1838,22 @@ impl WorldGuiPass {
                         format: wgpu::TextureFormat::Rgba8Unorm,
                         usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::RENDER_ATTACHMENT,
                         view_formats: &[],
-                    },
-                ),
-            };
-            match made {
-                Some(t) => t,
-                None => {
-                    self.mips_refused.insert(tex.clone(), frame);
-                    return None;
+                    });
+                    if let Some(err) = crate::gpu_caps::block_on(oom.pop()) {
+                        crate::gpu_health::mark_oom("world gui effect texture", &err.to_string());
+                        return tex.create_view(&Default::default());
+                    }
+                    t
                 }
             }
         };
         draw_mips(device, encoder, &self.mip_pipeline, &self.mip_bgl, &self.mip_sampler, tex, &mipped, dirty);
         if let Some((_, view)) = reuse {
-            return Some(view);
+            return view;
         }
         let view = mipped.create_view(&Default::default());
         self.mips.insert(tex.clone(), (mipped, view.clone(), frame, revision));
-        Some(view)
+        view
     }
 
     /// The world GUIs (`batches`) and, into the scene, the effects (`fx`),
@@ -1773,13 +1905,13 @@ impl WorldGuiPass {
         let texture_groups = rustudio_core::bench::scope("fx_texture_groups");
         // A bind group per egui texture (and sampler).
         self.frame += 1;
+        self.sync_oom_pressure();
         // (effects' textures unused for a while are let go)
         let frame = self.frame;
         // (let-go copies and bind groups are freed on another thread:
         // freeing a large texture costs an integrated GPU's driver tens of
         // milliseconds)
         let gone_mips: Vec<_> = self.mips.extract_if(|_, (_, _, used, _)| frame - *used >= 600).collect();
-        self.mips_refused.retain(|_, at| frame.saturating_sub(*at) < MIP_RETRY_FRAMES);
         let egui = rs.renderer.read();
         let gone_groups: Vec<_> = self.tex_groups.extract_if(|_, (_, _, used)| frame - *used >= 600).collect();
         if !gone_groups.is_empty() {
@@ -1833,86 +1965,73 @@ impl WorldGuiPass {
                 if *t == tex {
                     let bg = bg.clone();
                     let first = std::mem::replace(used, frame) != frame;
-                    // (a group made while the copy was refused samples egui's
-                    // texture: made again, below, once a copy may fit)
-                    let remake = first && mipped && !this.mips.contains_key(&tex) && !this.mips_making.contains_key(&tex) && !this.mip_refused(&tex);
-                    if first && mipped && !remake {
+                    if first && mipped {
                         this.mipped(device, encoder, &tex, revision);
                     }
-                    if !remake {
-                        return Some(bg);
-                    }
+                    return Some(bg);
                 }
             }
             // (a static image's mip copy is made on another thread the first
             // time it is drawn; until it is, it draws as an image still
             // loading does: not at all. Fixed-step runs make it here.)
-            let mut mipped = mipped;
-            if mipped && revision == TextureRevision::Static && !this.mips.contains_key(&tex) && !rustudio_core::sim_clock::on() {
-                let size = tex.size();
-                if this.mip_refused(&tex) {
-                    mipped = false;
-                } else {
-                    match this.mips_making.get(&tex).map(|rx| rx.try_recv()) {
-                        Some(Ok(Some((copy, view)))) => {
-                            this.mips_making.remove(&tex);
-                            this.mips.insert(tex.clone(), (copy, view, frame, revision));
-                        }
-                        Some(Ok(None)) => {
-                            this.mips_making.remove(&tex);
-                            this.mips_refused.insert(tex.clone(), frame);
-                            mipped = false;
-                        }
-                        Some(Err(std::sync::mpsc::TryRecvError::Empty)) => return None,
-                        Some(Err(std::sync::mpsc::TryRecvError::Disconnected)) => {
-                            this.mips_making.remove(&tex);
-                        }
-                        None if !this.mip_room_for(mip_copy_bytes(size.width, size.height)) => {
-                            this.mips_refused.insert(tex.clone(), frame);
-                            mipped = false;
-                        }
-                        None => {
-                            let (tx, rx) = std::sync::mpsc::channel();
-                            let (device, queue) = (device.clone(), rs.queue.clone());
-                            let (pipeline, bgl, sampler) = (this.mip_pipeline.clone(), this.mip_bgl.clone(), this.mip_sampler.clone());
-                            let source = tex.clone();
-                            let made = std::thread::Builder::new().name("gui-mips".into()).spawn(move || {
-                                let size = source.size();
-                                let key = mip_copy_key(size.width, size.height);
-                                let Some(copy) = try_create_texture(
-                                    &device,
-                                    &wgpu::TextureDescriptor {
-                                        label: Some("world gui effect texture"),
-                                        size: wgpu::Extent3d { width: size.width, height: size.height, depth_or_array_layers: 1 },
-                                        mip_level_count: key.mip_levels,
-                                        sample_count: 1,
-                                        dimension: wgpu::TextureDimension::D2,
-                                        format: key.format,
-                                        usage: key.usage,
-                                        view_formats: &[],
-                                    },
-                                ) else {
-                                    let _ = tx.send(None);
-                                    return;
-                                };
-                                let mut enc = device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("world gui mips") });
-                                draw_mips(&device, &mut enc, &pipeline, &bgl, &sampler, &source, &copy, None);
-                                queue.submit([enc.finish()]);
-                                let view = copy.create_view(&Default::default());
-                                let _ = tx.send(Some((copy, view)));
+            if mipped
+                && revision == TextureRevision::Static
+                && !this.mips.contains_key(&tex)
+                && !rustudio_core::sim_clock::on()
+                && !crate::gpu_health::oom_seen()
+                && this.mips_vram_bytes().saturating_add(mip_tex_bytes(&tex))
+                    <= crate::gpu_caps::world_gui_mips_budget()
+            {
+                match this.mips_making.get(&tex).map(|rx| rx.try_recv()) {
+                    Some(Ok((copy, view))) => {
+                        this.mips_making.remove(&tex);
+                        this.mips.insert(tex.clone(), (copy, view, frame, revision));
+                    }
+                    Some(Err(std::sync::mpsc::TryRecvError::Empty)) => return None,
+                    Some(Err(std::sync::mpsc::TryRecvError::Disconnected)) => {
+                        this.mips_making.remove(&tex);
+                    }
+                    None => {
+                        let (tx, rx) = std::sync::mpsc::channel();
+                        let (device, queue) = (device.clone(), rs.queue.clone());
+                        let (pipeline, bgl, sampler) = (this.mip_pipeline.clone(), this.mip_bgl.clone(), this.mip_sampler.clone());
+                        let source = tex.clone();
+                        let made = std::thread::Builder::new().name("gui-mips".into()).spawn(move || {
+                            let size = source.size();
+                            let key = mip_copy_key(size.width, size.height);
+                            let oom = device.push_error_scope(wgpu::ErrorFilter::OutOfMemory);
+                            let copy = device.create_texture(&wgpu::TextureDescriptor {
+                                label: Some("world gui effect texture"),
+                                size: wgpu::Extent3d { width: size.width, height: size.height, depth_or_array_layers: 1 },
+                                mip_level_count: key.mip_levels,
+                                sample_count: 1,
+                                dimension: wgpu::TextureDimension::D2,
+                                format: key.format,
+                                usage: key.usage,
+                                view_formats: &[],
                             });
-                            if made.is_ok() {
-                                this.mips_making.insert(tex.clone(), rx);
-                                return None;
+                            if let Some(err) = crate::gpu_caps::block_on(oom.pop()) {
+                                crate::gpu_health::mark_oom("world gui effect texture", &err.to_string());
+                                return;
                             }
+                            let mut enc = device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("world gui mips") });
+                            draw_mips(&device, &mut enc, &pipeline, &bgl, &sampler, &source, &copy, None);
+                            queue.submit([enc.finish()]);
+                            let view = copy.create_view(&Default::default());
+                            let _ = tx.send((copy, view));
+                        });
+                        if made.is_ok() {
+                            this.mips_making.insert(tex.clone(), rx);
+                            return None;
                         }
                     }
                 }
             }
-            let mip_view = if mipped { this.mipped(device, encoder, &tex, revision) } else { None };
-            let (view, sampler) = match mip_view {
-                Some(view) => (view, if wrap { &this.sampler_mip_wrap } else { &this.sampler_mip }),
-                None => (tex.create_view(&Default::default()), if wrap { &this.sampler_wrap } else { &this.sampler }),
+            let val = device.push_error_scope(wgpu::ErrorFilter::Validation);
+            let (view, sampler) = if mipped {
+                (this.mipped(device, encoder, &tex, revision), if wrap { &this.sampler_mip_wrap } else { &this.sampler_mip })
+            } else {
+                (tex.create_view(&Default::default()), if wrap { &this.sampler_wrap } else { &this.sampler })
             };
             let bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: Some("world gui texture"),
@@ -1922,6 +2041,9 @@ impl WorldGuiPass {
                     wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(sampler) },
                 ],
             });
+            if crate::gpu_caps::block_on(val.pop()).is_some() {
+                return Some(this.white.clone());
+            }
             this.tex_groups.insert((id, wrap), (tex, bg.clone(), frame));
             Some(bg)
         };
@@ -1958,27 +2080,98 @@ impl WorldGuiPass {
         if draws.is_empty() {
             return None;
         }
-        // (a failed upload — the device lost mid-frame — ends the frame's
-        // world GUI with nothing drawn; `stage`)
-        let staged = {
-            let _scope = rustudio_core::bench::scope("fx_tone_write");
-            stage(&mut self.staging, &self.tone_buf, encoder, bytemuck::cast_slice(&u))
+        // Size all vertex/index/storage buffers BEFORE touching `self.staging`,
+        // so an OutOfMemory abort never leaves unfinished staging chunks or
+        // invalid buffer copies in `encoder`. If any buffer cannot fit the full
+        // frame under tight VRAM, clamp only that buffer's draws instead of
+        // dropping every particle emitter, beam, trail, and world GUI.
+        let st = wgpu::BufferUsages::STORAGE;
+        let (v, i) = (wgpu::BufferUsages::VERTEX, wgpu::BufferUsages::INDEX);
+        let pad = [FxGlass::default()];
+        let raw_glass: &[u8] = bytemuck::cast_slice(if f.glass.is_empty() { &pad } else { &f.glass });
+        let raw_glass_idx: &[u8] = bytemuck::cast_slice(if f.glass_idx.is_empty() { &[0u32][..] } else { &f.glass_idx });
+        let (g0_cap, g1_cap, b0_cap, b1_cap, b2_cap, b3_cap, b4_cap) = {
+            let [g0, g1] = &mut self.glass;
+            let [b0, b1, b2, b3, b4] = &mut self.bufs;
+            let g0_cap = ensure_buf(device, g0, st, raw_glass.len());
+            let g1_cap = ensure_buf(device, g1, st, raw_glass_idx.len());
+            let (b0_cap, b1_cap) = if indices.is_empty() {
+                (0, 0)
+            } else {
+                (
+                    ensure_buf(device, b0, v, std::mem::size_of_val(vertices.as_slice())),
+                    ensure_buf(device, b1, i, std::mem::size_of_val(indices.as_slice())),
+                )
+            };
+            let b2_cap = ensure_buf(device, b2, v, std::mem::size_of_val(f.strips.as_slice()));
+            let b3_cap = ensure_buf(device, b3, i, std::mem::size_of_val(f.indices.as_slice()));
+            let b4_cap = ensure_buf(device, b4, v, std::mem::size_of_val(f.particles.as_slice()));
+            (g0_cap, g1_cap, b0_cap, b1_cap, b2_cap, b3_cap, b4_cap)
         };
-        if !staged {
-            self.staging.finish_and_recall_on_submit(encoder);
+        if g0_cap < std::mem::size_of::<FxGlass>() || g1_cap < std::mem::size_of::<u32>() {
             return None;
+        }
+        let glass_bytes: &[u8] = if raw_glass.len() <= g0_cap && raw_glass_idx.len() <= g1_cap {
+            raw_glass
+        } else {
+            bytemuck::cast_slice(&pad)
+        };
+        let glass_idx_bytes: &[u8] = if raw_glass.len() <= g0_cap && raw_glass_idx.len() <= g1_cap {
+            raw_glass_idx
+        } else {
+            bytemuck::cast_slice(&[0u32][..])
+        };
+        let gui_v_count = (b0_cap / std::mem::size_of::<GuiVertex>()).min(vertices.len());
+        let gui_i_count = (b1_cap / std::mem::size_of::<u32>()).min(indices.len());
+        let strip_v_count = (b2_cap / std::mem::size_of::<FxVertex>()).min(f.strips.len());
+        let strip_i_count = (b3_cap / std::mem::size_of::<u32>()).min(f.indices.len());
+        let part_count = (b4_cap / std::mem::size_of::<FxParticle>()).min(f.particles.len());
+
+        // Clamp/filter draw ranges to uploaded buffer bounds so out-of-bounds
+        // GPU draws can never happen even under severe VRAM pressure.
+        draws.retain_mut(|(kind, _, start, end)| match kind {
+            Kind::Gui => {
+                if *end as usize > gui_i_count {
+                    return false;
+                }
+                if gui_v_count < vertices.len() {
+                    indices[*start as usize..*end as usize].iter().all(|&idx| (idx as usize) < gui_v_count)
+                } else {
+                    true
+                }
+            }
+            Kind::Strip => {
+                if *end as usize > strip_i_count {
+                    return false;
+                }
+                if strip_v_count < f.strips.len() {
+                    f.indices[*start as usize..*end as usize].iter().all(|&idx| (idx as usize) < strip_v_count)
+                } else {
+                    true
+                }
+            }
+            Kind::Particles | Kind::Sparkles => {
+                *end = (*end).min(part_count as u32);
+                *start < *end
+            }
+        });
+        if draws.is_empty() {
+            return None;
+        }
+        let vert_bytes: &[u8] = bytemuck::cast_slice(&vertices[..gui_v_count]);
+        let idx_bytes: &[u8] = bytemuck::cast_slice(&indices[..gui_i_count]);
+        let strip_bytes: &[u8] = bytemuck::cast_slice(&f.strips[..strip_v_count]);
+        let strip_idx_bytes: &[u8] = bytemuck::cast_slice(&f.indices[..strip_i_count]);
+        let part_bytes: &[u8] = bytemuck::cast_slice(&f.particles[..part_count]);
+        {
+            let _scope = rustudio_core::bench::scope("fx_tone_write");
+            stage(&mut self.staging, &self.tone_buf, encoder, bytemuck::cast_slice(&u));
         }
         let glass_upload = rustudio_core::bench::scope("fx_glass_upload");
         // (storage bindings can't be empty)
-        let st = wgpu::BufferUsages::STORAGE;
-        let pad = [FxGlass::default()];
-        let [g0, g1] = &mut self.glass;
-        let staged = fill(device, &mut self.staging, encoder, g0, st, bytemuck::cast_slice(if f.glass.is_empty() { &pad } else { &f.glass }))
-            && fill(device, &mut self.staging, encoder, g1, st, bytemuck::cast_slice(if f.glass_idx.is_empty() { &[0u32][..] } else { &f.glass_idx }));
-        if !staged {
-            self.staging.finish_and_recall_on_submit(encoder);
-            return None;
-        }
+        let [g0, g1] = &self.glass;
+        fill_existing(&mut self.staging, encoder, g0, glass_bytes);
+        fill_existing(&mut self.staging, encoder, g1, glass_idx_bytes);
         let (Some(g0), Some(g1)) = (&self.glass[0], &self.glass[1]) else { return None };
         drop(glass_upload);
         let views = [depth, &self.sun_atlas, &self.sun_grid];
@@ -2010,23 +2203,20 @@ impl WorldGuiPass {
             self.depth_binding.as_ref().expect("depth bindings initialized").group.clone()
         };
         let _buffers = rustudio_core::bench::scope("fx_draw_buffer_upload");
-        let (v, i) = (wgpu::BufferUsages::VERTEX, wgpu::BufferUsages::INDEX);
-        let [b0, b1, b2, b3, b4] = &mut self.bufs;
-        let mut staged = true;
+        let [b0, b1, b2, b3, b4] = &self.bufs;
         if !indices.is_empty() {
             let _upload = rustudio_core::bench::scope("gui_world_mesh_upload");
-            staged = fill(device, &mut self.staging, encoder, b0, v, bytemuck::cast_slice(&vertices))
-                && fill(device, &mut self.staging, encoder, b1, i, bytemuck::cast_slice(&indices));
+            fill_existing(&mut self.staging, encoder, b0, vert_bytes);
+            fill_existing(&mut self.staging, encoder, b1, idx_bytes);
         }
-        staged = staged
-            && fill(device, &mut self.staging, encoder, b2, v, bytemuck::cast_slice(&f.strips))
-            && fill(device, &mut self.staging, encoder, b3, i, bytemuck::cast_slice(&f.indices))
-            && fill(device, &mut self.staging, encoder, b4, v, bytemuck::cast_slice(&f.particles));
+        fill_existing(&mut self.staging, encoder, b2, strip_bytes);
+        fill_existing(&mut self.staging, encoder, b3, strip_idx_bytes);
+        fill_existing(&mut self.staging, encoder, b4, part_bytes);
         self.staging.finish_and_recall_on_submit(encoder);
-        staged.then_some(Upload { depth_bg, draws })
+        Some(Upload { depth_bg, draws })
     }
 
-    fn record(&self, pass: &mut wgpu::RenderPass<'_>, gui: &wgpu::RenderPipeline, up: &Upload) {
+    fn record(&self, pass: &mut wgpu::RenderPass<'_>, pipes: [&wgpu::RenderPipeline; 4], up: &Upload) {
         pass.set_bind_group(0, &up.depth_bg, &[]);
         let mut bound = None;
         for (kind, bg, start, end) in &up.draws {
@@ -2035,24 +2225,24 @@ impl WorldGuiPass {
                 match kind {
                     Kind::Gui => {
                         let (Some(vb), Some(ib)) = (b0, b1) else { continue };
-                        pass.set_pipeline(gui);
+                        pass.set_pipeline(pipes[0]);
                         pass.set_vertex_buffer(0, vb.slice(..));
                         pass.set_index_buffer(ib.slice(..), wgpu::IndexFormat::Uint32);
                     }
                     Kind::Strip => {
                         let (Some(vb), Some(ib)) = (b2, b3) else { continue };
-                        pass.set_pipeline(&self.strip_pipeline);
+                        pass.set_pipeline(pipes[1]);
                         pass.set_vertex_buffer(0, vb.slice(..));
                         pass.set_index_buffer(ib.slice(..), wgpu::IndexFormat::Uint32);
                     }
                     Kind::Particles => {
                         let Some(vb) = b4 else { continue };
-                        pass.set_pipeline(&self.particle_pipeline);
+                        pass.set_pipeline(pipes[2]);
                         pass.set_vertex_buffer(0, vb.slice(..));
                     }
                     Kind::Sparkles => {
                         let Some(vb) = b4 else { continue };
-                        pass.set_pipeline(&self.sparkles_pipeline);
+                        pass.set_pipeline(pipes[3]);
                         pass.set_vertex_buffer(0, vb.slice(..));
                     }
                 }
@@ -2100,17 +2290,42 @@ impl WorldGuiPass {
                 occlusion_query_set: None,
                 multiview_mask: None,
             });
-            self.record(&mut pass, &self.pipeline, &up);
+            self.record(
+                &mut pass,
+                [&self.pipeline, &self.strip_pipeline, &self.particle_pipeline, &self.sparkles_pipeline],
+                &up,
+            );
         }
         crate::gpu_timing::submit(&rs.device, &rs.queue, "gpu: world gui", [enc.finish()]);
+    }
+
+    fn try_alloc_fx_tex(device: &wgpu::Device, size: [u32; 2]) -> Option<([u32; 2], wgpu::TextureView)> {
+        let oom = device.push_error_scope(wgpu::ErrorFilter::OutOfMemory);
+        let tex = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("world gui effects buffer"),
+            size: wgpu::Extent3d { width: size[0], height: size[1], depth_or_array_layers: 1 },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: FX_BUF_FORMAT,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::RENDER_ATTACHMENT,
+            view_formats: &[],
+        });
+        if let Some(err) = crate::gpu_caps::block_on(oom.pop()) {
+            crate::gpu_health::mark_oom("world gui effects buffer", &err.to_string());
+            None
+        } else {
+            Some((size, tex.create_view(&Default::default())))
+        }
     }
 
     /// Draws world GUIs and effects into the scene's HDR image `hdr`
     /// (linear light, before postprocessing), blended in the
     /// square root of linear light as Studio blends them: the image is
     /// copied into that space, the effects drawn over it far to near, and
-    /// squared back. False when there were none (the view needn't be
-    /// finished again).
+    /// squared back. If VRAM is too tight for the intermediate buffer, falls
+    /// back to drawing directly into `hdr` so particles, beams, trails,
+    /// sparkles, and world GUIs keep rendering. False when there were none.
     #[allow(clippy::too_many_arguments)]
     pub fn effects(
         &mut self,
@@ -2125,41 +2340,39 @@ impl WorldGuiPass {
         fog_rgb: [f32; 3],
         exposure: f32,
     ) -> bool {
-        let mut enc = rs.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("world gui effects") });
+        let fx_any = fx.is_some_and(|f| !f.draws.is_empty());
+        if !fx_any && batches.iter().all(|b| b.indices.is_empty()) {
+            return false;
+        }
+        let device = &rs.device;
+        self.sync_oom_pressure();
+        // Drop any outdated `fx_tex` BEFORE allocating the new size so old and
+        // new buffers never coexist in VRAM. If allocation still hits OOM,
+        // purge optional mip copies and retry once; if still OOM, fall back to
+        // direct-to-HDR rendering (zero extra VRAM) instead of stopping effects.
+        let resized = self.fx_tex.as_ref().is_some_and(|(s, _)| *s != size);
+        if resized {
+            self.fx_tex = None;
+        }
+        if self.fx_tex.is_none() && (resized || self.frame >= self.fx_tex_retry_at) {
+            if let Some(tex) = Self::try_alloc_fx_tex(device, size) {
+                self.fx_tex = Some(tex);
+            } else {
+                self.purge_mips();
+                if let Some(tex) = Self::try_alloc_fx_tex(device, size) {
+                    self.fx_tex = Some(tex);
+                } else {
+                    self.fx_tex_retry_at = self.frame.saturating_add(120);
+                }
+            }
+        }
+        let mut enc = device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("world gui effects") });
         let up = {
             let _b = rustudio_core::bench::scope("fx_upload");
             self.upload(rs, &mut enc, depth, batches, fx, tone_curve, fog, fog_rgb, exposure)
         };
         let Some(up) = up else { return false };
         let _b = rustudio_core::bench::scope("fx_encode");
-        let device = &rs.device;
-        if self.fx_tex.as_ref().is_none_or(|(s, _)| *s != size) {
-            let view = device
-                .create_texture(&wgpu::TextureDescriptor {
-                    label: Some("world gui effects buffer"),
-                    size: wgpu::Extent3d { width: size[0], height: size[1], depth_or_array_layers: 1 },
-                    mip_level_count: 1,
-                    sample_count: 1,
-                    dimension: wgpu::TextureDimension::D2,
-                    format: FX_BUF_FORMAT,
-                    usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::RENDER_ATTACHMENT,
-                    view_formats: &[],
-                })
-                .create_view(&Default::default());
-            self.fx_tex = Some((size, view));
-        }
-        let Some((_, buf)) = self.fx_tex.as_ref() else { return false };
-        let source = |v: &wgpu::TextureView| {
-            device.create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some("world gui effects buffer"),
-                layout: &self.fx_bgl,
-                entries: &[
-                    wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(v) },
-                    wgpu::BindGroupEntry { binding: 1, resource: self.tone_buf.as_entire_binding() },
-                ],
-            })
-        };
-        let (from_hdr, from_buf) = (source(hdr), source(buf));
         let mut step = |label: &str, view: &wgpu::TextureView, f: &mut dyn FnMut(&mut wgpu::RenderPass<'_>)| {
             let mut pass = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some(label),
@@ -2176,17 +2389,51 @@ impl WorldGuiPass {
             });
             f(&mut pass);
         };
-        step("effects in", buf, &mut |p| {
-            p.set_pipeline(&self.fx_in);
-            p.set_bind_group(0, &from_hdr, &[]);
-            p.draw(0..3, 0..1);
-        });
-        step("effects", buf, &mut |p| self.record(p, &self.fx_pipeline, &up));
-        step("effects out", hdr, &mut |p| {
-            p.set_pipeline(&self.fx_out);
-            p.set_bind_group(0, &from_buf, &[]);
-            p.draw(0..3, 0..1);
-        });
+        if let Some((_, buf)) = self.fx_tex.as_ref() {
+            let source = |v: &wgpu::TextureView| {
+                device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: Some("world gui effects buffer"),
+                    layout: &self.fx_bgl,
+                    entries: &[
+                        wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(v) },
+                        wgpu::BindGroupEntry { binding: 1, resource: self.tone_buf.as_entire_binding() },
+                    ],
+                })
+            };
+            let (from_hdr, from_buf) = (source(hdr), source(buf));
+            step("effects in", buf, &mut |p| {
+                p.set_pipeline(&self.fx_in);
+                p.set_bind_group(0, &from_hdr, &[]);
+                p.draw(0..3, 0..1);
+            });
+            step("effects", buf, &mut |p| {
+                self.record(
+                    p,
+                    [&self.fx_pipeline, &self.strip_pipeline, &self.particle_pipeline, &self.sparkles_pipeline],
+                    &up,
+                )
+            });
+            step("effects out", hdr, &mut |p| {
+                p.set_pipeline(&self.fx_out);
+                p.set_bind_group(0, &from_buf, &[]);
+                p.draw(0..3, 0..1);
+            });
+        } else {
+            // Direct-to-HDR fallback: zero extra texture VRAM, keeps all
+            // particles, beams, trails, sparkles, and world GUIs rendering.
+            step("effects direct hdr", hdr, &mut |p| {
+                self.record(
+                    p,
+                    [
+                        &self.hdr_fx_pipeline,
+                        &self.hdr_strip_pipeline,
+                        &self.hdr_particle_pipeline,
+                        &self.hdr_sparkles_pipeline,
+                    ],
+                    &up,
+                )
+            });
+        }
         drop(step);
         let commands = {
             let _b = rustudio_core::bench::scope("fx_finish");

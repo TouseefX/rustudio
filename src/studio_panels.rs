@@ -122,25 +122,31 @@ impl Editor {
         self.game.doc.find_child(root, "StarterPlayer")
     }
 
-    /// The place's avatar type (StarterPlayer.GameSettingsAvatar), Studio's default R15.
+    /// The place's avatar type (`StarterPlayer.GameSettingsAvatar` /
+    /// `AvatarSettings.DefaultAvatarRules.AvatarBodyRules.AvatarType`), Studio's default R15.
     pub fn avatar_type(&self) -> u32 {
-        self.starter_player()
-            .and_then(|sp| rustudio_render::scene::enum_u32(self.game.doc.prop(sp, "GameSettingsAvatar")))
-            .unwrap_or(1)
+        self.game.doc.avatar_type()
     }
 
-    /// Sets the place's avatar type (undoable, saved with the place).
-    /// Studio's setter (, on
-    /// StarterPlayer, category "Character", value at with
-    /// the component at) returns at once when the value
-    /// is unchanged: no change is recorded, so no undo step either.
+    /// Sets the place's avatar type (undoable, saved with the place and synced
+    /// to Roblox's experience settings on Publish).
+    /// Updates both `StarterPlayer.GameSettingsAvatar` and any
+    /// `AvatarBodyRules.AvatarType` in the place in one undo step so both
+    /// legacy and modern Avatar Settings stay in sync.
     pub fn set_avatar_type(&mut self, v: u32) {
-        if v > 2 || self.avatar_type() == v {
+        if v > 2 || (self.avatar_type() == v && self.game.doc.explicit_avatar_type() == Some(v)) {
             return;
         }
+        let val = Variant::Enum(Enum::from_u32(v));
+        let mut edits = Vec::new();
         if let Some(sp) = self.starter_player() {
-            let edit = vec![(sp, rbx_dom_weak::ustr("GameSettingsAvatar"), Variant::Enum(Enum::from_u32(v)))];
-            self.game.doc.set_props("Avatar Type", edit, None);
+            edits.push((sp, rbx_dom_weak::ustr("GameSettingsAvatar"), val.clone()));
+        }
+        for body in self.game.doc.avatar_body_rules_refs() {
+            edits.push((body, rbx_dom_weak::ustr("AvatarType"), val.clone()));
+        }
+        if !edits.is_empty() {
+            self.game.doc.set_props("Avatar Type", edits, None);
         }
     }
 
@@ -149,7 +155,7 @@ impl Editor {
         ui.add_space(6.0);
         ui.label(RichText::new("Avatar").strong());
         ui.label(
-            RichText::new("Saved with the place (StarterPlayer.GameSettingsAvatar), so Play uses it here and in Roblox.")
+            RichText::new("Saved with the place and synced to Roblox's experience settings on Publish.")
                 .color(theme::TEXT_DIM)
                 .small(),
         );
@@ -322,5 +328,50 @@ mod tests {
         assert!(o("Workspace") < o("Players") && o("Players") < o("Lighting"));
         assert!(o("Camera") < o("Part"));
         assert_eq!(super::class_meta()["ClickDetector"].category, "3D Interfaces");
+    }
+
+    #[test]
+    fn set_avatar_type_updates_starter_player_and_avatar_body_rules() {
+        let mut doc = rustudio_core::doc::Document::new_place();
+        let root = doc.dom.root_ref();
+        let sp = doc.find_child(root, "StarterPlayer").unwrap();
+        let avs = doc.insert(root, rbx_dom_weak::InstanceBuilder::new("AvatarSettings").with_name("AvatarSettings"));
+        let rules = doc.insert(avs, rbx_dom_weak::InstanceBuilder::new("AvatarRules").with_name("DefaultAvatarRules"));
+        let body = doc.insert(rules, rbx_dom_weak::InstanceBuilder::new("AvatarBodyRules").with_name("AvatarBodyRules"));
+
+        assert_eq!(doc.explicit_avatar_type(), None);
+        assert_eq!(doc.avatar_type(), 1);
+
+        let ctx = egui::Context::default();
+        let mut app = crate::app::RustudioApp::new_in(
+            &ctx,
+            None,
+            None,
+            None,
+            crate::app::Harness::test_empty(),
+            false,
+        );
+        app.ed.game.doc = doc;
+
+        app.ed.set_avatar_type(0);
+        assert_eq!(app.ed.avatar_type(), 0);
+        assert_eq!(app.ed.game.doc.explicit_avatar_type(), Some(0));
+        assert_eq!(app.ed.game.doc.explicit_enum_u32(sp, "GameSettingsAvatar"), Some(0));
+        assert_eq!(app.ed.game.doc.explicit_enum_u32(body, "AvatarType"), Some(0));
+
+        // Undo reverts both properties in one step.
+        app.ed.undo();
+        assert_eq!(app.ed.game.doc.explicit_avatar_type(), None);
+        assert_eq!(app.ed.game.doc.explicit_enum_u32(sp, "GameSettingsAvatar"), None);
+        assert_eq!(app.ed.game.doc.explicit_enum_u32(body, "AvatarType"), None);
+
+        // A place with only AvatarBodyRules.AvatarType = R6 (from modern Studio) is detected too.
+        app.ed.game.doc.set_prop_live(
+            body,
+            rbx_dom_weak::ustr("AvatarType"),
+            rbx_dom_weak::types::Variant::Enum(rbx_dom_weak::types::Enum::from_u32(0)),
+        );
+        assert_eq!(app.ed.game.doc.explicit_avatar_type(), Some(0));
+        assert_eq!(app.ed.avatar_type(), 0);
     }
 }

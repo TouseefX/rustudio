@@ -47,10 +47,10 @@ pub enum LiveOp {
 #[derive(Default, Debug)]
 pub struct Plan {
     pub ops: Vec<LiveOp>,
-    /// Edits that cannot be sent (saving stays blocked), by instance path.
-    pub unsynced: Vec<String>,
-    /// Properties left out of a create (the rest of the instance is sent).
-    pub skipped: Vec<String>,
+    /// Edits that cannot be sent (saving stays blocked): `(instance, message)`.
+    pub unsynced: Vec<(Ref, String)>,
+    /// Properties left out of a create (the rest of the instance is sent): `(instance, message)`.
+    pub skipped: Vec<(Ref, String)>,
 }
 
 /// Plans one frame's journal marks. `allocate` hands out new instance
@@ -81,9 +81,12 @@ pub fn plan(
             if model.server_id(r).is_some() {
                 deletes.push(r);
             } else if model.lost_referent(r) {
-                out.unsynced.push(format!(
-                    "{}: removed here, but it is still on the Team Create server: another instance has its server referent, so it can't be deleted by it",
-                    path(doc, r)
+                out.unsynced.push((
+                    r,
+                    format!(
+                        "{}: removed here, but it is still on the Team Create server: another instance has its server referent, so it can't be deleted by it",
+                        path(doc, r)
+                    ),
                 ));
             }
         } else if model.server_id(r).is_some() {
@@ -102,7 +105,7 @@ pub fn plan(
                 top = parent;
             }
             if doc.dom.get_by_ref(top).is_some_and(|i| i.parent() == root) {
-                out.unsynced.push(format!("{}: a service the Team Create server does not have", path(doc, top)));
+                out.unsynced.push((top, format!("{}: a service the Team Create server does not have", path(doc, top))));
                 continue;
             }
             if !create_roots.contains(&top) {
@@ -115,9 +118,12 @@ pub fn plan(
     let mut deferred: Vec<(Ref, String)> = Vec::new();
     for top in create_roots {
         let Some(parent) = doc.dom.get_by_ref(top).and_then(|i| model.server_id(i.parent())) else {
-            out.unsynced.push(format!(
-                "{}: its parent is not on the Team Create server (a service it does not have?)",
-                path(doc, top)
+            out.unsynced.push((
+                top,
+                format!(
+                    "{}: its parent is not on the Team Create server (a service it does not have?)",
+                    path(doc, top)
+                ),
             ));
             continue;
         };
@@ -142,7 +148,7 @@ pub fn plan(
             let id = match id {
                 Ok(id) => id,
                 Err(error) => {
-                    out.unsynced.push(format!("{}: {error}", path(doc, r)));
+                    out.unsynced.push((r, format!("{}: {error}", path(doc, r))));
                     continue;
                 }
             };
@@ -161,7 +167,7 @@ pub fn plan(
         let (Some(id), Some(inst)) = (model.server_id(r), doc.dom.get_by_ref(r)) else { continue };
         match model.server_id(inst.parent()) {
             Some(parent) => out.ops.push(LiveOp::Reparent { reference: r, id, parent }),
-            None => out.unsynced.push(format!("{}: moved under an instance that is not on the server", path(doc, r))),
+            None => out.unsynced.push((r, format!("{}: moved under an instance that is not on the server", path(doc, r)))),
         }
     }
     // A NewObject carrying any Ref-typed property (Motor6D.Part0,
@@ -174,7 +180,7 @@ pub fn plan(
         let (Some(id), Some(inst)) = (model.server_id(r), doc.dom.get_by_ref(r)) else { continue };
         match doc.prop(r, &name).as_ref().and_then(|v| live_value(v, model)) {
             Some(value) => out.ops.push(LiveOp::Property { reference: r, id, class: inst.class.to_string(), name, value }),
-            None => out.unsynced.push(format!("{}.{name}: refers to an instance that is not on the Team Create server", path(doc, r))),
+            None => out.unsynced.push((r, format!("{}.{name}: refers to an instance that is not on the Team Create server", path(doc, r)))),
         }
     }
     let mut props_seen = HashSet::new();
@@ -214,7 +220,7 @@ pub fn plan(
                 name: name.to_string(),
                 value,
             }),
-            None => out.unsynced.push(format!("{}.{name}: Team Create cannot synchronize this value yet", path(doc, r))),
+            None => out.unsynced.push((r, format!("{}.{name}: Team Create cannot synchronize this value yet", path(doc, r)))),
         }
     }
     // Deepest first, so a child is never named after its server parent went.
@@ -262,7 +268,7 @@ fn in_place(doc: &Document, r: Ref) -> bool {
 /// plugin made with RunContext = Legacy and Disabled = false set explicitly,
 /// while ModuleScripts (no such properties) went through. A value without a
 /// wire form is left out and reported; the rest of the instance is created.
-fn create_props(doc: &Document, model: &LiveModel, r: Ref, skipped: &mut Vec<String>, deferred: &mut Vec<(Ref, String)>) -> Vec<(String, PropValue)> {
+fn create_props(doc: &Document, model: &LiveModel, r: Ref, skipped: &mut Vec<(Ref, String)>, deferred: &mut Vec<(Ref, String)>) -> Vec<(String, PropValue)> {
     let Some(inst) = doc.dom.get_by_ref(r) else { return Vec::new() };
     let mut props = vec![("Name".to_string(), PropValue::String(inst.name.clone()))];
     let mut names: Vec<_> = inst.properties.iter().collect();
@@ -284,7 +290,7 @@ fn create_props(doc: &Document, model: &LiveModel, r: Ref, skipped: &mut Vec<Str
         }
         match live_value(value, model) {
             Some(value) => props.push((name.to_string(), value)),
-            None => skipped.push(format!("{}.{name}: its value has no Team Create form yet", path(doc, r))),
+            None => skipped.push((r, format!("{}.{name}: its value has no Team Create form yet", path(doc, r)))),
         }
     }
     props
@@ -339,24 +345,47 @@ pub fn renew_shared_script_guids(doc: &mut Document, model: &LiveModel, marks: &
     }
 }
 
-/// State the server streams to clients and never takes back: an instance
-/// copied from the live DataModel keeps it, and sending it in a NewObject
-/// reset a test place's session (0x104, 2026-11-21: a pasted R6 rig whose
-/// Parts carried NetworkOwnerV3 and whose containers carried
-/// numExpectedDirectChildren). Covers the runtime-only properties
-/// (not saved, not scriptable) and the ones the reflection DB doesn't list
-/// but the stream carries.
+/// State the server streams to clients and never takes back, or local/runtime
+/// state the server never replicates: an instance copied from the live
+/// DataModel keeps it, and sending it in a NewObject reset a test place's
+/// session (0x104, 2026-11-21: a pasted R6 rig whose Parts carried
+/// NetworkOwnerV3 and whose containers carried numExpectedDirectChildren).
+/// Built-in Studio plugins also write non-replicated local properties (such as
+/// `StarterGui.ProcessUserInput`), which the server's replication schema does
+/// not list and which would otherwise fail sync and block saving.
+///
+/// Covers runtime-only properties (`DoesNotSerialize` with `NotScriptable` or
+/// `NotReplicated`, excluding properties with an explicit wire alias in
+/// `writer::wire_name` such as `MaterialVariant` and `Sandboxed`), stream-only
+/// properties absent from the reflection DB, and newer non-replicated runtime
+/// properties from `api-dump.json`.
 pub fn server_owned(class: &str, name: &str) -> bool {
     use rbx_reflection::{PropertyKind, PropertySerialization, PropertyTag};
     if matches!(name, "numExpectedDirectChildren" | "NetworkOwnerV3" | "NetworkOwnerV2" | "NetworkIsSleeping") {
         return true;
     }
+    let has_wire_alias = rustudio_net::writer::wire_name(name) != name;
     let db = rustudio_core::doc::db();
-    let Some(class) = db.classes.get(class) else { return false };
-    db.superclasses_iter(class).find_map(|c| c.properties.get(name)).is_some_and(|p| {
-        p.tags.contains(&PropertyTag::NotScriptable)
-            && matches!(p.kind, PropertyKind::Canonical { serialization: PropertySerialization::DoesNotSerialize })
-    })
+    if let Some(cls) = db.classes.get(class) {
+        if let Some(p) = db.superclasses_iter(cls).find_map(|c| c.properties.get(name)) {
+            if !matches!(p.kind, PropertyKind::Canonical { serialization: PropertySerialization::DoesNotSerialize }) {
+                return false;
+            }
+            return p.tags.contains(&PropertyTag::NotScriptable)
+                || (!has_wire_alias && p.tags.contains(&PropertyTag::NotReplicated));
+        }
+    }
+    if !has_wire_alias {
+        if let Some(api) = rustudio_core::api::get() {
+            if let Some((_, m)) = api.lookup(class, name) {
+                return m.kind == rustudio_core::api::Kind::Property
+                    && m.not_replicated
+                    && !m.can_load
+                    && !m.can_save;
+            }
+        }
+    }
+    false
 }
 
 /// `game.Workspace.Model.Part` (or `(removed) Part`).
@@ -731,7 +760,7 @@ mod tests {
         let plan = live.plan();
         assert!(plan.ops.is_empty());
         assert_eq!(plan.unsynced.len(), 1);
-        assert!(plan.unsynced[0].starts_with("ReplicatedFirst.First"), "{:?}", plan.unsynced);
+        assert!(plan.unsynced[0].1.starts_with("ReplicatedFirst.First"), "{:?}", plan.unsynced);
     }
 
     /// Place A's LocalMapAssets: a new script was given the folder's referent (a
@@ -758,7 +787,47 @@ mod tests {
         let plan = live.plan();
         assert!(plan.ops.is_empty(), "{plan:?}");
         assert_eq!(plan.unsynced.len(), 1);
-        assert!(plan.unsynced[0].contains("still on the Team Create server"), "{:?}", plan.unsynced);
+        assert!(plan.unsynced[0].1.contains("still on the Team Create server"), "{:?}", plan.unsynced);
+    }
+
+    /// Built-in plugins write non-replicated runtime properties like
+    /// `StarterGui.ProcessUserInput`; they must never be sent to Team Create
+    /// (which would fail sync and block saving), while replicated properties
+    /// that use a wire alias (`Size`, `Color`, `MaterialVariant`, `Sandboxed`…)
+    /// must still be sent.
+    #[test]
+    fn non_replicated_runtime_properties_are_skipped_without_dropping_wire_aliases() {
+        assert!(server_owned("StarterGui", "ProcessUserInput"));
+        assert!(server_owned("WrapLayer", "Color"));
+        for (class, prop) in [
+            ("Part", "Size"),
+            ("Part", "Color"),
+            ("Part", "Shape"),
+            ("Part", "MaterialVariant"),
+            ("Part", "CollisionGroup"),
+            ("MeshPart", "RenderFidelity"),
+            ("MeshPart", "MeshId"),
+            ("MeshPart", "TextureID"),
+            ("Script", "Sandboxed"),
+            ("Script", "Source"),
+            ("Folder", "Attributes"),
+            ("Frame", "Position"),
+        ] {
+            assert!(!server_owned(class, prop), "{class}.{prop} must replicate");
+        }
+
+        let (mut live, [.., root]) = Live::new();
+        let sg = live.doc.dom.insert(root, InstanceBuilder::new("StarterGui").with_name("StarterGui"));
+        live.model.bind_local(0x2444, sg);
+        live.start();
+        live.doc.set_props(
+            "Plugin",
+            vec![(sg, rbx_dom_weak::ustr("ProcessUserInput"), Variant::Bool(false))],
+            None,
+        );
+        let plan = live.plan();
+        assert!(plan.ops.is_empty(), "{:?}", plan.ops);
+        assert!(plan.unsynced.is_empty(), "{:?}", plan.unsynced);
     }
 }
 
@@ -851,10 +920,10 @@ mod studio_parity_tests {
             next += 1;
             Ok(next)
         });
-        for line in &plan.skipped {
+        for (_, line) in &plan.skipped {
             println!("SKIPPED {line}");
         }
-        for line in &plan.unsynced {
+        for (_, line) in &plan.unsynced {
             println!("UNSYNCED {line}");
         }
         for op in plan.ops {
@@ -935,7 +1004,7 @@ mod studio_parity_tests {
                 next += 1;
                 Ok(next)
             });
-            for line in &plan.skipped {
+            for (_, line) in &plan.skipped {
                 println!("SKIPPED {line}");
             }
             for op in plan.ops {

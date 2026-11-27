@@ -416,6 +416,9 @@ pub(crate) struct VmProf {
     script_names: HashMap<rbx_dom_weak::types::Ref, Name>,
     /// Thread pointer → script name, for threads the memory map doesn't know.
     thread_names: HashMap<usize, Option<Name>>,
+    /// The scripts this VM's last heap poll reported: the next poll zeroes
+    /// only those (another VM of the same kind owns the other rows).
+    heap_names: Vec<Name>,
 }
 
 type Proc = unsafe extern "C-unwind" fn(*mut ffi::lua_State, std::ffi::c_int);
@@ -439,7 +442,7 @@ pub(crate) fn attach(lua: &mlua::Lua, callbacks: *mut ffi::lua_Callbacks) {
         last_heap: Mutex::new(None),
     });
     slots().push(slot.clone());
-    lua.set_app_data(VmProf { slot, script_names: HashMap::new(), thread_names: HashMap::new() });
+    lua.set_app_data(VmProf { slot, script_names: HashMap::new(), thread_names: HashMap::new(), heap_names: Vec::new() });
     init_from_env();
     static EXT: std::sync::Once = std::sync::Once::new();
     // Saved captures (.rsprof / Chrome trace) carry the script profile.
@@ -502,12 +505,22 @@ fn poll_heap(lua: &mlua::Lua, kind: VmKind) {
         .iter()
         .filter_map(|&(r, bytes, threads)| script_name(lua, r).map(|n| (n, bytes as u64, threads)))
         .collect();
+    // Scripts this VM reported last time and no longer holds memory in go to
+    // zero; rows of the same kind from another VM (several Server VMs at
+    // once, or tests in parallel) are left alone.
+    let gone: Vec<Name> = {
+        let Some(mut p) = lua.app_data_mut::<VmProf>() else { return };
+        let now: Vec<Name> = named.iter().map(|(n, _, _)| *n).collect();
+        let gone = p.heap_names.iter().copied().filter(|n| !now.contains(n)).collect();
+        p.heap_names = now;
+        gone
+    };
     let mut s = state();
     let vm = s.vms.entry(kind).or_default();
     vm.heap_total = mem.total as u64;
     vm.heap_other = mem.other as u64;
-    for (k, st) in s.scripts.iter_mut() {
-        if k.0 == kind {
+    for n in gone {
+        if let Some(st) = s.scripts.get_mut(&(kind, n)) {
             st.heap = 0;
             st.threads = 0;
         }

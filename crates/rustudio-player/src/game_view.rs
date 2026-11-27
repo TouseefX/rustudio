@@ -589,6 +589,24 @@ impl Game {
         std::mem::swap(&mut self.draws_asset_gen, &mut self.vf_draws_asset_gen);
     }
 
+    /// Whether any of the parts that only moved can change a light grid
+    /// of `voxel`-stud cells: an opaque part in the grid (`light`) of at
+    /// least a quarter of a voxel's volume (a 4×2×2 torso at 4 studs: no;
+    /// a door, a crate, a car: yes). Many movers at once (a collapsing
+    /// building, a train of parts) count without looking.
+    fn moves_matter(&self, moved: &[Ref], voxel: f32) -> bool {
+        const MANY: usize = 256;
+        if moved.len() > MANY {
+            return true;
+        }
+        let min_volume = voxel * voxel * voxel * 0.25;
+        moved.iter().any(|r| {
+            self.scene
+                .get(*r)
+                .is_some_and(|sp| sp.light.is_some() && sp.size.x * sp.size.y * sp.size.z >= min_volume)
+        })
+    }
+
     /// `sync_draws` for one scene: the world's, or (`layered`) the parts
     /// in ViewportFrames, each in its frame's renderer layer.
     fn sync_draws_of(&mut self, layered: bool, live_redo: &[Ref]) {
@@ -602,10 +620,29 @@ impl Game {
             self.lighting.lightgrid_dirty = true;
             self.lighting.lightocc_dirty = true;
         } else if !changes.moved.is_empty() {
-            // Moving parts (characters, zombies, physics) refresh the grid
+            // Moving parts (characters, zombies, physics) refresh the grids
             // on a slower clock: a rebuild gathers every part around it.
-            self.lighting.lightgrid_moves = true;
-            self.lighting.lightocc_dirty = true;
+            // A phone in Play rebuilds only for parts a grid's voxels can
+            // see (`moves_matter`): a character's limbs, debris and bullets
+            // move every frame and change little in a 4-stud voxel, yet
+            // rebuilt both grids on their clocks for as long as anyone
+            // walked (a gather over every part of the place on the UI
+            // thread, a worker, a 3D texture upload: a hitch each 0.5–1.5 s
+            // on a phone). The cost: a walking character's voxel shade
+            // stays where the last rebuild put it until a door, a car or
+            // an edit moves the grid on.
+            if cfg!(target_os = "android") && self.is_playing() {
+                let occ_voxel = rustudio_render::lightocc::voxel_size(rustudio_render::lighting::soft_style(&self.doc));
+                if self.moves_matter(&changes.moved, rustudio_render::lightgrid::VOXEL) {
+                    self.lighting.lightgrid_moves = true;
+                }
+                if self.moves_matter(&changes.moved, occ_voxel) {
+                    self.lighting.lightocc_dirty = true;
+                }
+            } else {
+                self.lighting.lightgrid_moves = true;
+                self.lighting.lightocc_dirty = true;
+            }
         }
         let regen = self.asset_gen != self.draws_asset_gen;
         if regen && !layered {
@@ -924,6 +961,7 @@ impl Game {
                             maps.release_pixels();
                         }
                         Lookup::Ready(_) if textures.over_upload_budget() => {
+                            textures.touch_decoded(color);
                             textures.defer_upload();
                             waiting = true;
                         }
@@ -2223,6 +2261,13 @@ impl Game {
         }
     }
 
+    /// The 3D view's settings for a frame report (perf_report.rs): the
+    /// quality level in force (Automatic's or the setting's; None: the
+    /// full manual profile), the render target and its samples a pixel.
+    pub fn perf_view(&self) -> (Option<u8>, Option<([u32; 2], u32)>) {
+        (self.quality_profile().map(|p| p.level()), self.renderer.as_ref().and_then(|r| r.target_info()))
+    }
+
     fn quality_profile(&self) -> Option<rustudio_render::quality::Profile> {
         if self.is_playing() {
             if let Some(level) = rustudio_engine::gui::share().saved_quality {
@@ -2298,10 +2343,15 @@ impl Game {
             self.env_probe.update(self.cam.pos, self.cam.forward(), dt, now, revision, &ray)
         });
         let vp_render = rustudio_core::bench::scope("vp_render");
+        // World GUIs or effects to draw into the scene below (the GUI's
+        // batches of this frame; the effects as of the last one): the
+        // post-processing waits for them (render.rs `postfx_after_gui`).
+        let gui_after = self.gui.world_batches.iter().any(|b| !b.indices.is_empty()) || self.effects.drew_last();
         let tex = match (self.renderer.as_mut(), self.render_state.as_ref()) {
-            (Some(r), Some(rs)) => r.render(
+            (Some(r), Some(rs)) => r.render_with_gui_after(
                 rs,
                 size,
+                gui_after,
                 &Frame {
                     globals,
                     postfx,
@@ -2383,6 +2433,7 @@ impl Game {
         // including when Show UI / RUSTUDIO_NO_GUI skips Gui::draw; otherwise
         // live particles and beams accumulate all previous frames' geometry.
         self.gui.world_batches.clear();
+        self.gui.begin_vram_frame();
         let playing = self.play.is_some();
         self.gui.pointer_override = self.lock_center_held().then(|| rect.center());
         {
@@ -2803,18 +2854,20 @@ impl Game {
             .as_ref()
             .and_then(|p| p.parent())
             .map(|p| p.to_path_buf());
-        // Every face's bytes first: nothing is decoded while one downloads.
+        // Every face's bytes first: queue all 6 downloads in parallel and wait
+        // until none are pending before decoding.
         let mut bytes = Vec::new();
+        let mut pending = false;
         for id in &faces {
             match self.assets.content(id, doc_dir.as_deref()) {
                 rustudio_core::assets::Fetch::Ready(b) => bytes.push(b),
-                // Still downloading: try again next frame.
-                rustudio_core::assets::Fetch::Pending => {
-                    self.lighting.sky_failed = true;
-                    return;
-                }
-                rustudio_core::assets::Fetch::Unavailable(_) => break,
+                rustudio_core::assets::Fetch::Pending => pending = true,
+                rustudio_core::assets::Fetch::Unavailable(_) => {}
             }
+        }
+        if pending {
+            self.lighting.sky_failed = true;
+            return;
         }
         self.lighting.sky_key = key.clone();
         self.lighting.sky_failed = false;

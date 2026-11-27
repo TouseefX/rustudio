@@ -189,6 +189,7 @@ impl RunHarness {
                     Level::Info => "info",
                     Level::Warn => "warning",
                     Level::Error => "error",
+                    Level::System => "system",
                 };
                 serde_json::json!({"level": level, "text": l.text.replace(STACK_MARK, "")})
             })
