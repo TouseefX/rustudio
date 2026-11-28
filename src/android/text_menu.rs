@@ -48,12 +48,18 @@ impl TextMenu {
     /// At the end of `App::ui`, after every text field was drawn.
     pub fn end_frame(&mut self, ctx: &egui::Context) {
         let focused = focused_text(ctx);
-        let response = focused.and_then(|id| ctx.read_response(id));
-        // A right click (a long press) on the focused field: by place, not
+        // A long press goes out as a secondary click alone (touch_input.rs),
+        // so an unfocused field never got the primary click that would have
+        // focused it: the field from the frame before is the one under the
+        // finger. Its rect is checked below, so a press elsewhere opens no
+        // menu on it.
+        let candidate = focused.or_else(|| self.prev.map(|(id, _)| id));
+        let response = candidate.and_then(|id| ctx.read_response(id));
+        // A right click (a long press) on a text field: by place, not
         // by the field's response, since the Properties panel lays its
         // own click catcher over its edit box (properties.rs `text_cell`).
         let (secondary, at) = ctx.input(|i| (i.pointer.button_clicked(egui::PointerButton::Secondary), i.pointer.interact_pos()));
-        let clicked = match (focused, response.as_ref(), at) {
+        let clicked = match (candidate, response.as_ref(), at) {
             (Some(id), Some(r), Some(p)) if secondary && self.open.is_none() && r.rect.expand(4.0).contains(p) => Some((id, r)),
             _ => None,
         };
@@ -76,6 +82,12 @@ impl TextMenu {
             let surrender = ctx.options_mut(|o| {
                 std::mem::replace(&mut o.input_options.surrender_focus_on, egui::SurrenderFocusOn::Never)
             });
+            // The long press alone never focused the field; the menu's
+            // Cut / Copy / Paste events are for it, so give it the focus
+            // now (and hold it through the menu below).
+            if focused != Some(id) && !ctx.memory(|m| m.has_focus(id)) {
+                ctx.memory_mut(|m| m.request_focus(id));
+            }
             // Open in egui's memory, as the context menus are: the touch
             // layer asks `Popup::is_any_open` whether a long press came to
             // something before it lets the finger drag.
@@ -90,7 +102,7 @@ impl TextMenu {
         }
         if let Some(open) = self.open.as_ref() {
             let id = Id::new(ID);
-            let mut keep = focused == Some(open.field) && egui::Popup::is_id_open(ctx, id);
+            let mut keep = ctx.memory(|m| m.has_focus(open.field)) && egui::Popup::is_id_open(ctx, id);
             let selection = egui::TextEdit::load_state(ctx, open.field)
                 .and_then(|s| s.cursor.char_range())
                 .is_some_and(|r| !r.is_empty());

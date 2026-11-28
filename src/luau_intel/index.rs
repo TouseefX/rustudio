@@ -2512,22 +2512,37 @@ fn skip_number(source: &str, index: &mut usize) {
 /// One lexical token, skipping comments, strings, numbers, and whitespace.
 fn next_token<'a>(source: &'a str, index: &mut usize, line: &mut usize) -> Option<Token<'a>> {
     let bytes = source.as_bytes();
+
     loop {
         let i = *index;
-        let Some(&byte) = bytes.get(i) else { return None };
+        let Some(&byte) = bytes.get(i) else {
+            return None;
+        };
+
         match byte {
             b'\n' => {
                 *index += 1;
                 *line += 1;
                 return Some(Token::Newline);
             }
-            b' ' | b'\t' | b'\r' | 0x0b | 0x0c => *index += 1,
+
+            b' ' | b'\t' | b'\r' | 0x0b | 0x0c => {
+                *index += 1;
+            }
+
             b'-' if bytes.get(i + 1) == Some(&b'-') => {
                 *index += 2;
                 skip_comment(source, index, line);
             }
-            b'"' | b'\'' => skip_quoted_string(source, index, line),
-            b'`' => skip_interpolated_string(source, index, line),
+
+            b'"' | b'\'' => {
+                skip_quoted_string(source, index, line);
+            }
+
+            b'`' => {
+                skip_interpolated_string(source, index, line);
+            }
+
             b'[' => {
                 if let Some(level) = long_bracket_level(source, i) {
                     *index += 2 + level;
@@ -2537,33 +2552,50 @@ fn next_token<'a>(source: &'a str, index: &mut usize, line: &mut usize) -> Optio
                     return Some(Token::Op("["));
                 }
             }
-            b'0'..=b'9' => skip_number(source, index),
+
+            b'0'..=b'9' => {
+                skip_number(source, index);
+            }
+
             b'.' if bytes.get(i + 1).is_some_and(|byte| byte.is_ascii_digit()) => {
                 skip_number(source, index);
             }
+
             b'A'..=b'Z' | b'a'..=b'z' | b'_' => {
                 let start = i;
                 *index += 1;
+
                 while bytes
                     .get(*index)
                     .is_some_and(|byte| byte.is_ascii_alphanumeric() || *byte == b'_')
                 {
                     *index += 1;
                 }
+
                 return Some(Token::Word(&source[start..*index]));
             }
+
             _ => {
                 let rest = &source[i..];
-                if let Some(&operator) = MULTI_CHAR_OPS.iter().find(|op| rest.starts_with(*op)) {
+
+                if let Some(&operator) = MULTI_CHAR_OPS
+                    .iter()
+                    .find(|op| rest.starts_with(*op))
+                {
                     *index += operator.len();
                     return Some(Token::Op(operator));
                 }
+
                 let operator = single_operator(byte);
+
                 if !operator.is_empty() {
                     *index += 1;
                     return Some(Token::Op(operator));
                 }
-                *index += 1;
+
+                // Advance by a complete UTF-8 character instead of one byte.
+                let ch = rest.chars().next()?;
+                *index += ch.len_utf8();
             }
         }
     }

@@ -606,21 +606,21 @@ the room away at once.
 
 The soft keyboard has no Ctrl, egui's text fields have no menu of their
 own, and egui-winit has no clipboard on Android. So while the keyboard is
-up for anything **without the input-connection bridge** (its dex failed
-to load: `ime: bridge …` in logcat says), a **text bar** stands in a band
+up for anything, a **text bar** stands in a band
 right above it (`src/android/text_bar.rs`, `HEIGHT` points; part of the
 room keyboard.rs makes, or of what the view slides up for a game's
 TextBox — `text_bar::in_use`): Cut, Copy, Paste and Select all for an
 egui field, Paste and Copy for a Roblox TextBox (a game's in Play, a
 plugin widget's), fed to egui as the events the shortcuts would be
 (`Event::Cut` / `Copy` / `Paste(text)` / Ctrl+A) through `raw_input_hook`
-on the next frame. With the bridge there is no bar: the keyboard's own
-paste, clipboard panel and Select all reach the field through the input
-connection (`commitText`, `performContextMenuAction`), and the bar only
-took a band of the screen — a dark strip labelled "Text" / "TextBox" over
-a game in Play, where the keyboard lies over the view, which a 2026-11
-report called a black bar covering the text. Whatever room the keyboard
-takes is painted the window's colour (`Keyboard::shrink`): the band
+on the next frame. The bar is up with the bridge as well: the keyboard's
+own paste, clipboard panel and Select all can reach the field through the
+input connection (`commitText`, `performContextMenuAction`), but a
+2026-11 Android 13 report had a keyboard whose panel did nothing, and a
+game's TextBox has no long-press menu. The dark strip labelled "Text" /
+"TextBox" over a game in Play is the price of a paste that works.
+Whatever room the keyboard takes is painted the window's colour
+(`Keyboard::shrink`): the band
 between the panels' end and the keyboard's top was left unpainted, black,
 the moment the keyboard went before the next height reading, and while
 the bar's band was reserved with the bar not up. egui's `TextEdit` answers

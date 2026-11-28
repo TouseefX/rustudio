@@ -30,14 +30,13 @@
 //! focus all the same, it is asked back for the frame the event is handled
 //! in (as the long-press menu does).
 //!
-//! With the input-connection bridge (ime.rs) there is no bar: the
-//! keyboard's own paste, clipboard panel and Select all reach the field
-//! through its `InputConnection` (`commitText`, `performContextMenuAction`),
-//! so the bar only took a band of the screen — a dark strip labelled
-//! "Text" / "TextBox" over a game in Play, where the keyboard lies over
-//! the view — and its band stood unpainted (black) over panel text while
-//! the keyboard was up for nothing. The bar is the fallback for a phone
-//! whose bridge failed to load ([`in_use`]).
+//! The bar is always up while the keyboard is up, also with the
+//! input-connection bridge (ime.rs). A 2026-11 Android 13 report had a
+//! keyboard whose clipboard panel and Select all never reached the field
+//! through its `InputConnection`, and a game TextBox has no long-press menu
+//! at all: a band of the screen with the four entries is the reliable way
+//! to paste. The bridge's own actions still work when a keyboard provides
+//! them ([`in_use`]); the bar is not a fallback for a failed bridge only.
 
 use egui::{Align, Event, Id, Key, Layout, Modifiers, Order, Pos2, Rect, SurrenderFocusOn};
 
@@ -46,10 +45,12 @@ use super::keyboard::{Keyboard, Want};
 /// The bar's band, in points.
 pub const HEIGHT: f32 = 34.0;
 
-/// Whether the bar (and its band in `Keyboard::room`) is in use: only
-/// without the input-connection bridge (the module comment).
+/// Whether the bar (and its band in `Keyboard::room`) is in use. Always:
+/// the keyboard's own context-menu actions are not available on every
+/// phone (a 2026-11 Android 13 report), and a Roblox TextBox has no other
+/// menu ([`super::text_menu`]).
 pub fn in_use() -> bool {
-    !super::ime::available()
+    true
 }
 
 const ID: &str = "rustudio text bar";
