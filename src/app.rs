@@ -2828,6 +2828,32 @@ impl RustudioApp {
     }
 
     /// One frame, in eframe's window or offscreen (src/offscreen.rs).
+    /// Android, at the end of a frame: the soft keyboard follows what
+    /// there is to type into (src/android/keyboard.rs; egui-winit gets no
+    /// IME output, src/android/ime.rs), with the Cut / Copy / Paste bar
+    /// over it (src/android/text_bar.rs).
+    #[cfg(target_os = "android")]
+    fn keyboard_end_frame(&mut self, ctx: &egui::Context) {
+        let textbox = self.ed.textbox_focused();
+        let want = crate::android::keyboard::wanted(ctx, textbox);
+        crate::android::ime::end_frame(ctx, textbox);
+        self.text_bar.end_frame(ctx, &self.keyboard, want);
+        self.keyboard.end_frame(ctx, textbox);
+    }
+
+    /// Android, at the end of a frame: all of the phone's text handling —
+    /// the keyboard and bar (`keyboard_end_frame`), text copied this frame
+    /// to the system clipboard too, and a long press's Cut / Copy / Paste
+    /// menu (src/android/text_menu.rs). Every way out of a frame that
+    /// shows a text field passes here (the editor, a game filling the
+    /// screen, the Start Page).
+    #[cfg(target_os = "android")]
+    fn text_end_frame(&mut self, ctx: &egui::Context) {
+        self.keyboard_end_frame(ctx);
+        crate::android::clipboard::after_frame(ctx);
+        self.text_menu.end_frame(ctx);
+    }
+
     pub fn frame(&mut self, ui: &mut egui::Ui) {
         // A display frame ends here and the next begins (the profiler gathers
         // every thread's records at this boundary).
@@ -3055,6 +3081,13 @@ impl RustudioApp {
             if ed.game.account.busy() || ed.game.assets.busy() {
                 ctx.request_repaint();
             }
+            // The phone's text handling, as at the end of the editor's
+            // frame below: the Start Page's fields (the search box, a new
+            // place's name, the sign-in) had no soft keyboard, no Cut /
+            // Copy / Paste bar or menu and no copy to the system clipboard
+            // — this return came before them.
+            #[cfg(target_os = "android")]
+            self.text_end_frame(&ctx);
             self.watchdog.complete();
             return;
         }
@@ -3308,13 +3341,7 @@ impl RustudioApp {
         // gets no IME output (src/android/keyboard.rs). Over the keyboard,
         // the text bar (src/android/text_bar.rs).
         #[cfg(target_os = "android")]
-        {
-            let textbox = self.ed.textbox_focused();
-            let want = crate::android::keyboard::wanted(&ctx, textbox);
-            crate::android::ime::end_frame(&ctx, textbox);
-            self.text_bar.end_frame(&ctx, &self.keyboard, want);
-            self.keyboard.end_frame(&ctx, textbox);
-        }
+        self.keyboard_end_frame(&ctx);
         // The memory, as it grows (src/android/memory.rs).
         #[cfg(target_os = "android")]
         {
@@ -3461,11 +3488,7 @@ impl RustudioApp {
         // The soft keyboard over a game's TextBox (the chat), as in `frame`.
         #[cfg(target_os = "android")]
         {
-            let textbox = self.ed.textbox_focused();
-            let want = crate::android::keyboard::wanted(ctx, textbox);
-            crate::android::ime::end_frame(ctx, textbox);
-            self.text_bar.end_frame(ctx, &self.keyboard, want);
-            self.keyboard.end_frame(ctx, textbox);
+            self.keyboard_end_frame(ctx);
             let doing = match &self.ed.game.doc.path {
                 Some(p) => format!("playing {}", p.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default()),
                 None => String::new(),

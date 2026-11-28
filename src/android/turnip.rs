@@ -89,10 +89,11 @@
 //! device keeps its driver and the window doesn't
 //! offer the switch. The swap is also skipped on other ABIs than
 //! arm64-v8a, below Android 12 (the fork's floor), when the files aren't
-//! in the APK, when turned off (Graphics Settings > GPU driver, or
-//! `RUSTUDIO_TURNIP=0`), and after a start that didn't get to its first
-//! frames with Turnip (a marker file this module keeps; the window
-//! offers "Try again"). `RUSTUDIO_TURNIP=1` overrides the window's choice
+//! in the APK, unless turned on (View > GPU Driver: the swap is opt-in,
+//! off by default — [`wanted`]; `RUSTUDIO_TURNIP=0` keeps it off), and
+//! after a start that didn't get to its first frames with Turnip (a
+//! marker file this module keeps; the window offers "Try again").
+//! `RUSTUDIO_TURNIP=1` overrides the window's choice
 //! and the marker; `RUSTUDIO_TURNIP=force` also skips the device checks
 //! (the GPU, model, HyperOS and Android version ones). `RUSTUDIO_GPU_TURBO=1` asks libadrenotools for the GPU's top
 //! clocks (`adrenotools_set_turbo`; thermal limits still apply; an ioctl
@@ -224,9 +225,17 @@ fn dir() -> PathBuf {
     super::files_dir().join("turnip")
 }
 
-/// Graphics Settings' choice: on unless the `off` marker is there.
+/// Graphics Settings' choice: off unless the `on` marker is there. The
+/// Mesa driver is opt-in: the swap was on by default for every eligible
+/// phone until some of them crashed at start or in their first frames
+/// with it (the failed-start marker below catches a crash before the
+/// first frames, not one in the first minutes of a session), and a
+/// phone's own driver is the one its games run on. View > GPU Driver
+/// turns it on for the phones it helps. (An `off` marker from the time
+/// it was opt-out still means off, so a choice made then holds.)
 pub fn wanted() -> bool {
-    !dir().join("off").exists()
+    let d = dir();
+    d.join("on").exists() && !d.join("off").exists()
 }
 
 /// Graphics Settings' switch (takes effect at the next start). Turning it
@@ -235,9 +244,15 @@ pub fn set_wanted(on: bool) {
     let d = dir();
     let _ = std::fs::create_dir_all(&d);
     if on {
+        let _ = std::fs::write(d.join("on"), b"");
         let _ = std::fs::remove_file(d.join("off"));
         let _ = std::fs::remove_file(d.join("failed"));
+        // (a start under the old default that never reached its first
+        // frames left `pending`; the next start would call it a failure
+        // and skip the driver just asked for)
+        let _ = std::fs::remove_file(d.join("pending"));
     } else {
+        let _ = std::fs::remove_file(d.join("on"));
         let _ = std::fs::write(d.join("off"), b"");
     }
 }
@@ -250,6 +265,7 @@ pub fn failed_last_time() -> bool {
 
 pub fn retry() {
     let _ = std::fs::remove_file(dir().join("failed"));
+    let _ = std::fs::remove_file(dir().join("pending"));
 }
 
 /// The editor drew its first frames: the start with Turnip went well.
@@ -981,7 +997,7 @@ fn try_activate() -> Result<Status, Status> {
     let _ = std::fs::create_dir_all(&markers);
     if mode == Mode::Auto {
         if !wanted() {
-            return Err(skip("turned off in Graphics Settings > GPU driver".into(), true));
+            return Err(skip(format!("off (the default): View > GPU Driver turns the {} driver on, from the next start", mesa.name()), true));
         }
         if markers.join("pending").exists() {
             // The last start never got to its first frames.

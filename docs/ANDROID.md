@@ -133,7 +133,7 @@ xbuild quirks worth knowing (commit e67b501):
 | "Open with rustudio" while it runs | Finder's hand-over (`macos::take_opened`) | a second instance of the activity per VIEW intent (`launchMode` `standard`), caught at the library's entry point: its file is copied in and queued for the editor's next frame, the editor's task comes to the front, the new activity finishes unseen (`src/android/intent.rs`). A place the last start died within 20 s of opening by itself isn't opened again by itself (`state/opening`, `storage.rs`) |
 | UI zoom | 1.0 of the display's scale | first run: the zoom that fits ~1100 points across (0.8 … 1.6 of the density), then View > Zoom In / Out as saved |
 | A played game | the dock's 3D view, at the UI zoom (View > Play Fills the Screen off) | View > Play Fills the Screen on: the game alone over the window at zoom 1 (a point is a dp, Roblox's unit on Android) until it ends (`RUSTUDIO_PLAY_FULL`; "The game's canvas" below) |
-| GPU driver | the system's | the device's Vulkan driver, or on Snapdragon phones the Turnip (Mesa) driver shipped in the APK, swapped in before wgpu starts (`src/android/turnip.rs`; "Turnip driver" below) — on an Adreno 6xx with its bandwidth compression (UBWC) off, which restarted a Snapdragon 865 phone outright ("UBWC and the whole-device restarts" below); OpenGL ES as the fallback either way |
+| GPU driver | the system's | the device's Vulkan driver; on Snapdragon phones the Turnip (Mesa) driver shipped in the APK can be swapped in before wgpu starts — **opt-in, off by default** (View > GPU Driver; `src/android/turnip.rs`; "Turnip driver" below): faster on many phones, a crash on some — on an Adreno 6xx with its bandwidth compression (UBWC) off, which restarted a Snapdragon 865 phone outright ("UBWC and the whole-device restarts" below); OpenGL ES as the fallback either way |
 | Graphics quality (File > Studio Settings > rustudio > Performance) | Manual at the full profile, 100% 3D resolution; Automatic from level 5 | weak-GPU mode (`gpu_caps.rs`: every Android device): Automatic from level 1 — no shadows, SSAO, clouds, bloom, DoF, probe or grass until the frame times allow — and 75% 3D resolution (`rustudio_settings::choice_default`); "Frame time on a phone" below. View > GPU Driver names the adapter and holds the Mesa driver switch |
 | Logging | stderr | logcat tag `rustudio` (`log` → android_logger), stdout/stderr forwarded by android-activity |
 | Crash reports | `~/.cache/rustudio/crash/` | `Android/data/dev.rustudio.studio/files/crash/<timestamp>-<pid>.txt` on the shared volume (`adb pull`, or a PC over USB; the private cache folder needed root — and since Android 11 the Files apps can't open `Android/data` either, so the start after a crash copies the report, the session logs (`src/android/logcat.rs`: this run's and the crashed run's) and the app's own `logcat -d` into **`Download/rustudio/rustudio-logs-<stamp>.txt`**, a file any Files app shows and a user can send; Help > Copy Logs to Download does the same at any time: `src/android/logs.rs`, a `MediaStore.Downloads` row the app inserts, no permission needed). Same `crates/rustudio-core/src/crash.rs`: panic hook + signal handlers chain to debuggerd; the next start names the report in Output and logcat (`rustudio crashed last time: panic in thread … at file:line — message`). A report ends with the last 24 notes (`crash::note`): the GPU errors wgpu reported, a lost device, so it says what led up to it |
@@ -1380,9 +1380,14 @@ Arm kbase kernel driver — no root, no custom kernel — MIT; optional, 18 MB),
 libadrenotools-native](https://github.com/TouseefX/libadrenotools-native),
 a fork of bylaws/libadrenotools for apps without Java of their own,
 BSD-2-Clause; the shadowhook / bytehook libraries inside are ByteDance's,
-MIT). On a Snapdragon phone the editor swaps Turnip in for the vendor's
-driver at start, on a Mali phone PanVK (same path, other file: "PanVK"
-below). The device's own driver spent most of the 3D view's
+MIT). On a Snapdragon phone the editor can swap Turnip in for the
+vendor's driver at start, on a Mali phone PanVK (same path, other file:
+"PanVK" below) — **off by default since 0.6.0-port: View > GPU Driver
+turns it on** (`turnip::wanted`, a marker file `files/turnip/on`; the
+swap was on by default for every eligible phone until some crashed at
+start or in their first minutes with it, which the failed-start marker
+only catches when the crash comes before the first frames; a choice of
+"off" made under the old default is kept). The device's own driver spent most of the 3D view's
 frame waiting (the "Frame time on a phone" measurements: ~60 ms of GPU
 time for a baseplate of 12 triangles, a wait rather than drawing); Turnip
 is the driver the emulators on Android reach for because its submit and
@@ -1601,9 +1606,9 @@ the shim honours that, and with an older shim run but not relied on
 falls back to the device's driver, so that wgpu's own loading sees the
 vendor's loader uniformly).
 
-**Switches.** View > GPU Driver has the checkbox (a marker
-file `files/turnip/off`; takes effect at the next start). From adb:
-`RUSTUDIO_TURNIP=0` keeps the device's driver, `=1` ignores the window's
+**Switches.** View > GPU Driver has the checkbox (off by default; the
+marker files `files/turnip/on` / `off`; takes effect at the next start).
+From adb: `RUSTUDIO_TURNIP=0` keeps the device's driver, `=1` ignores the window's
 choice and the failed-start marker, `=force` also skips the device checks
 (for a Snapdragon the properties don't name). `RUSTUDIO_GPU_TURBO=1`
 asks libadrenotools for the GPU's top clocks (`adrenotools_set_turbo`, a
@@ -1955,6 +1960,13 @@ also echoed to logcat at the next start.
 - **Start Page lists wouldn't scroll / taps misfired.** The finger layer
   ran there too, with no viewport to publish its zones, over a page that
   is plain egui; it is off until a place opens (see "Fingers").
+- **No soft keyboard, Cut / Copy / Paste or system clipboard on the Start
+  Page.** `RustudioApp::frame` returned for the Start Page before the
+  end-of-frame text handling that the editor's and a full-screen game's
+  frames reach (`keyboard.end_frame`, the bar, the long-press menu,
+  `clipboard::after_frame`), so its search box, a new place's name and
+  the sign-in fields took no typing and copied nowhere. Every way out
+  of the frame now passes `text_end_frame`.
 - **Lag on a Baseplate with a release APK.** The chrome redrew the 3D
   view every frame it drew itself; see "Frame time on a phone".
 - **The 3D view lags while the camera moves, the chrome less so.** The

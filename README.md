@@ -127,8 +127,9 @@ the Android APKs.
   the app's folder in shared storage (`Android/data/dev.rustudio.studio/
   files`), from any Files app ("Open with"), or from Roblox when signed in;
   Studio's content (the default character, the PlayerModule) is downloaded
-  at the first Play. Phones get the Automatic graphics quality and a Mesa
-  Turnip / PanVK driver switch for Snapdragon and Mali GPUs. Crash reports
+  at the first Play. Phones get the Automatic graphics quality and, under
+  View > GPU Driver, an opt-in Mesa Turnip / PanVK driver for Snapdragon
+  and Mali GPUs (off by default: faster on many phones, a crash on some). Crash reports
   and logs are copied to `Download/rustudio/` (Help > Copy Logs to
   Download). Install the APK from the releases page with `adb install` or
   by opening it on the device.

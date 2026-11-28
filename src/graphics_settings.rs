@@ -98,10 +98,13 @@ fn gpu_driver_section(ui: &mut egui::Ui) {
     let mut on = turnip::wanted();
     if ui
         .checkbox(&mut on, format!("{} (Mesa) Vulkan driver", mesa.name()))
-        .on_hover_text(format!("Mesa's open-source {} driver in place of the phone's, from the next start on", mesa.gpus()))
+        .on_hover_text(format!("Mesa's open-source {} driver in place of the phone's, from the next start on. Off by default: it draws faster on many phones and crashes on some; try it, and untick it if the app stops starting or closes in its first minutes.", mesa.gpus()))
         .changed()
     {
         turnip::set_wanted(on);
+    }
+    if !on && !st.active {
+        ui.small(RichText::new(format!("Off by default. {} is faster on many {} phones and crashes on some; worth a try if the 3D view is slow.", mesa.name(), mesa.gpus())).weak());
     }
     if turnip::failed_last_time() {
         ui.horizontal_wrapped(|ui| {
