@@ -17,6 +17,7 @@ pub mod characters;
 pub mod cloud;
 pub mod config;
 pub mod data;
+pub mod game_settings;
 pub mod http;
 pub mod mock;
 pub mod plugins;

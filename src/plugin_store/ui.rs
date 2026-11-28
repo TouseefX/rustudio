@@ -9,6 +9,8 @@
 //! plugins show as Studio's Allow / Deny dialogs. Also Publish as Plugin's
 //! confirm dialog.
 
+use std::path::{Path, PathBuf};
+
 use egui::{Align, Color32, Layout, RichText, Sense, Vec2};
 
 use super::manager::PluginManager;
@@ -17,9 +19,48 @@ use super::{PluginKind, PluginSource};
 use rustudio_core::assets::SharedClient;
 use rustudio_engine::theme;
 
+/// Kind of a Built-in Suite entry shown in Manage Plugins.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SuiteItemKind {
+    NativeRust,
+    BundledLuau,
+}
+
+/// One Built-in Suite plugin entry rendered in Manage Plugins.
+#[derive(Clone, Debug)]
+pub struct SuiteItem {
+    pub id: String,
+    pub name: String,
+    pub description: String,
+    pub kind: SuiteItemKind,
+    pub enabled: bool,
+    /// True when Studio Settings routes this tool to Roblox's `.rbxm` plugin.
+    pub overridden_by_roblox: bool,
+    pub path: Option<PathBuf>,
+    pub errors: Vec<String>,
+}
+
+/// User actions triggered in the Built-in Suite section of Manage Plugins.
+#[derive(Clone, Debug)]
+pub enum SuiteAction {
+    ToggleNative(String, bool),
+    ToggleBundled(PathBuf, bool),
+    ReloadBundled(PathBuf),
+    OpenSuiteFolder(PathBuf),
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ManageTab {
+    #[default]
+    Plugins,
+    BuiltIn,
+}
+
 #[derive(Default)]
 pub struct ManageUi {
     pub open: bool,
+    pub tab: ManageTab,
+    pub suite_filter: String,
     pub find: bool,
     pub query: String,
     pub install_id: String,
@@ -51,12 +92,21 @@ const LINK: Color32 = Color32::from_rgb(102, 145, 255);
 
 /// Studio's toggle switch.
 fn switch(ui: &mut egui::Ui, on: bool, enabled: bool) -> egui::Response {
-    let (r, resp) = ui.allocate_exact_size(Vec2::new(40.0, 22.0), if enabled { Sense::click() } else { Sense::hover() });
+    switch_sized(ui, on, enabled, Vec2::new(40.0, 22.0))
+}
+
+fn switch_compact(ui: &mut egui::Ui, on: bool, enabled: bool) -> egui::Response {
+    switch_sized(ui, on, enabled, Vec2::new(32.0, 17.0))
+}
+
+fn switch_sized(ui: &mut egui::Ui, on: bool, enabled: bool, size: Vec2) -> egui::Response {
+    let (r, resp) = ui.allocate_exact_size(size, if enabled { Sense::click() } else { Sense::hover() });
     let p = ui.painter();
+    let rad = size.y * 0.5;
     let bg = if on { GREEN } else { Color32::from_rgb(110, 110, 110) };
-    p.rect_filled(r, 11.0, if enabled { bg } else { bg.gamma_multiply(0.5) });
-    let x = if on { r.right() - 11.0 } else { r.left() + 11.0 };
-    p.circle_filled(egui::pos2(x, r.center().y), 8.5, Color32::WHITE);
+    p.rect_filled(r, rad, if enabled { bg } else { bg.gamma_multiply(0.5) });
+    let x = if on { r.right() - rad } else { r.left() + rad };
+    p.circle_filled(egui::pos2(x, r.center().y), rad - 2.5, Color32::WHITE);
     resp
 }
 
@@ -87,10 +137,23 @@ impl ManageUi {
 /// Draws Manage Plugins (when open), the permission prompts and the
 /// publish dialog.
 pub fn show(ctx: &egui::Context, m: &mut PluginManager, client: Option<SharedClient>) {
+    let _ = show_with_suite(ctx, m, client, None, &[]);
+}
+
+/// Draws Manage Plugins including the modular Built-in Suite section (native
+/// Rust plugins + bundled Luau/Vide plugins) and returns any suite actions.
+pub fn show_with_suite(
+    ctx: &egui::Context,
+    m: &mut PluginManager,
+    client: Option<SharedClient>,
+    suite_dir: Option<&Path>,
+    suite: &[SuiteItem],
+) -> Vec<SuiteAction> {
+    let mut actions = Vec::new();
     prompts(ctx);
     publish_dialog(ctx, m, client.clone());
     if !m.ui.open {
-        return;
+        return actions;
     }
     let mut open = true;
     let list = m.store.list();
@@ -112,31 +175,122 @@ pub fn show(ctx: &egui::Context, m: &mut PluginManager, client: Option<SharedCli
                 perms_page(ui, m, &id);
                 return;
             }
-            header(ui, m, client.clone(), &list);
-            ui.add_space(6.0);
-            egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
-                let installed: Vec<&PluginSource> = list.iter().filter(|p| p.kind == PluginKind::Installed).collect();
-                let pending: Vec<&PluginSource> = installed.iter().copied().filter(|p| p.has_update()).collect();
-                let current: Vec<&PluginSource> = installed.iter().copied().filter(|p| !p.has_update()).collect();
-                let local: Vec<&PluginSource> = list.iter().filter(|p| p.kind == PluginKind::Local).collect();
-                if installed.is_empty() && local.is_empty() {
-                    ui.add_space(20.0);
-                    ui.vertical_centered(|ui| {
-                        ui.label(RichText::new("You don't have any plugins installed.").color(theme::TEXT_DIM));
+            let has_suite = !suite.is_empty() || suite_dir.is_some();
+            if !has_suite {
+                m.ui.tab = ManageTab::Plugins;
+            }
+            // Top bar: tab strip on the left, context actions on the right.
+            ui.horizontal(|ui| {
+                tab_button(
+                    ui,
+                    &mut m.ui.tab,
+                    ManageTab::Plugins,
+                    if list.is_empty() {
+                        "Plugins".to_string()
+                    } else {
+                        format!("Plugins ({})", list.len())
+                    },
+                );
+                if has_suite {
+                    ui.add_space(4.0);
+                    tab_button(
+                        ui,
+                        &mut m.ui.tab,
+                        ManageTab::BuiltIn,
+                        format!("Built-in ({})", suite.len()),
+                    );
+                }
+                if m.ui.tab == ManageTab::Plugins {
+                    match &m.synced {
+                        None if m.signed_in => {
+                            ui.spinner();
+                        }
+                        Some(Err(e)) => {
+                            ui.label(RichText::new("⚠").color(theme::WARN)).on_hover_text(e);
+                        }
+                        _ => {}
+                    }
+                    header_actions(ui, m, client.clone(), &list);
+                } else {
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        if let Some(dir) = suite_dir {
+                            if ui
+                                .small_button("Suite Folder…")
+                                .on_hover_text(format!("Open {}", dir.display()))
+                                .clicked()
+                            {
+                                actions.push(SuiteAction::OpenSuiteFolder(dir.to_path_buf()));
+                            }
+                        }
+                        ui.add(
+                            egui::TextEdit::singleline(&mut m.ui.suite_filter)
+                                .hint_text("Filter built-ins…")
+                                .desired_width(150.0),
+                        );
                     });
                 }
-                for (title, group) in [("Pending updates", pending), ("Up to date", current), ("Local plugins", local)] {
-                    if group.is_empty() {
-                        continue;
+            });
+            ui.add_space(4.0);
+            ui.separator();
+            ui.add_space(4.0);
+            egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+                match m.ui.tab {
+                    ManageTab::BuiltIn => {
+                        suite_section(ui, suite_dir, suite, &m.ui.suite_filter, &mut actions);
                     }
-                    ui.add_space(6.0);
-                    ui.label(RichText::new(title).size(15.0));
-                    if title == "Local plugins" {
-                        ui.label(RichText::new(m.store.plugins_dir.display().to_string()).small().color(theme::TEXT_DIM));
-                    }
-                    ui.add_space(4.0);
-                    for p in group {
-                        card(ui, m, client.clone(), p);
+                    ManageTab::Plugins => {
+                        if !m.signed_in {
+                            ui.label(
+                                RichText::new("Signed out: installed plugins and updates need you to sign in (File > Account).")
+                                    .small()
+                                    .color(theme::WARN),
+                            );
+                        }
+                        if !m.loading_on() {
+                            ui.label(
+                                RichText::new("Plugin loading is turned off for this run.")
+                                    .small()
+                                    .color(theme::WARN),
+                            );
+                        }
+                        let installed: Vec<&PluginSource> =
+                            list.iter().filter(|p| p.kind == PluginKind::Installed).collect();
+                        let pending: Vec<&PluginSource> =
+                            installed.iter().copied().filter(|p| p.has_update()).collect();
+                        let current: Vec<&PluginSource> =
+                            installed.iter().copied().filter(|p| !p.has_update()).collect();
+                        let local: Vec<&PluginSource> =
+                            list.iter().filter(|p| p.kind == PluginKind::Local).collect();
+                        if installed.is_empty() && local.is_empty() {
+                            ui.add_space(24.0);
+                            ui.vertical_centered(|ui| {
+                                ui.label(
+                                    RichText::new("You don't have any plugins installed.").color(theme::TEXT_DIM),
+                                );
+                            });
+                        }
+                        for (title, group) in [
+                            ("Pending updates", pending),
+                            ("Up to date", current),
+                            ("Local plugins", local),
+                        ] {
+                            if group.is_empty() {
+                                continue;
+                            }
+                            ui.add_space(6.0);
+                            ui.label(RichText::new(title).size(15.0));
+                            if title == "Local plugins" {
+                                ui.label(
+                                    RichText::new(m.store.plugins_dir.display().to_string())
+                                        .small()
+                                        .color(theme::TEXT_DIM),
+                                );
+                            }
+                            ui.add_space(4.0);
+                            for p in group {
+                                card(ui, m, client.clone(), p);
+                            }
+                        }
                     }
                 }
             });
@@ -145,43 +299,170 @@ pub fn show(ctx: &egui::Context, m: &mut PluginManager, client: Option<SharedCli
     details_window(ctx, m);
     remove_confirm(ctx, m);
     import_window(ctx, m);
+    actions
 }
 
-fn header(ui: &mut egui::Ui, m: &mut PluginManager, client: Option<SharedClient>, list: &[PluginSource]) {
-    ui.horizontal(|ui| {
-        ui.label(RichText::new("Plugins").strong().size(18.0));
-        match &m.synced {
-            None if m.signed_in => {
-                ui.spinner();
-            }
-            Some(Err(e)) => {
-                ui.label(RichText::new("⚠").color(theme::WARN)).on_hover_text(e);
-            }
-            _ => {}
-        }
-        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-            // "+": find plugins (Studio opens the Toolbox's Plugins; rustudio
-            // searches the Creator Store here).
-            let plus = ui.add(egui::Button::new(RichText::new("+").strong().color(Color32::WHITE).size(16.0)).fill(BLUE).min_size(Vec2::new(28.0, 28.0)));
-            if plus.on_hover_text("Find Plugins").clicked() {
-                m.ui.find = true;
-            }
-            let n = list.iter().filter(|p| p.has_update()).count();
-            if ui.add_enabled(n > 0 && client.is_some(), egui::Button::new("Update all").min_size(Vec2::new(96.0, 28.0))).clicked() {
-                m.update_all(client.clone());
-            }
-            if ui.small_button("Import from Studio…").clicked() {
-                m.ui.import_open = true;
-            }
+fn tab_button(ui: &mut egui::Ui, active: &mut ManageTab, target: ManageTab, label: String) {
+    let selected = *active == target;
+    let fill = if selected { Color32::from_rgb(56, 60, 72) } else { Color32::TRANSPARENT };
+    let text_color = if selected { Color32::WHITE } else { theme::TEXT_DIM };
+    let btn = egui::Button::new(RichText::new(label).size(14.0).strong().color(text_color))
+        .fill(fill)
+        .corner_radius(4.0)
+        .min_size(Vec2::new(0.0, 26.0));
+    if ui.add(btn).clicked() {
+        *active = target;
+    }
+}
+
+fn suite_section(
+    ui: &mut egui::Ui,
+    suite_dir: Option<&Path>,
+    suite: &[SuiteItem],
+    filter: &str,
+    actions: &mut Vec<SuiteAction>,
+) {
+    let q = filter.trim().to_ascii_lowercase();
+    let matches = |item: &SuiteItem| {
+        q.is_empty()
+            || item.name.to_ascii_lowercase().contains(&q)
+            || item.description.to_ascii_lowercase().contains(&q)
+    };
+    let luau: Vec<&SuiteItem> = suite
+        .iter()
+        .filter(|i| i.kind == SuiteItemKind::BundledLuau && matches(i))
+        .collect();
+    let rust: Vec<&SuiteItem> = suite
+        .iter()
+        .filter(|i| i.kind == SuiteItemKind::NativeRust && matches(i))
+        .collect();
+
+    if let Some(dir) = suite_dir {
+        ui.label(
+            RichText::new(format!("Suite folder: {}", dir.display()))
+                .small()
+                .color(theme::TEXT_DIM),
+        );
+        ui.add_space(4.0);
+    }
+
+    if luau.is_empty() && rust.is_empty() {
+        ui.add_space(16.0);
+        ui.vertical_centered(|ui| {
+            ui.label(RichText::new("No matching built-in plugins.").color(theme::TEXT_DIM));
         });
+        return;
+    }
+
+    for (heading, items) in [
+        (format!("Luau / Vide ({})", luau.len()), luau),
+        (format!("Native Rust ({})", rust.len()), rust),
+    ] {
+        if items.is_empty() {
+            continue;
+        }
+        ui.add_space(4.0);
+        ui.label(RichText::new(heading).small().strong().color(theme::TEXT_DIM));
+        ui.add_space(2.0);
+        for (idx, item) in items.iter().enumerate() {
+            suite_row(ui, item, idx % 2 == 1, actions);
+        }
+        ui.add_space(6.0);
+    }
+}
+
+fn suite_row(ui: &mut egui::Ui, item: &SuiteItem, alt: bool, actions: &mut Vec<SuiteAction>) {
+    let frame = egui::Frame::NONE
+        .fill(if alt { Color32::from_rgba_unmultiplied(255, 255, 255, 6) } else { Color32::TRANSPARENT })
+        .corner_radius(3.0)
+        .inner_margin(egui::Margin::symmetric(8, 4));
+    frame.show(ui, |ui| {
+        ui.set_width(ui.available_width());
+        ui.horizontal(|ui| {
+            let right_w = if item.kind == SuiteItemKind::BundledLuau { 104.0 } else { 44.0 };
+            let text_w = (ui.available_width() - right_w).max(160.0);
+            ui.allocate_ui_with_layout(Vec2::new(text_w, 18.0), Layout::left_to_right(Align::Center), |ui| {
+                ui.set_max_width(text_w);
+                let name_color = if item.enabled && !item.overridden_by_roblox {
+                    theme::TEXT
+                } else {
+                    theme::TEXT_DIM
+                };
+                let name_resp = ui.label(RichText::new(&item.name).size(13.0).strong().color(name_color));
+                if !item.description.is_empty() {
+                    name_resp.on_hover_text(&item.description);
+                    ui.add(
+                        egui::Label::new(
+                            RichText::new(&item.description).small().color(theme::TEXT_DIM),
+                        )
+                        .truncate(),
+                    )
+                    .on_hover_text(&item.description);
+                }
+            });
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                let interactive = !item.overridden_by_roblox;
+                let resp = switch_compact(ui, item.enabled && interactive, interactive);
+                if interactive && resp.clicked() {
+                    let next = !item.enabled;
+                    match item.kind {
+                        SuiteItemKind::NativeRust => actions.push(SuiteAction::ToggleNative(item.id.clone(), next)),
+                        SuiteItemKind::BundledLuau => {
+                            if let Some(p) = &item.path {
+                                actions.push(SuiteAction::ToggleBundled(p.clone(), next));
+                            }
+                        }
+                    }
+                }
+                if item.kind == SuiteItemKind::BundledLuau && item.enabled {
+                    if let Some(p) = &item.path {
+                        ui.add_space(4.0);
+                        if ui.add(egui::Button::new(RichText::new("Reload").small()).min_size(Vec2::new(0.0, 18.0))).clicked() {
+                            actions.push(SuiteAction::ReloadBundled(p.clone()));
+                        }
+                    }
+                }
+            });
+        });
+        if item.overridden_by_roblox {
+            ui.label(
+                RichText::new("Using Roblox's built-in plugin (change in Studio Settings > rustudio)")
+                    .small()
+                    .color(theme::WARN),
+            );
+        }
+        for e in &item.errors {
+            ui.label(RichText::new(e).small().color(theme::ERROR));
+        }
     });
-    if !m.signed_in {
-        ui.label(RichText::new("Signed out: installed plugins and updates need you to sign in (File > Account).").small().color(theme::WARN));
-    }
-    if !m.loading_on() {
-        ui.label(RichText::new("Plugin loading is turned off for this run.").small().color(theme::WARN));
-    }
-    ui.separator();
+}
+
+fn header_actions(ui: &mut egui::Ui, m: &mut PluginManager, client: Option<SharedClient>, list: &[PluginSource]) {
+    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+        // "+": find plugins (Studio opens the Toolbox's Plugins; rustudio
+        // searches the Creator Store here).
+        let plus = ui.add(
+            egui::Button::new(RichText::new("+").strong().color(Color32::WHITE).size(16.0))
+                .fill(BLUE)
+                .min_size(Vec2::new(26.0, 26.0)),
+        );
+        if plus.on_hover_text("Find Plugins").clicked() {
+            m.ui.find = true;
+        }
+        let n = list.iter().filter(|p| p.has_update()).count();
+        if ui
+            .add_enabled(
+                n > 0 && client.is_some(),
+                egui::Button::new("Update all").min_size(Vec2::new(88.0, 26.0)),
+            )
+            .clicked()
+        {
+            m.update_all(client.clone());
+        }
+        if ui.small_button("Import from Studio…").clicked() {
+            m.ui.import_open = true;
+        }
+    });
 }
 
 fn card(ui: &mut egui::Ui, m: &mut PluginManager, client: Option<SharedClient>, p: &PluginSource) {

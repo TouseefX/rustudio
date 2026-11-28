@@ -89,7 +89,12 @@ impl Editor {
         let resp = ribbon_button(ui, "texture", "Material", false, enabled);
         self.ui_rects.insert("home.material", resp.rect);
         if !enabled {
-            resp.on_hover_text("Material: select parts first");
+            let tip = if !self.native_tool_loaded(crate::plugin_host::builtin_suite::MATERIAL_PICKER_ID) {
+                "Material Picker is disabled in Manage Plugins"
+            } else {
+                "Material: select parts first"
+            };
+            resp.on_hover_text(tip);
             return;
         }
         let ctx = ui.ctx().clone();

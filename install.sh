@@ -65,6 +65,7 @@ refresh() {
 if [ "$uninstall" = 1 ]; then
     rm -f "$bindir/rustudio" "$appdir/rustudio.desktop"
     rm -f "$libdir/rustudio" "$libdir/api-dump.json"
+    rm -rf "$libdir/plugins"
     rmdir "$libdir" 2>/dev/null || true
     for s in $sizes; do rm -f "$icondir/${s}x${s}/apps/rustudio.png"; done
     rm -f "$icondir/scalable/apps/rustudio.svg"
@@ -101,12 +102,17 @@ mkdir -p "$bindir" "$libdir" "$appdir"
 install -m 755 "$bin" "$libdir/rustudio.new"
 mv -f "$libdir/rustudio.new" "$libdir/rustudio"
 install -m 644 "$repo/api-dump.json" "$libdir/api-dump.json"
+rm -rf "$libdir/plugins"
+if [ -d "$repo/plugins" ]; then
+    cp -R "$repo/plugins" "$libdir/plugins"
+fi
 
 cat > "$bindir/rustudio" <<EOF
 #!/bin/sh
 # Installed by rustudio's install.sh; ./install.sh --uninstall removes it.
 : "\${RUSTUDIO_API_DUMP:=$libdir/api-dump.json}"
-export RUSTUDIO_API_DUMP
+: "\${RUSTUDIO_SUITE_PLUGINS_DIR:=$libdir/plugins}"
+export RUSTUDIO_API_DUMP RUSTUDIO_SUITE_PLUGINS_DIR
 exec "$libdir/rustudio" "\$@"
 EOF
 chmod 755 "$bindir/rustudio"

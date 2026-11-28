@@ -7,6 +7,17 @@ use rbx_dom_weak::{InstanceBuilder, types::{Ref, Variant}};
 use rustudio_core::{doc::{self, Document}, log::{Level, LogLine, tee_log}, mech};
 use rustudio_render::{camera::Camera, render::Renderer, scene::Scene};
 
+/// A device without a keyboard or mouse that was given one (Device Simulator).
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum InputFlip {
+    #[default]
+    None,
+    /// A console's mouse was clicked: keyboard and mouse on, Gamepad still preferred.
+    Mouse,
+    /// A key was pressed: keyboard and mouse on, KeyboardAndMouse preferred.
+    Key,
+}
+
 /// State shared by Studio and the player.
 pub struct Game {
     pub phys: crate::keys::PhysicalKeys,
@@ -54,7 +65,24 @@ pub struct Game {
     pub cursor_log: Vec<String>,
     /// Test Here: the character's first spawn point (the camera's position).
     pub play_here: Option<Vec3>,
+    /// Where the 3D image is: the whole panel, or a simulated device's screen.
     pub viewport_rect: egui::Rect,
+    /// The simulated device (Device Simulator) and its place in the panel.
+    pub device: Option<crate::device_view::DeviceView>,
+    /// The 3D panel, around the device.
+    pub view_panel: egui::Rect,
+    /// Mouse-as-touch on a simulated phone or tablet, and whether each
+    /// finger began over a GUI that took it (gameProcessedEvent).
+    pub touch: crate::touch::TouchEmu,
+    pub(crate) touch_gpe: HashMap<u32, bool>,
+    /// A key (or a console's mouse) was used on a device without them.
+    pub input_flip: InputFlip,
+    /// The modifier keys last frame (LeftAlt, Shift and Ctrl count as keys
+    /// for the flip above).
+    pub(crate) mods_prev: egui::Modifiers,
+    /// The Device Simulator's virtual controller is on (its Controller
+    /// Emulator panel is open): keys drive a gamepad.
+    pub controller_on: bool,
     pub frame_no: u64,
     pub snap_move: bool,
     pub move_inc: f32,
@@ -142,10 +170,78 @@ pub struct Game {
     pub show_core_gui: bool,
     /// Fingers (touch screens): what the viewport laid out for them and the
     /// movement stick's state (crates/rustudio-engine/src/touch_input.rs).
-    pub touch: rustudio_engine::touch_input::Touch,
+    /// (`touch` above is the simulated device's mouse-as-touch.)
+    pub fingers: rustudio_engine::touch_input::Touch,
 }
 
 impl Game {
+    /// Camera.ViewportSize: a simulated device's safe area in its points,
+    /// else the view in window points.
+    pub fn script_view_size(&self) -> [f32; 2] {
+        match &self.device {
+            Some(v) => v.safe_size(),
+            None => [self.viewport_rect.width(), self.viewport_rect.height()],
+        }
+    }
+
+    /// What the client is told about its device: the simulated device's own
+    /// input, else Studio's desktop; a key on a phone, or a mouse or key on
+    /// a console, turns its keyboard and mouse on until the next touch
+    /// (measured in Studio's simulator).
+    pub fn device_input(&self) -> rustudio_engine::runtime::ext::DeviceInput {
+        use rustudio_core::devices::Preferred;
+        let mut d = self.device.as_ref().map(|v| v.input()).unwrap_or_default();
+        if d.simulated && !(d.flags.keyboard && d.flags.mouse) && self.input_flip != InputFlip::None {
+            d.flip = true;
+            d.flags.keyboard = true;
+            d.flags.mouse = true;
+            if self.input_flip == InputFlip::Key || d.flags.preferred == Preferred::Touch {
+                d.flags.preferred = Preferred::KeyboardAndMouse;
+            }
+        }
+        // The virtual controller connects a gamepad at once; PreferredInput
+        // turns Gamepad with its first key, or at once on a device that
+        // already has one (the TV) (measured).
+        if self.controller_on {
+            let used = self.play.as_ref().is_some_and(|s| s.virtual_pad.used);
+            if used || d.flags.gamepad {
+                d.flags.preferred = Preferred::Gamepad;
+            }
+            d.flags.gamepad = true;
+        }
+        d
+    }
+
+    /// Mouse-as-touch: Play on a simulated touch device without a mouse
+    /// (phones, tablets, the TV).
+    pub fn touch_mode(&self) -> bool {
+        let flags = self.device.as_ref().map(|v| v.device.flags());
+        flags.is_some_and(|f| f.touch && !f.mouse)
+            && self.play.as_ref().is_some_and(|s| s.mode == rustudio_engine::runtime::RunMode::Play && s.showing == rustudio_engine::runtime::Side::Client)
+    }
+
+    /// The device screen's centre and extent in GUI coordinates (the
+    /// second finger mirrors about the whole screen's centre, measured).
+    pub fn touch_frame(&self) -> Option<(egui::Pos2, egui::Rect)> {
+        let v = self.device.as_ref()?;
+        let o = egui::vec2(-v.safe.left, -v.safe.top - mech::GUI_TOP_INSET);
+        let screen = egui::Rect::from_min_size(egui::Pos2::ZERO + o, egui::vec2(v.logical[0], v.logical[1]));
+        Some((screen.center(), screen))
+    }
+
+    /// A window point in the view as GUI-space coordinates (InputObject /
+    /// Mouse positions are below the top bar, from the safe area's corner on
+    /// a device): x, y from the view's (or safe area's) top-left.
+    pub fn view_xy(&self, p: egui::Pos2) -> [f32; 2] {
+        match &self.device {
+            Some(v) => {
+                let q = v.to_device(p);
+                [q.x - v.safe.left, q.y - v.safe.top]
+            }
+            None => [p.x - self.viewport_rect.min.x, p.y - self.viewport_rect.min.y],
+        }
+    }
+
     pub fn new(render_state: Option<egui_wgpu::RenderState>) -> Self {
         let renderer = render_state.as_ref().map(|rs| {
             rustudio_render::gpu_health::watch(&rs.adapter, &rs.device);
@@ -194,6 +290,13 @@ impl Game {
             cursor_log: Vec::new(),
             play_here: None,
             viewport_rect: egui::Rect::NOTHING,
+            device: None,
+            view_panel: egui::Rect::NOTHING,
+            touch: Default::default(),
+            touch_gpe: HashMap::new(),
+            input_flip: InputFlip::None,
+            mods_prev: egui::Modifiers::NONE,
+            controller_on: false,
             frame_no: 0,
             snap_move: mech::SNAP_ON_BY_DEFAULT,
             move_inc: mech::MOVE_SNAP,
@@ -243,7 +346,7 @@ impl Game {
             extra_adorn: Vec::new(),
             extra_highlights: Vec::new(),
             show_core_gui: true,
-            touch: Default::default(),
+            fingers: Default::default(),
         }
     }
 }
@@ -346,12 +449,24 @@ impl Game {
                     })
                     .collect()
             });
+            // A key on a simulated device without a keyboard gives it one
+            // until the next touch (measured in Studio's simulator), LeftAlt
+            // too: pressing it for a pinch flips the phone to keyboard and
+            // mouse until the fingers come down (measured).
+            // (The virtual controller takes every key while it's on.)
+            let mods = ctx.input(|i| i.modifiers);
+            let pressed = |on: bool, was: bool| on && !was;
+            let mod_down = pressed(mods.alt, self.mods_prev.alt) || pressed(mods.shift, self.mods_prev.shift) || pressed(mods.ctrl, self.mods_prev.ctrl);
+            self.mods_prev = mods;
+            if (!taps.is_empty() || mod_down) && !self.controller_on && self.device.as_ref().is_some_and(|v| !v.device.flags().keyboard) {
+                self.input_flip = InputFlip::Key;
+            }
             // The open menu takes the keys (R, L); the game hears none.
             if core_scripts || !self.game_menu_keys(&taps) {
                 // (A focused TextBox has them: game-processed, Enter included.)
                 let processed = self.gui.focus.is_some();
                 if let Some(s) = self.play.as_mut() {
-                    if !processed && !core_scripts {
+                    if !processed && !core_scripts && !self.controller_on {
                         s.game.hotbar_taps.extend(taps.iter().copied());
                     }
                     s.game.key_taps.extend(taps.into_iter().map(|k| (k, processed)));

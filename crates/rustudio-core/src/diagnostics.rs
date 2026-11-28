@@ -118,23 +118,63 @@ impl ::log::Log for DiagnosticLogger {
     fn flush(&self) {}
 }
 
-fn write_record(file: &mut File, level: ::log::Level, target: &str, text: &str) {
-    // Omit credential-bearing messages and URLs (which can carry signed query parameters).
+fn sanitize_log_text(text: &str) -> std::borrow::Cow<'_, str> {
+    // Omit messages that look like they carry raw session cookies or auth headers.
     let lower = text.to_ascii_lowercase();
-    let text = if [
+    if [
         "roblosecurity",
         "warning:-do-not-share",
         "authorization:",
-        "://",
+        "cookie:",
+        "x-csrf-token:",
+        "bearer ",
     ]
     .iter()
     .any(|marker| lower.contains(marker))
     {
-        "[message omitted because it may contain credentials]"
-    } else {
-        // Bound the size of a single record and quote it to keep one event per line.
-        text.get(..text.floor_char_boundary(8192)).unwrap_or(text)
-    };
+        return std::borrow::Cow::Borrowed("[message omitted because it may contain credentials]");
+    }
+    let bounded = text.get(..text.floor_char_boundary(8192)).unwrap_or(text);
+    if !bounded.contains("://") {
+        return std::borrow::Cow::Borrowed(bounded);
+    }
+    // Keep URLs readable for diagnostics (e.g. rbxassetid://, https://host/path)
+    // while stripping any embedded userinfo (user:pass@) and signed query/fragment.
+    let mut out = String::with_capacity(bounded.len());
+    let mut rest = bounded;
+    while let Some(scheme_sep) = rest.find("://") {
+        let after_sep = scheme_sep + 3;
+        let url_end = rest[after_sep..]
+            .find(|c: char| c.is_whitespace() || matches!(c, '"' | '\'' | '<' | '>' | ')' | ']' | '}'))
+            .map(|i| after_sep + i)
+            .unwrap_or(rest.len());
+        out.push_str(&rest[..after_sep]);
+        let body = &rest[after_sep..url_end];
+        let (path_part, has_query) = match body.find(['?', '#']) {
+            Some(q) => (&body[..q], body.as_bytes()[q] == b'?'),
+            None => (body, false),
+        };
+        let authority_end = path_part.find('/').unwrap_or(path_part.len());
+        let authority = &path_part[..authority_end];
+        let clean_body = match authority.rfind('@') {
+            Some(at) => {
+                out.push_str("[redacted]@");
+                &path_part[at + 1..]
+            }
+            None => path_part,
+        };
+        out.push_str(clean_body);
+        if has_query {
+            out.push_str("?[redacted]");
+        }
+        rest = &rest[url_end..];
+    }
+    out.push_str(rest);
+    std::borrow::Cow::Owned(out)
+}
+
+fn write_record(file: &mut File, level: ::log::Level, target: &str, text: &str) {
+    let text = sanitize_log_text(text);
 
     if file
         .stream_position()
@@ -146,7 +186,7 @@ fn write_record(file: &mut File, level: ::log::Level, target: &str, text: &str) 
         let _ = writeln!(file, "Diagnostic log restarted after reaching 4 MiB");
     }
     let now = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
-    let _ = writeln!(file, "{now} {level:5} {target} {text:?}");
+    let _ = writeln!(file, "{now} {level:5} {target} {:?}", text.as_ref());
 }
 
 /// The panic hook can run while the logging lock is already held.
@@ -160,5 +200,30 @@ pub(crate) fn panic_at(location: &str) {
                 &format!("Panic at {location}; see crash report"),
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::sanitize_log_text;
+
+    #[test]
+    fn redacts_secrets_but_keeps_sanitized_urls() {
+        assert_eq!(
+            sanitize_log_text("Cookie: .ROBLOSECURITY=secret"),
+            "[message omitted because it may contain credentials]"
+        );
+        assert_eq!(
+            sanitize_log_text("Authorization: Bearer abc123"),
+            "[message omitted because it may contain credentials]"
+        );
+        assert_eq!(
+            sanitize_log_text("failed to load rbxassetid://12345"),
+            "failed to load rbxassetid://12345"
+        );
+        assert_eq!(
+            sanitize_log_text("GET https://user:pw@cdn.example.com/asset/1?sig=secret&exp=9 failed"),
+            "GET https://[redacted]@cdn.example.com/asset/1?[redacted] failed"
+        );
     }
 }

@@ -336,36 +336,48 @@ fn named(dom: &WeakDom, parent: Ref, name: &str) -> Option<Ref> {
 /// scripts after it — ExperienceChatMain, InspectAndBuy, NetworkPause … — so
 /// without the frame a phone never gets Roblox's chat window;
 /// MainBotChatScript2 waits for `BottomLeftControl` to hold its DialogFrame.
+/// (Whatever a place already has in CoreGui is completed, not replaced.)
 pub fn ensure_roblox_gui(doc: &mut Document, core_gui: Ref) -> Ref {
     use rbx_dom_weak::types::{UDim, UDim2};
-    if let Some(rg) = named(&doc.dom, core_gui, "RobloxGui") {
-        return rg;
-    }
+    let rg = named(&doc.dom, core_gui, "RobloxGui").unwrap_or_else(|| {
+        doc.dom.insert(
+            core_gui,
+            InstanceBuilder::new("ScreenGui")
+                .with_name("RobloxGui")
+                .with_property("ResetOnSpawn", false)
+                .with_property("ZIndexBehavior", Variant::Enum(rbx_dom_weak::types::Enum::from_u32(1))),
+        )
+    });
     let udim2 = |xs: f32, xo: i32, ys: f32, yo: i32| UDim2::new(UDim::new(xs, xo), UDim::new(ys, yo));
-    let corner = |name: &str, pos: UDim2, size: UDim2| {
-        InstanceBuilder::new("Frame")
-            .with_name(name)
-            .with_property("Position", pos)
-            .with_property("Size", size)
-            .with_property("BackgroundTransparency", 1.0f32)
-            .with_property("BorderSizePixel", 0i32)
-    };
-    let control_frame = InstanceBuilder::new("Frame")
-        .with_name("ControlFrame")
-        .with_property("Size", udim2(1.0, 0, 1.0, 0))
-        .with_property("BackgroundTransparency", 1.0f32)
-        .with_property("BorderSizePixel", 0i32)
-        .with_child(corner("BottomLeftControl", udim2(0.0, 0, 1.0, -46), udim2(0.0, 130, 0.0, 46)))
-        .with_child(corner("BottomRightControl", udim2(1.0, -180, 1.0, -46), udim2(0.0, 180, 0.0, 46)))
-        .with_child(corner("TopLeftControl", udim2(0.0, 0, 0.0, 0), udim2(0.0, 180, 0.0, 36)));
-    doc.dom.insert(
-        core_gui,
-        InstanceBuilder::new("ScreenGui")
-            .with_name("RobloxGui")
-            .with_property("ResetOnSpawn", false)
-            .with_property("ZIndexBehavior", Variant::Enum(rbx_dom_weak::types::Enum::from_u32(1)))
-            .with_child(control_frame),
-    )
+    let cf = named(&doc.dom, rg, "ControlFrame").unwrap_or_else(|| {
+        doc.dom.insert(
+            rg,
+            InstanceBuilder::new("Frame")
+                .with_name("ControlFrame")
+                .with_property("Size", udim2(1.0, 0, 1.0, 0))
+                .with_property("BackgroundTransparency", 1.0_f32)
+                .with_property("BorderSizePixel", 0_i32),
+        )
+    });
+    let corners = [
+        ("BottomLeftControl", udim2(0.0, 0, 1.0, -46), udim2(0.0, 130, 0.0, 46)),
+        ("BottomRightControl", udim2(1.0, -180, 1.0, -46), udim2(0.0, 180, 0.0, 46)),
+        ("TopLeftControl", udim2(0.0, 0, 0.0, 0), udim2(0.0, 180, 0.0, 36)),
+    ];
+    for (name, pos, size) in corners {
+        if named(&doc.dom, cf, name).is_none() {
+            doc.dom.insert(
+                cf,
+                InstanceBuilder::new("Frame")
+                    .with_name(name)
+                    .with_property("Position", pos)
+                    .with_property("Size", size)
+                    .with_property("BackgroundTransparency", 1.0_f32)
+                    .with_property("BorderSizePixel", 0_i32),
+            );
+        }
+    }
+    rg
 }
 
 /// Puts the patch in a client DataModel: `DataModelInstances` into the
@@ -639,6 +651,11 @@ mod tests {
         let root = d.dom.root_ref();
         let cg = d.find_child(root, "CoreGui").unwrap();
         let rg = crate::default_scripts::child_named(&d, cg, "RobloxGui").unwrap();
+        let control_frame = crate::default_scripts::child_named(&d, rg, "ControlFrame").expect("RobloxGui.ControlFrame");
+        assert!(
+            crate::default_scripts::child_named(&d, control_frame, "BottomLeftControl").is_some(),
+            "RobloxGui.ControlFrame.BottomLeftControl must exist for mobile StarterScript"
+        );
         let modules = crate::default_scripts::child_named(&d, rg, "Modules").unwrap();
         assert!(crate::default_scripts::child_named(&d, modules, "TopBar").is_some());
         let cp = d.find_child(root, "CorePackages").unwrap();

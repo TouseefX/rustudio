@@ -18,5 +18,6 @@ done
 mkdir -p "$stage/assets/icons" "$stage/assets/linux"
 cp "$repo"/assets/icons/rustudio-*.png "$repo/assets/icons/rustudio.svg" "$stage/assets/icons/"
 cp "$repo/assets/linux/rustudio.desktop" "$stage/assets/linux/"
+[ ! -d "$repo/plugins" ] || cp -R "$repo/plugins" "$stage/plugins"
 mkdir -p "$(dirname "$2")"
 tar -czf "$2" -C "$temp" rustudio-linux-x86_64

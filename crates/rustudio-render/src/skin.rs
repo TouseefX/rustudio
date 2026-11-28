@@ -738,7 +738,17 @@ pub fn matrices(doc: &Document, part: Ref, base: &Base, scale: Vec3) -> Option<V
             let sb = &base.skin.bones[i];
             match look.bones[i] {
                 Some(Target::Bone(b)) => {
-                    let now = mul(&part_inv, &frames.world(b));
+                    let mut now = mul(&part_inv, &frames.world(b));
+                    // Compose FaceControls FACS offset when the Bone's own Transform
+                    // is still identity (e.g. Edit mode or non-Lua FaceControls).
+                    if let Some(l) = facs.get(&sb.name).copied() {
+                        let bone_tr = cf(doc, b, "Transform");
+                        let is_ident = bone_tr.pos.length_squared() < 1e-8
+                            && bone_tr.rot.abs_diff_eq(Mat3::IDENTITY, 1e-5);
+                        if is_ident {
+                            now = mul(&now, &l);
+                        }
+                    }
                     mats[i] = Some(mul(&now, &bind_inv[i]));
                     progress = true;
                 }

@@ -284,6 +284,10 @@ impl Game {
         let core_menu = self.show_core_gui && rustudio_engine::gui::share().core_menu_open;
         let menu = (self.show_core_gui && menu) || core_menu || ctx.memory(|m| m.top_modal_layer()).is_some();
         let (behavior, icon) = if menu { (0, true) } else { (behavior, icon) };
+        // A simulated touch device never takes the cursor (the bar and the
+        // frame stay reachable): touch has no mouse lock.
+        let touch = self.touch_mode();
+        let behavior = if touch { 0 } else { behavior };
         // A shown GuiButton.Modal lets go of the cursor too, unless the
         // right button is down (gui_modal.rs; asked only while the game
         // wants a lock).
@@ -425,7 +429,7 @@ impl Game {
         let hover_pos = resp.hover_pos();
         let wheel_sunk = menu || hover_pos.is_some_and(|p| self.gui.sinks_wheel_at(p));
         let move_sunk = menu || self.gui.pointer_over_sink();
-        if let Some(s) = self.play.as_mut() {
+        if let Some(s) = self.play.as_mut().filter(|_| !touch) {
             if !menu {
                 s.mouse_delta += glam::Vec2::new(d.x, d.y);
             }
@@ -801,10 +805,13 @@ impl Game {
             // Textures still on their way (the part is redone when one can
             // get further); `waiting` is for everything else.
             let mut tex_wait: Vec<String> = Vec::new();
-            // A file mesh with no mesh id (an empty SpecialMesh FileMesh or
-            // MeshPart): nothing to draw, as in Studio (Place B's striped
-            // ground cover, round 23).
-            if d.placeholder && sp.mesh_asset.is_none() {
+            // A file mesh with no mesh id (an empty SpecialMesh FileMesh):
+            // nothing to draw, as in Studio (Place B's striped ground cover, round 23).
+            // An empty MeshPart draws Studio's 4×4-stud checkerboard box.
+            if d.placeholder
+                && sp.mesh_asset.is_none()
+                && !self.doc.class_of(sp.r).is_some_and(|c| c == "MeshPart")
+            {
                 d.alpha = 0.0;
                 d.placeholder = false;
                 alpha_forced = true;
@@ -893,7 +900,7 @@ impl Game {
                                     refresh_skin_deps.push(sp.r);
                                 }
                                 skin_base = Some((asset.id.clone(), base.clone()));
-                                if rustudio_render::skin::cpu_skinning() {
+                                if rustudio_render::skin::cpu_skinning() || !renderer.can_skin_gpu() {
                                     if let Some((palette, scale, origin)) = rustudio_render::skin::pose(&self.doc, sp.r, &base) {
                                         skin_pose = Some(Some((palette.clone(), scale, origin)));
                                         let (p, n) = rustudio_render::skin::deform(&base, &palette, scale, origin);
@@ -2436,6 +2443,27 @@ impl Game {
         self.gui.begin_vram_frame();
         let playing = self.play.is_some();
         self.gui.pointer_override = self.lock_center_held().then(|| rect.center());
+        // A simulated device: its GUI is laid out in its own points over its
+        // safe area and the shapes are moved into place on screen after.
+        let device = self.device.clone();
+        self.gui.device = device.as_ref().map(|v| rustudio_engine::gui::DeviceFrame { screen: v.screen_rect_dev(), scale: v.k });
+        self.gui.pointer_map = device.as_ref().map(|v| v.pointer_transform());
+        // (mouse-as-touch: the GUI hears the pointer's finger)
+        let alt = ctx.input(|i| i.modifiers.alt);
+        self.gui.touch_id = self.touch_mode().then(|| self.touch.pointer_id(alt));
+        // (`fingers`, the parameter, is a touch screen's)
+        let marker_fingers = if self.touch.two_fingers() && alt { self.touch.fingers() } else { Vec::new() };
+        let (gui_rect, gui_painter) = match &device {
+            Some(v) => {
+                // (device coordinates: the clip is moved with the shapes)
+                let mut p = painter.clone();
+                p.set_clip_rect(v.screen_rect_dev());
+                (v.safe_rect_dev(), p)
+            }
+            None => (rect, painter.clone()),
+        };
+        let layer = painter.layer_id();
+        let shapes_from = ctx.graphics_mut(|g| g.entry(layer).next_idx());
         {
             let doc_dir = self
                 .doc
@@ -2455,12 +2483,12 @@ impl Game {
                 gui.sync_roots(doc);
                 gui.draw(
                     &ctx,
-                    &painter,
+                    &gui_painter,
                     rustudio_engine::gui::DrawIn {
                         render_state: self.render_state.as_ref(),
                         doc,
                         cam,
-                        rect,
+                        rect: gui_rect,
                         store: assets,
                         doc_dir: doc_dir.as_deref(),
                         playing,
@@ -2468,6 +2496,19 @@ impl Game {
                         roots: rustudio_engine::gui::Roots::View,
                     },
                 );
+                if let Some(v) = &device {
+                    // A disc per finger while LeftAlt is held (Rustudio's own
+                    // look for Studio's markers: about 46 points across).
+                    let o = egui::vec2(v.safe.left, v.safe.top + mech::GUI_TOP_INSET);
+                    let r = mech::TOUCH_MARKER_SIZE / 2.0;
+                    for f in &marker_fingers {
+                        let c = *f + o;
+                        gui_painter.circle_filled(c, r, egui::Color32::from_rgba_unmultiplied(20, 20, 24, 140));
+                        gui_painter.circle_stroke(c, r - 1.5, egui::Stroke::new(3.0, egui::Color32::from_rgba_unmultiplied(220, 220, 225, 170)));
+                    }
+                    let to = ctx.graphics_mut(|g| g.entry(layer).next_idx());
+                    ctx.graphics_mut(|g| g.entry(layer).transform_range(shapes_from, to, v.gui_transform()));
+                }
                 // The game's cursor image over the view. While LockCenter
                 // holds the mouse (shift lock, first person) Roblox draws it
                 // in the middle of the view, where its mouse is, at the
@@ -2547,7 +2588,7 @@ impl Game {
             // (The open legacy egui menu covers the game's GUIs: they get no input.
             // CoreScripts' SettingsHub is drawn by `gui` itself, so `gui.input` must run.)
             if playing && !play.as_ref().is_some_and(|s| s.game.menu_open) {
-                let took = gui.input(&ctx, &resp, rect);
+                let took = gui.input(&ctx, &resp, gui_rect);
                 if gui.wheel_sunk() {
                     if let Some(s) = play.as_mut() {
                         s.wheel_processed = true;

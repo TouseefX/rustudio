@@ -125,7 +125,7 @@ impl Physics {
         if self.joint_cons.is_empty() && self.live_joints.is_empty() {
             return;
         }
-        let Some(ws) = doc.workspace() else { return };
+        let Some(ws) = self.root_of(doc) else { return };
         let cons: Vec<Ref> = self.joint_cons.iter().copied().collect();
         let mut keep: HashSet<Ref> = HashSet::default();
         let mut no_collide: rustc_hash::FxHashSet<(u32, u32)> = Default::default();
@@ -520,7 +520,7 @@ impl Physics {
         if self.studio.is_none() {
             return;
         }
-        let Some(ws) = doc.workspace() else { return };
+        let Some(ws) = self.root_of(doc) else { return };
         let mut seen: HashSet<Ref> = HashSet::default();
         let mut refs: Vec<Ref> = self.joint_cons.iter().chain(self.ropes.iter()).chain(self.movers.keys()).copied().filter(|r| seen.insert(*r)).collect();
         // Connectors are allocated (and keyed: the batch's sort key, DUAL §1 step 5) in
@@ -935,18 +935,36 @@ impl Physics {
             },
             // I.15 [J2]: the per-step update (vt slot 78) — BodyVelocity Studio (connector =
             // Velocity, = clampF(MaxForce)), BodyForce Studio (F = Force, world)
-            "BodyVelocity" => SClass::BodyVelocity { velocity: v("Velocity"), max_force: vec3_of(doc.prop(r, "MaxForce")).unwrap_or(Vec3::splat(4000.0)), p: n("P", 1250.0) },
-            "BodyForce" => SClass::BodyForce { force: v("Force") },
+            "BodyVelocity" => SClass::BodyVelocity {
+                velocity: vec3_of(doc.prop(r, "Velocity").or_else(|| doc.prop(r, "velocity"))).unwrap_or(Vec3::ZERO),
+                max_force: vec3_of(doc.prop(r, "MaxForce").or_else(|| doc.prop(r, "maxForce"))).unwrap_or(Vec3::splat(4000.0)),
+                p: n("P", 1250.0),
+            },
+            "BodyForce" => SClass::BodyForce {
+                force: vec3_of(doc.prop(r, "Force").or_else(|| doc.prop(r, "force"))).unwrap_or(Vec3::ZERO),
+            },
             // [J3] slot 78: BodyThrust Studio, BodyAngularVelocity Studio, BodyPosition Studio
             "BodyGyro" => SClass::BodyGyro {
                 cframe: Mat3::from_quat(rot_prop(doc, r, "CFrame")),
-                max_torque: vec3_of(doc.prop(r, "MaxTorque")).unwrap_or(Vec3::new(400000.0, 400000.0, 400000.0)),
+                max_torque: vec3_of(doc.prop(r, "MaxTorque").or_else(|| doc.prop(r, "maxTorque"))).unwrap_or(Vec3::new(400000.0, 400000.0, 400000.0)),
                 p: n("P", 3000.0),
                 d: n("D", 500.0),
             },
-            "BodyThrust" => SClass::BodyThrust { force: v("Force"), location: v("Location") },
-            "BodyAngularVelocity" => SClass::BodyAngularVelocity { ang_vel: vec3_of(doc.prop(r, "AngularVelocity")).unwrap_or(Vec3::new(0.0, 2.0, 0.0)), max_torque: vec3_of(doc.prop(r, "MaxTorque")).unwrap_or(Vec3::new(4000.0, 4000.0, 4000.0)), p: n("P", 1250.0) },
-            "BodyPosition" => SClass::BodyPosition { position: vec3_of(doc.prop(r, "Position")).unwrap_or(Vec3::new(0.0, 50.0, 0.0)), max_force: vec3_of(doc.prop(r, "MaxForce")).unwrap_or(Vec3::new(4000.0, 4000.0, 4000.0)), p: n("P", 10000.0), d: n("D", 1250.0) },
+            "BodyThrust" => SClass::BodyThrust {
+                force: vec3_of(doc.prop(r, "Force").or_else(|| doc.prop(r, "force"))).unwrap_or(Vec3::ZERO),
+                location: vec3_of(doc.prop(r, "Location").or_else(|| doc.prop(r, "location"))).unwrap_or(Vec3::ZERO),
+            },
+            "BodyAngularVelocity" => SClass::BodyAngularVelocity {
+                ang_vel: vec3_of(doc.prop(r, "AngularVelocity").or_else(|| doc.prop(r, "angularvelocity"))).unwrap_or(Vec3::new(0.0, 2.0, 0.0)),
+                max_torque: vec3_of(doc.prop(r, "MaxTorque").or_else(|| doc.prop(r, "maxTorque"))).unwrap_or(Vec3::new(4000.0, 4000.0, 4000.0)),
+                p: n("P", 1250.0),
+            },
+            "BodyPosition" => SClass::BodyPosition {
+                position: vec3_of(doc.prop(r, "Position").or_else(|| doc.prop(r, "position"))).unwrap_or(Vec3::new(0.0, 50.0, 0.0)),
+                max_force: vec3_of(doc.prop(r, "MaxForce").or_else(|| doc.prop(r, "maxForce"))).unwrap_or(Vec3::new(4000.0, 4000.0, 4000.0)),
+                p: n("P", 10000.0),
+                d: n("D", 1250.0),
+            },
             c if c.starts_with("Body") || c == "RocketPropulsion" => {
                 if c == "RocketPropulsion" {
                     uncovered_once(&UNCOVERED_ROCKET, "RocketPropulsion");

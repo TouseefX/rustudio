@@ -50,28 +50,31 @@ impl SavedTab {
             Tab::Output => SavedTab::Output,
             Tab::AvatarSettings => SavedTab::AvatarSettings,
             Tab::TerrainEditor => SavedTab::TerrainEditor,
-            Tab::AnimationEditor => SavedTab::AnimationEditor,
             Tab::Toolbox => SavedTab::Toolbox,
             Tab::AssetManager => SavedTab::AssetManager,
             Tab::FileSync => SavedTab::FileSync,
             Tab::Profiler => SavedTab::Profiler,
-            Tab::Script(_) | Tab::Plugin(_) => return None,
+            // (the Controller Emulator starts closed: the controller is off)
+            Tab::Script(_) | Tab::Plugin(_) | Tab::ControllerEmulator => return None,
         })
     }
-    pub(crate) fn tab(self) -> Tab {
-        match self {
+    /// Converts a saved tab back to a live `Tab`, dropping legacy variants
+    /// migrated into modular plugin slots (such as `AnimationEditor`) so old
+    /// `layout.json` files continue to load cleanly.
+    pub(crate) fn to_tab(self) -> Option<Tab> {
+        Some(match self {
             SavedTab::Viewport => Tab::Viewport,
             SavedTab::Explorer => Tab::Explorer,
             SavedTab::Properties => Tab::Properties,
             SavedTab::Output => Tab::Output,
             SavedTab::AvatarSettings => Tab::AvatarSettings,
             SavedTab::TerrainEditor => Tab::TerrainEditor,
-            SavedTab::AnimationEditor => Tab::AnimationEditor,
+            SavedTab::AnimationEditor => return None,
             SavedTab::Toolbox => Tab::Toolbox,
             SavedTab::AssetManager => Tab::AssetManager,
             SavedTab::FileSync => Tab::FileSync,
             SavedTab::Profiler => Tab::Profiler,
-        }
+        })
     }
 }
 
@@ -214,7 +217,7 @@ impl Layout {
     /// The saved dock, if it still has the 3D view (else the default is used).
     pub fn dock(&self) -> Option<DockState<Tab>> {
         let d = self.dock.as_ref()?;
-        let dock = d.map_tabs(|t| t.tab());
+        let dock = d.filter_map_tabs(|t| t.to_tab());
         dock.find_tab(&Tab::Viewport).is_some().then_some(dock)
     }
 
@@ -223,7 +226,7 @@ impl Layout {
     pub fn panels(&self, main: &DockState<Tab>) -> Panels {
         let mut out = Panels { popped: Vec::new(), homes: self.homes.clone() };
         for w in &self.popped {
-            let mut dock = w.dock.map_tabs(|t| t.tab());
+            let mut dock = w.dock.filter_map_tabs(|t| t.to_tab());
             dock.retain_tabs(|t| *t != Tab::Viewport && main.find_tab(t).is_none() && out.locate(main, t).is_none());
             if dock.iter_all_tabs().next().is_none() || w.key.is_empty() {
                 continue;

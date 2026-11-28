@@ -134,7 +134,46 @@ impl Editor {
             if mode.is_some() && resp.clicked() {
                 self.stop_play();
             }
-            top_icon(ui, "device-mobile", theme::TEXT, false).on_hover_text("Device Simulator: not in rustudio yet");
+            if let Some(showing) = self
+                .game
+                .play
+                .as_ref()
+                .filter(|p| p.mode == rustudio_engine::runtime::RunMode::Play)
+                .map(|p| p.showing)
+            {
+                use rustudio_engine::runtime::Side;
+                let is_server = showing == Side::Server;
+                let label = if is_server { "Server" } else { "Client" };
+                let fill = if is_server {
+                    Color32::from_rgb(38, 128, 72)
+                } else {
+                    theme::PANEL_ALT
+                };
+                let tip = if is_server {
+                    "Current: Server — click to switch to Client (edits here update physics and replicate to Client)"
+                } else {
+                    "Current: Client — click to switch to Server (edits on Server update physics and replicate to Client)"
+                };
+                let btn = egui::Button::new(
+                    egui::RichText::new(format!("Current: {label}")).size(11.5).color(theme::TEXT),
+                )
+                .fill(fill)
+                .corner_radius(4.0);
+                let resp = ui.add_sized([92.0, 22.0], btn).on_hover_text(tip);
+                self.ui_rects.insert("test.client_server", resp.rect);
+                if resp.clicked() {
+                    let next = if is_server { Side::Client } else { Side::Server };
+                    self.show_play_side(next);
+                }
+            }
+            // Device Simulator (Test > Device Simulator; greyed during Play).
+            let (en, on) = self.action_state("device_simulator");
+            let color = if on == Some(true) { theme::ACCENT } else { theme::TEXT };
+            let resp = top_icon(ui, "device-mobile", color, en).on_hover_text("Device Simulator");
+            self.ui_rects.insert("test.device_simulator", resp.rect);
+            if en && resp.clicked() {
+                self.run_action("device_simulator");
+            }
 
             // The tabs, centred like Studio's.
             let tab_w = 80.0;
@@ -260,7 +299,10 @@ impl Editor {
                     self.rb(ui, "list-details", "Properties", "panel_properties", p, a);
                     let tb_on = self.action_state("toolbox").1 == Some(true);
                     self.rb(ui, "tools", "Toolbox", "toolbox", tb_on, a);
-                    self.rb(ui, "folders", "Assets", "asset_manager", false, a);
+                    let am_on = self.action_state("asset_manager").1 == Some(true);
+                    self.rb(ui, "folders", "Assets", "asset_manager", am_on, a);
+                    divider(ui);
+                    self.rb(ui, "settings", "Settings", "experience_settings", self.cloud.settings_open, a);
                 }
                 RibbonTab::Model => {
                     self.ribbon_tools(ui, a);
@@ -322,6 +364,12 @@ impl Editor {
                     divider(ui);
                     let style_on = self.action_state("style_editor").1 == Some(true);
                     self.rb(ui, "brush", "Style Editor", "style_editor", style_on, a);
+                    let slice_on = self.action_state("nine_slice_editor").1 == Some(true);
+                    self.rb(ui, "border-all", "9-Slice", "nine_slice_editor", slice_on, a);
+                    let path_on = self.action_state("path_editor").1 == Some(true);
+                    self.rb(ui, "vector-bezier", "Path2D", "path_editor", path_on, a);
+                    let tex_on = self.action_state("texture_viewer").1 == Some(true);
+                    self.rb(ui, "photo-search", "Textures", "texture_viewer", tex_on, a);
                 }
                 RibbonTab::Script => {
                     self.rb(ui, "chevron-left", "Back", "script_back", false, a);
@@ -333,7 +381,8 @@ impl Editor {
                     self.rb(ui, "search", "Find", "find_in_place", false, a);
                     self.rb(ui, "list-numbers", "Go to Line", "goto_line", false, a);
                     divider(ui);
-                    self.rb(ui, "terminal-2", "Command", "command_bar", false, a);
+                    let cmd_on = self.action_state("command_bar").1 == Some(true);
+                    self.rb(ui, "terminal-2", "Command", "command_bar", cmd_on, a);
                     let o = self.ui.panels_open.contains("Output");
                     self.rb(ui, "terminal", "Output", "panel_output", o, a);
                     divider(ui);

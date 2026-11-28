@@ -1559,7 +1559,11 @@ impl MaterialArrays {
 
     fn upload(&self, queue: &wgpu::Queue, layer: u32, maps: &crate::matpack::Pixels) {
         for (tex, data, channels) in [(&self.albedo, &maps.albedo, 4), (&self.surface, &maps.surface, 4), (&self.emission, &maps.emission_tint, 2)] {
-            for (mip, (at, size)) in crate::matpack::mip_levels().into_iter().enumerate() {
+            for (mip, (at, size)) in crate::matpack::mip_levels()
+                .into_iter()
+                .filter(|&(_, s)| s <= self.size)
+                .enumerate()
+            {
                 let at = at / (4 / channels) as usize;
                 let bytes = (size * size * channels) as usize;
                 let Some(level) = data.get(at..at + bytes) else {
@@ -4840,10 +4844,21 @@ impl Renderer {
         let layer = self.materials.cpu.len() as u32;
         self.materials.cpu.push(maps.clone());
         self.materials.layers.insert(maps.pack, layer);
-        if layer >= self.materials.capacity || self.materials.size != crate::matpack::LAYER_SIZE {
-            let cap = (layer + 1).next_power_of_two().max(4);
+        let low_vram = crate::gpu_caps::is_low_vram_global();
+        let target_size = if low_vram {
+            (crate::matpack::LAYER_SIZE / 2).max(256)
+        } else {
+            crate::matpack::LAYER_SIZE
+        };
+        if layer >= self.materials.capacity || self.materials.size != target_size {
+            let need = layer + 1;
+            let cap = if low_vram && need > 16 {
+                need.div_ceil(8) * 8
+            } else {
+                need.next_power_of_two().max(4)
+            };
             let params = std::mem::take(&mut self.materials.params);
-            let mut grown = MaterialArrays::with_params(device, crate::matpack::LAYER_SIZE, cap, params);
+            let mut grown = MaterialArrays::with_params(device, target_size, cap, params);
             grown.layers = std::mem::take(&mut self.materials.layers);
             grown.cpu = std::mem::take(&mut self.materials.cpu);
             // The layers already there are copied on the GPU (their maps
@@ -7480,6 +7495,11 @@ impl Renderer {
             self.skin.again(index);
         }
         true
+    }
+
+    /// Whether GPU compute skinning is supported on this device.
+    pub fn can_skin_gpu(&self) -> bool {
+        self.skin.is_available()
     }
 
     /// A skinned part's mesh slot deformed on the GPU (skin_gpu.rs): the

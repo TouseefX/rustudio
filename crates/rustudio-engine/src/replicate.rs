@@ -582,7 +582,13 @@ fn drain(server: &Document, client: &Runtime, map: &mut RepMap, budgeted: bool) 
                 if let Some(w) = &mut world {
                     let d = w.dm();
                     if let Some(i) = d.dom.get_by_ref_mut(target) {
-                        if i.properties.get(&cframe) != Some(value) {
+                        // Respect local client-side Anchored = true edits so
+                        // anchoring a moving part in Client view freezes it.
+                        let locally_anchored = matches!(
+                            i.properties.get(&ustr("Anchored")),
+                            Some(Variant::Bool(true))
+                        );
+                        if !locally_anchored && i.properties.get(&cframe) != Some(value) {
                             i.properties.insert(cframe, value.clone());
                             d.mark_prop(target, cframe);
                         }

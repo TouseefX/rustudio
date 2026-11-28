@@ -584,6 +584,9 @@ pub(super) struct Walk<'a, 'b> {
     pub abs_offset: [f32; 2],
     /// A ScreenGui's canvas origin on screen (UIBlur samples the view there).
     pub screen: Option<Pos2>,
+    /// SafeAreaCompatibility.FullscreenExtension: (safe_area, full_screen) in
+    /// canvas coordinates when a simulated device has notch/home-bar insets.
+    pub fullscreen_ext: Option<(Rect, Rect)>,
     /// The object being walked (none at the root): who reads what.
     pub cur: Ref,
     /// Memos being written, innermost last; and replay depth.
@@ -1362,7 +1365,8 @@ impl Walk<'_, '_> {
     fn measure_text(&mut self, r: Ref, wrap: f32, scale: f32, fit_height: Option<f32>) -> egui::Vec2 {
         let d = self.input.doc;
         let mut text = text_prop(d, r, "Text");
-        if text.is_empty() && d.class_of(r).is_some_and(|c| c == "TextBox") {
+        let is_placeholder = text.is_empty() && d.class_of(r).is_some_and(|c| c == "TextBox");
+        if is_placeholder {
             text = text_prop(d, r, "PlaceholderText");
         }
         let rich = boolp(d, r, "RichText", false);
@@ -1461,7 +1465,9 @@ impl Walk<'_, '_> {
         } else {
             text_rows_height(g.rows.len(), size, lh)
         };
-        egui::vec2(g.rect.width().ceil(), h)
+        // PlaceholderText supplies line height for AutomaticSize.Y but does not
+        // expand AutomaticSize.X past the TextBox's explicit container width.
+        egui::vec2(if is_placeholder { 0.0 } else { g.rect.width().ceil() }, h)
     }
 
     fn content_size(&mut self, r: Ref, size: egui::Vec2, scale: f32, auto: u32, depth: usize) -> egui::Vec2 {
@@ -2142,7 +2148,23 @@ impl Walk<'_, '_> {
                 }
                 _ => 0.0,
             };
-            let fill_rect = if seam_overlap > 0.0 { rect.expand(seam_overlap) } else { rect };
+            let mut fill_rect = if seam_overlap > 0.0 { rect.expand(seam_overlap) } else { rect };
+            let mut bg_me = me;
+            // SafeAreaCompatibility.FullscreenExtension: a full-safe-area backdrop
+            // (SettingsHub shield, PlayerList scrim, etc.) extends behind notches/home bars
+            // even when ClipToDeviceSafeArea is true.
+            if me.aff.is_id() && !has_corner {
+                if let Some((safe_c, screen_c)) = self.fullscreen_ext {
+                    if rect.min.x <= safe_c.min.x + 1.0
+                        && rect.min.y <= safe_c.min.y + 1.0
+                        && rect.max.x >= safe_c.max.x - 1.0
+                        && rect.max.y >= safe_c.max.y - 1.0
+                    {
+                        fill_rect = fill_rect.union(screen_c);
+                        bg_me.clip = me.clip.union(screen_c);
+                    }
+                }
+            }
             let fill_r = corner.map(|c| {
                 let base = c.min(rect.width() * 0.5).min(rect.height() * 0.5).max(0.0);
                 if base >= 0.5 { base + seam_overlap } else { 0.0 }
@@ -2176,7 +2198,7 @@ impl Walk<'_, '_> {
                         )
                     } else {
                         quad_mesh(
-                            rect,
+                            fill_rect,
                             Rect::from_min_max(egui::epaint::WHITE_UV, egui::epaint::WHITE_UV),
                             egui::TextureId::default(),
                             &|_| Color32::WHITE,
@@ -2198,7 +2220,7 @@ impl Walk<'_, '_> {
                     )
                 }
             };
-            self.push(Shape::Mesh(mesh.into()), &me);
+            self.push(Shape::Mesh(mesh.into()), &bg_me);
             // BorderSizePixel draws outside the box (BorderMode Outline), not with a UICorner.
             let border = num(d, r, "BorderSizePixel", 0.0) * me.scale;
             if border > 0.0 && corner.is_none() && !styled && !chat_style {
@@ -2321,7 +2343,17 @@ impl Walk<'_, '_> {
             content = content.shrink(17.0 * me.scale);
         }
         if (boolp(d, r, "ClipsDescendants", false) || scrolling || class == "CanvasGroup") && me.aff.is_id() {
-            me.clip = me.clip.intersect(rect);
+            let mut clip_box = rect;
+            if let Some((safe_c, screen_c)) = self.fullscreen_ext {
+                if rect.min.x <= safe_c.min.x + 1.0
+                    && rect.min.y <= safe_c.min.y + 1.0
+                    && rect.max.x >= safe_c.max.x - 1.0
+                    && rect.max.y >= safe_c.max.y - 1.0
+                {
+                    clip_box = clip_box.union(screen_c);
+                }
+            }
+            me.clip = me.clip.intersect(clip_box);
         }
         if scrolling {
             // CanvasSize.Scale multiplies the ScrollingFrame's parent content size.
@@ -3110,8 +3142,8 @@ impl Walk<'_, '_> {
             } else {
                 self.gui.tb_scroll.remove(&r);
             }
-            // Clip overflowing TextBox text/selection/caret to the TextBox bounds.
-            if me.aff.is_id() && (focused || scroll_x > 0.0 || boolp(d, r, "ClipsDescendants", false)) {
+            // Clip overflowing TextBox text/placeholder/selection/caret to the TextBox bounds.
+            if me.aff.is_id() && (focused || scroll_x > 0.0 || content_w > view_w || boolp(d, r, "ClipsDescendants", false)) {
                 text_down.clip = me.clip.intersect(rect);
             }
         }
@@ -3626,7 +3658,7 @@ mod layout_tests {
         let rect = Rect::from_min_size(Pos2::new(20.0, 0.0), egui::vec2(309.7, 30.0));
         let mut input = DrawIn { render_state: None, doc: &doc, cam: &cam, rect, store: &mut store, doc_dir: None, playing: false, fixed_step: true, roots: Default::default() };
         let mut out = ctx.run_ui(Default::default(), |ui| {
-            let mut walk = Walk { gui: &mut gui, ctx: ui.ctx(), input: &mut input, items: Vec::new(), hits: Vec::new(), seq: 0, boxes: Vec::new(), global_z: false, abs_offset: [0.0; 2], screen: None, cur: Ref::none(), rec: Vec::new(), replaying: 0, table_cells: HashMap::new() };
+            let mut walk = Walk { gui: &mut gui, ctx: ui.ctx(), input: &mut input, items: Vec::new(), hits: Vec::new(), seq: 0, boxes: Vec::new(), global_z: false, abs_offset: [0.0; 2], screen: None, fullscreen_ext: None, cur: Ref::none(), rec: Vec::new(), replaying: 0, table_cells: HashMap::new() };
             walk.children(parent, rect, Down { aff: Aff::ID, clip: rect, alpha: 1.0, tint: [1.0; 3], scale: 1.0, z: 0, turn: 0.0 });
             let reply_box = &walk.boxes.iter().find(|(r, _)| *r == reply).unwrap().1;
             assert!((reply_box.size[0] - rect.width()).abs() < 0.01);
@@ -3685,7 +3717,7 @@ mod layout_tests {
         let mut input = DrawIn { render_state: None, doc: &doc, cam: &cam, rect, store: &mut store, doc_dir: None, playing: false, fixed_step: true, roots: Default::default() };
         let mut out = ctx.run_ui(Default::default(), |ui| {
             let ctx = ui.ctx();
-            let mut walk = Walk { gui: &mut gui, ctx, input: &mut input, items: Vec::new(), hits: Vec::new(), seq: 0, boxes: Vec::new(), global_z: false, abs_offset: [0.0; 2], screen: None, cur: Ref::none(), rec: Vec::new(), replaying: 0, table_cells: HashMap::new() };
+            let mut walk = Walk { gui: &mut gui, ctx, input: &mut input, items: Vec::new(), hits: Vec::new(), seq: 0, boxes: Vec::new(), global_z: false, abs_offset: [0.0; 2], screen: None, fullscreen_ext: None, cur: Ref::none(), rec: Vec::new(), replaying: 0, table_cells: HashMap::new() };
             let dn = Down { aff: Aff::ID, clip: rect, alpha: 1.0, tint: [1.0; 3], scale: 1.0, z: 0, turn: 0.0 };
             walk.children(wrap, rect, dn);
             walk.children(spread, rect, dn);
@@ -3738,7 +3770,7 @@ mod layout_tests {
         let mut input = DrawIn { render_state: None, doc: &doc, cam: &cam, rect, store: &mut store, doc_dir: None, playing: false, fixed_step: true, roots: Default::default() };
         let mut out = ctx.run_ui(Default::default(), |ui| {
             let ctx = ui.ctx();
-            let mut walk = Walk { gui: &mut gui, ctx, input: &mut input, items: Vec::new(), hits: Vec::new(), seq: 0, boxes: Vec::new(), global_z: false, abs_offset: [0.0; 2], screen: None, cur: Ref::none(), rec: Vec::new(), replaying: 0, table_cells: HashMap::new() };
+            let mut walk = Walk { gui: &mut gui, ctx, input: &mut input, items: Vec::new(), hits: Vec::new(), seq: 0, boxes: Vec::new(), global_z: false, abs_offset: [0.0; 2], screen: None, fullscreen_ext: None, cur: Ref::none(), rec: Vec::new(), replaying: 0, table_cells: HashMap::new() };
             let dn = Down { aff: Aff::ID, clip: rect, alpha: 1.0, tint: [1.0; 3], scale: 1.0, z: 0, turn: 0.0 };
             walk.children(container, rect, dn);
             walk.children(listed, rect, dn);
@@ -3776,7 +3808,7 @@ mod layout_tests {
         let mut input = DrawIn { render_state: None, doc: &doc, cam: &cam, rect, store: &mut store, doc_dir: None, playing: false, fixed_step: true, roots: Default::default() };
         let mut out = ctx.run_ui(Default::default(), |ui| {
             let ctx = ui.ctx();
-            let mut walk = Walk { gui: &mut gui, ctx, input: &mut input, items: Vec::new(), hits: Vec::new(), seq: 0, boxes: Vec::new(), global_z: false, abs_offset: [0.0; 2], screen: None, cur: Ref::none(), rec: Vec::new(), replaying: 0, table_cells: HashMap::new() };
+            let mut walk = Walk { gui: &mut gui, ctx, input: &mut input, items: Vec::new(), hits: Vec::new(), seq: 0, boxes: Vec::new(), global_z: false, abs_offset: [0.0; 2], screen: None, fullscreen_ext: None, cur: Ref::none(), rec: Vec::new(), replaying: 0, table_cells: HashMap::new() };
             walk.children(page, rect, Down { aff: Aff::ID, clip: rect, alpha: 1.0, tint: [1.0; 3], scale: 1.0, z: 0, turn: 0.0 });
             let bounds = |it: &Item| it.shape.visual_bounding_rect();
             let shadow = walk.items.iter().find(|it| bounds(it).min.x < 46.0).expect("a shadow item");
@@ -3819,7 +3851,7 @@ mod layout_tests {
         let mut input = DrawIn { render_state: None, doc: &doc, cam: &cam, rect, store: &mut store, doc_dir: None, playing: false, fixed_step: true, roots: Default::default() };
         let mut out = ctx.run_ui(Default::default(), |ui| {
             let ctx = ui.ctx();
-            let mut walk = Walk { gui: &mut gui, ctx, input: &mut input, items: Vec::new(), hits: Vec::new(), seq: 0, boxes: Vec::new(), global_z: false, abs_offset: [0.0; 2], screen: None, cur: Ref::none(), rec: Vec::new(), replaying: 0, table_cells: HashMap::new() };
+            let mut walk = Walk { gui: &mut gui, ctx, input: &mut input, items: Vec::new(), hits: Vec::new(), seq: 0, boxes: Vec::new(), global_z: false, abs_offset: [0.0; 2], screen: None, fullscreen_ext: None, cur: Ref::none(), rec: Vec::new(), replaying: 0, table_cells: HashMap::new() };
             walk.children(parent, rect, Down { aff: Aff::ID, clip: rect, alpha: 1.0, tint: [1.0; 3], scale: 1.0, z: 0, turn: 0.0 });
             assert!(walk.boxes.iter().any(|(r, _)| *r == control), "nested Folder control was skipped");
             let boxes: Vec<_> = tabs.iter().map(|r| &walk.boxes.iter().find(|(k, _)| k == r).unwrap().1).collect();
@@ -3862,7 +3894,7 @@ mod layout_tests {
         let mut input = DrawIn { render_state: None, doc: &doc, cam: &cam, rect, store: &mut store, doc_dir: None, playing: false, fixed_step: true, roots: Default::default() };
         let mut out = ctx.run_ui(Default::default(), |ui| {
             let ctx = ui.ctx();
-            let mut walk = Walk { gui: &mut gui, ctx, input: &mut input, items: Vec::new(), hits: Vec::new(), seq: 0, boxes: Vec::new(), global_z: false, abs_offset: [0.0; 2], screen: None, cur: Ref::none(), rec: Vec::new(), replaying: 0, table_cells: HashMap::new() };
+            let mut walk = Walk { gui: &mut gui, ctx, input: &mut input, items: Vec::new(), hits: Vec::new(), seq: 0, boxes: Vec::new(), global_z: false, abs_offset: [0.0; 2], screen: None, fullscreen_ext: None, cur: Ref::none(), rec: Vec::new(), replaying: 0, table_cells: HashMap::new() };
             let dn = Down { aff: Aff::ID, clip: rect, alpha: 1.0, tint: [1.0; 3], scale: 1.0, z: 0, turn: 0.0 };
             walk.children(parent, rect, dn);
             walk.children(holder, rect, dn);
@@ -3906,7 +3938,7 @@ mod layout_tests {
                     // This frame's budget is already spent.
                     gui.text_fit.spent = [Duration::from_secs(1); 2];
                 }
-                let mut walk = Walk { gui: &mut gui, ctx, input: &mut input, items: Vec::new(), hits: Vec::new(), seq: 0, boxes: Vec::new(), global_z: false, abs_offset: [0.0; 2], screen: None, cur: Ref::none(), rec: Vec::new(), replaying: 0, table_cells: HashMap::new() };
+                let mut walk = Walk { gui: &mut gui, ctx, input: &mut input, items: Vec::new(), hits: Vec::new(), seq: 0, boxes: Vec::new(), global_z: false, abs_offset: [0.0; 2], screen: None, fullscreen_ext: None, cur: Ref::none(), rec: Vec::new(), replaying: 0, table_cells: HashMap::new() };
                 walk.children(holder, rect, Down { aff: Aff::ID, clip: rect, alpha: 1.0, tint: [1.0; 3], scale: 1.0, z: 0, turn: 0.0 });
                 assert_eq!(texts(&walk.items), 1, "frame {frame}: the label's text is drawn");
                 if frame == 1 {
@@ -3954,7 +3986,7 @@ mod layout_tests {
         let mut input = DrawIn { render_state: None, doc: &doc, cam: &cam, rect, store: &mut store, doc_dir: None, playing: false, fixed_step: true, roots: Default::default() };
         let mut out = ctx.run_ui(Default::default(), |ui| {
             let ctx = ui.ctx();
-            let mut walk = Walk { gui: &mut gui, ctx, input: &mut input, items: Vec::new(), hits: Vec::new(), seq: 0, boxes: Vec::new(), global_z: false, abs_offset: [0.0; 2], screen: None, cur: Ref::none(), rec: Vec::new(), replaying: 0, table_cells: HashMap::new() };
+            let mut walk = Walk { gui: &mut gui, ctx, input: &mut input, items: Vec::new(), hits: Vec::new(), seq: 0, boxes: Vec::new(), global_z: false, abs_offset: [0.0; 2], screen: None, fullscreen_ext: None, cur: Ref::none(), rec: Vec::new(), replaying: 0, table_cells: HashMap::new() };
             walk.children(page, rect, Down { aff: Aff::ID, clip: rect, alpha: 1.0, tint: [1.0; 3], scale: 1.0, z: 0, turn: 0.0 });
             let b_ = |r: Ref| walk.boxes.iter().find(|(k, _)| *k == r).unwrap().1.clone();
             let l = b_(list);
@@ -4002,7 +4034,7 @@ mod layout_tests {
         let mut input = DrawIn { render_state: None, doc: &doc, cam: &cam, rect, store: &mut store, doc_dir: None, playing: false, fixed_step: true, roots: Default::default() };
         let mut out = ctx.run_ui(Default::default(), |ui| {
             let ctx = ui.ctx();
-            let mut walk = Walk { gui: &mut gui, ctx, input: &mut input, items: Vec::new(), hits: Vec::new(), seq: 0, boxes: Vec::new(), global_z: false, abs_offset: [0.0; 2], screen: None, cur: Ref::none(), rec: Vec::new(), replaying: 0, table_cells: HashMap::new() };
+            let mut walk = Walk { gui: &mut gui, ctx, input: &mut input, items: Vec::new(), hits: Vec::new(), seq: 0, boxes: Vec::new(), global_z: false, abs_offset: [0.0; 2], screen: None, fullscreen_ext: None, cur: Ref::none(), rec: Vec::new(), replaying: 0, table_cells: HashMap::new() };
             walk.children(page, rect, Down { aff: Aff::ID, clip: rect, alpha: 1.0, tint: [1.0; 3], scale: 1.0, z: 0, turn: 0.0 });
             let size = |r: Ref| walk.boxes.iter().find(|(k, _)| *k == r).unwrap().1.size;
             let (s, p) = (size(scaled), size(plain));
@@ -4033,7 +4065,7 @@ mod layout_tests {
         let mut input = DrawIn { render_state: None, doc: &doc, cam: &cam, rect, store: &mut store, doc_dir: None, playing: false, fixed_step: true, roots: Default::default() };
         let mut out = ctx.run_ui(Default::default(), |ui| {
             let ctx = ui.ctx();
-            let mut walk = Walk { gui: &mut gui, ctx, input: &mut input, items: Vec::new(), hits: Vec::new(), seq: 0, boxes: Vec::new(), global_z: false, abs_offset: [0.0; 2], screen: None, cur: Ref::none(), rec: Vec::new(), replaying: 0, table_cells: HashMap::new() };
+            let mut walk = Walk { gui: &mut gui, ctx, input: &mut input, items: Vec::new(), hits: Vec::new(), seq: 0, boxes: Vec::new(), global_z: false, abs_offset: [0.0; 2], screen: None, fullscreen_ext: None, cur: Ref::none(), rec: Vec::new(), replaying: 0, table_cells: HashMap::new() };
             walk.children(parent, rect, Down { aff: Aff::ID, clip: rect, alpha: 1.0, tint: [1.0; 3], scale: 1.0, z: 0, turn: 0.0 });
             let size = |r: Ref| walk.boxes.iter().find(|(k, _)| *k == r).unwrap().1.size;
             let a = size(yy);
@@ -4074,7 +4106,7 @@ mod layout_tests {
         let mut input = DrawIn { render_state: None, doc: &doc, cam: &cam, rect, store: &mut store, doc_dir: None, playing: false, fixed_step: true, roots: Default::default() };
         let mut out = ctx.run_ui(Default::default(), |ui| {
             let ctx = ui.ctx();
-            let mut walk = Walk { gui: &mut gui, ctx, input: &mut input, items: Vec::new(), hits: Vec::new(), seq: 0, boxes: Vec::new(), global_z: false, abs_offset: [0.0; 2], screen: None, cur: Ref::none(), rec: Vec::new(), replaying: 0, table_cells: HashMap::new() };
+            let mut walk = Walk { gui: &mut gui, ctx, input: &mut input, items: Vec::new(), hits: Vec::new(), seq: 0, boxes: Vec::new(), global_z: false, abs_offset: [0.0; 2], screen: None, fullscreen_ext: None, cur: Ref::none(), rec: Vec::new(), replaying: 0, table_cells: HashMap::new() };
             walk.children(parent, rect, Down { aff: Aff::ID, clip: rect, alpha: 1.0, tint: [1.0; 3], scale: 1.0, z: 0, turn: 0.0 });
             let b = walk.boxes.iter().find(|(k, _)| *k == sf).unwrap().1;
             let laid = b.canvas.unwrap();
@@ -4123,7 +4155,7 @@ mod layout_tests {
         let mut input = DrawIn { render_state: None, doc: &doc, cam: &cam, rect, store: &mut store, doc_dir: None, playing: false, fixed_step: true, roots: Default::default() };
         let mut out = ctx.run_ui(Default::default(), |ui| {
             let ctx = ui.ctx();
-            let mut walk = Walk { gui: &mut gui, ctx, input: &mut input, items: Vec::new(), hits: Vec::new(), seq: 0, boxes: Vec::new(), global_z: false, abs_offset: [0.0; 2], screen: None, cur: Ref::none(), rec: Vec::new(), replaying: 0, table_cells: HashMap::new() };
+            let mut walk = Walk { gui: &mut gui, ctx, input: &mut input, items: Vec::new(), hits: Vec::new(), seq: 0, boxes: Vec::new(), global_z: false, abs_offset: [0.0; 2], screen: None, fullscreen_ext: None, cur: Ref::none(), rec: Vec::new(), replaying: 0, table_cells: HashMap::new() };
             let dn = Down { aff: Aff::ID, clip: rect, alpha: 1.0, tint: [1.0; 3], scale: 1.0, z: 0, turn: 0.0 };
             walk.children(t_row, rect, dn);
             walk.children(t_col, rect, dn);
@@ -4166,7 +4198,7 @@ mod layout_tests {
         let mut input = DrawIn { render_state: None, doc: &doc, cam: &cam, rect, store: &mut store, doc_dir: None, playing: false, fixed_step: true, roots: Default::default() };
         let mut out = ctx.run_ui(Default::default(), |ui| {
             let ctx = ui.ctx();
-            let mut walk = Walk { gui: &mut gui, ctx, input: &mut input, items: Vec::new(), hits: Vec::new(), seq: 0, boxes: Vec::new(), global_z: false, abs_offset: [0.0; 2], screen: None, cur: Ref::none(), rec: Vec::new(), replaying: 0, table_cells: HashMap::new() };
+            let mut walk = Walk { gui: &mut gui, ctx, input: &mut input, items: Vec::new(), hits: Vec::new(), seq: 0, boxes: Vec::new(), global_z: false, abs_offset: [0.0; 2], screen: None, fullscreen_ext: None, cur: Ref::none(), rec: Vec::new(), replaying: 0, table_cells: HashMap::new() };
             walk.children(parent, rect, Down { aff: Aff::ID, clip: rect, alpha: 1.0, tint: [1.0; 3], scale: 1.0, z: 0, turn: 0.0 });
             let b = |r: Ref| walk.boxes.iter().find(|(k, _)| *k == r).unwrap().1;
             // Cell 80x112 aspect-fit 2:1 -> 80x40; 2x2 grid; BottomRight puts i1 at (85,45), i2 at (0,45), i3 at (85,0).
@@ -4223,7 +4255,7 @@ mod layout_tests {
         let mut input = DrawIn { render_state: None, doc: &doc, cam: &cam, rect, store: &mut store, doc_dir: None, playing: false, fixed_step: true, roots: Default::default() };
         let mut out = ctx.run_ui(Default::default(), |ui| {
             let ctx = ui.ctx();
-            let mut walk = Walk { gui: &mut gui, ctx, input: &mut input, items: Vec::new(), hits: Vec::new(), seq: 0, boxes: Vec::new(), global_z: false, abs_offset: [0.0; 2], screen: None, cur: Ref::none(), rec: Vec::new(), replaying: 0, table_cells: HashMap::new() };
+            let mut walk = Walk { gui: &mut gui, ctx, input: &mut input, items: Vec::new(), hits: Vec::new(), seq: 0, boxes: Vec::new(), global_z: false, abs_offset: [0.0; 2], screen: None, fullscreen_ext: None, cur: Ref::none(), rec: Vec::new(), replaying: 0, table_cells: HashMap::new() };
             walk.children(page, rect, Down { aff: Aff::ID, clip: rect, alpha: 1.0, tint: [1.0; 3], scale: 1.0, z: 0, turn: 0.0 });
             let b = |r: Ref| walk.boxes.iter().find(|(k, _)| *k == r).unwrap().1;
             assert_eq!(b(min_gt_max).size, [100.0, 100.0]);
@@ -4256,7 +4288,7 @@ mod layout_tests {
         let mut input = DrawIn { render_state: None, doc: &doc, cam: &cam, rect, store: &mut store, doc_dir: None, playing: false, fixed_step: true, roots: Default::default() };
         let mut out = ctx.run_ui(Default::default(), |ui| {
             let ctx = ui.ctx();
-            let mut walk = Walk { gui: &mut gui, ctx, input: &mut input, items: Vec::new(), hits: Vec::new(), seq: 0, boxes: Vec::new(), global_z: false, abs_offset: [0.0; 2], screen: None, cur: Ref::none(), rec: Vec::new(), replaying: 0, table_cells: HashMap::new() };
+            let mut walk = Walk { gui: &mut gui, ctx, input: &mut input, items: Vec::new(), hits: Vec::new(), seq: 0, boxes: Vec::new(), global_z: false, abs_offset: [0.0; 2], screen: None, fullscreen_ext: None, cur: Ref::none(), rec: Vec::new(), replaying: 0, table_cells: HashMap::new() };
             walk.children(parent, rect, Down { aff: Aff::ID, clip: rect, alpha: 1.0, tint: [1.0; 3], scale: 1.0, z: 0, turn: 0.0 });
             let b = |r: Ref| walk.boxes.iter().find(|(k, _)| *k == r).unwrap().1;
             // gutter = 16 + 1 = 17 -> acs = (163, 300), aws = (163, 100), child shifted right by 17.
@@ -4302,7 +4334,7 @@ mod layout_tests {
         let mut input = DrawIn { render_state: None, doc: &doc, cam: &cam, rect, store: &mut store, doc_dir: None, playing: false, fixed_step: true, roots: Default::default() };
         let mut out = ctx.run_ui(Default::default(), |ui| {
             let ctx = ui.ctx();
-            let mut walk = Walk { gui: &mut gui, ctx, input: &mut input, items: Vec::new(), hits: Vec::new(), seq: 0, boxes: Vec::new(), global_z: false, abs_offset: [0.0; 2], screen: None, cur: Ref::none(), rec: Vec::new(), replaying: 0, table_cells: HashMap::new() };
+            let mut walk = Walk { gui: &mut gui, ctx, input: &mut input, items: Vec::new(), hits: Vec::new(), seq: 0, boxes: Vec::new(), global_z: false, abs_offset: [0.0; 2], screen: None, fullscreen_ext: None, cur: Ref::none(), rec: Vec::new(), replaying: 0, table_cells: HashMap::new() };
             walk.children(parent, rect, Down { aff: Aff::ID, clip: rect, alpha: 1.0, tint: [1.0; 3], scale: 1.0, z: 0, turn: 0.0 });
             let b = |r: Ref| walk.boxes.iter().find(|(k, _)| *k == r).unwrap().1;
             let (auto_sf, auto_kids) = &frames[0];
@@ -4346,7 +4378,7 @@ mod layout_tests {
         let mut input = DrawIn { render_state: None, doc: &doc, cam: &cam, rect, store: &mut store, doc_dir: None, playing: false, fixed_step: true, roots: Default::default() };
         let mut out = ctx.run_ui(Default::default(), |ui| {
             let ctx = ui.ctx();
-            let mut walk = Walk { gui: &mut gui, ctx, input: &mut input, items: Vec::new(), hits: Vec::new(), seq: 0, boxes: Vec::new(), global_z: false, abs_offset: [0.0; 2], screen: None, cur: Ref::none(), rec: Vec::new(), replaying: 0, table_cells: HashMap::new() };
+            let mut walk = Walk { gui: &mut gui, ctx, input: &mut input, items: Vec::new(), hits: Vec::new(), seq: 0, boxes: Vec::new(), global_z: false, abs_offset: [0.0; 2], screen: None, fullscreen_ext: None, cur: Ref::none(), rec: Vec::new(), replaying: 0, table_cells: HashMap::new() };
             walk.children(parent, rect, Down { aff: Aff::ID, clip: rect, alpha: 1.0, tint: [1.0; 3], scale: 1.0, z: 0, turn: 0.0 });
             let b = |r: Ref| walk.boxes.iter().find(|(k, _)| *k == r).unwrap().1;
             // Default Horizontal, stride = 210, acs = (4*200 + 3*10, 120) = (830, 120).
@@ -4385,7 +4417,7 @@ mod layout_tests {
         let mut input = DrawIn { render_state: None, doc: &doc, cam: &cam, rect, store: &mut store, doc_dir: None, playing: false, fixed_step: true, roots: Default::default() };
         let mut out = ctx.run_ui(Default::default(), |ui| {
             let ctx = ui.ctx();
-            let mut walk = Walk { gui: &mut gui, ctx, input: &mut input, items: Vec::new(), hits: Vec::new(), seq: 0, boxes: Vec::new(), global_z: false, abs_offset: [0.0; 2], screen: None, cur: Ref::none(), rec: Vec::new(), replaying: 0, table_cells: HashMap::new() };
+            let mut walk = Walk { gui: &mut gui, ctx, input: &mut input, items: Vec::new(), hits: Vec::new(), seq: 0, boxes: Vec::new(), global_z: false, abs_offset: [0.0; 2], screen: None, fullscreen_ext: None, cur: Ref::none(), rec: Vec::new(), replaying: 0, table_cells: HashMap::new() };
             walk.children(parent, rect, Down { aff: Aff::ID, clip: rect, alpha: 1.0, tint: [1.0; 3], scale: 1.0, z: 0, turn: 0.0 });
             let bx = |r: Ref| walk.boxes.iter().find(|(k, _)| *k == r).unwrap().1;
             // Overflow = 60: `a` hits MinSize 80 (shrinks 20), `b` absorbs remaining 40 -> 60.
@@ -4516,7 +4548,7 @@ mod layout_tests {
         let mut input = DrawIn { render_state: None, doc: &doc, cam: &cam, rect, store: &mut store, doc_dir: None, playing: false, fixed_step: true, roots: Default::default() };
         let mut child_clip = None;
         let mut out = ctx.run_ui(Default::default(), |ui| {
-            let mut walk = Walk { gui: &mut gui, ctx: ui.ctx(), input: &mut input, items: Vec::new(), hits: Vec::new(), seq: 0, boxes: Vec::new(), global_z: false, abs_offset: [0.0; 2], screen: None, cur: Ref::none(), rec: Vec::new(), replaying: 0, table_cells: HashMap::new() };
+            let mut walk = Walk { gui: &mut gui, ctx: ui.ctx(), input: &mut input, items: Vec::new(), hits: Vec::new(), seq: 0, boxes: Vec::new(), global_z: false, abs_offset: [0.0; 2], screen: None, fullscreen_ext: None, cur: Ref::none(), rec: Vec::new(), replaying: 0, table_cells: HashMap::new() };
             walk.children(screen, rect, Down { clip: rect, aff: Aff::ID, scale: 1.0, z: 0, alpha: 1.0, tint: [1.0; 3], turn: 0.0 });
             child_clip = walk.hits.iter().find(|h| h.r == overflow).and_then(|h| h.clip);
         });
@@ -4525,6 +4557,46 @@ mod layout_tests {
             child_clip,
             Some(Rect::from_min_size(Pos2::new(20.0, 30.0), egui::vec2(100.0, 80.0))),
             "CanvasGroup must clip descendants to its bounds even with ClipsDescendants=false",
+        );
+    }
+
+    #[test]
+    fn textbox_placeholder_does_not_expand_automatic_size_x() {
+        use rbx_dom_weak::InstanceBuilder;
+        use rbx_dom_weak::types::{Enum, UDim, UDim2};
+        let mut doc = Document::new_place();
+        let root = doc.dom.root_ref();
+        let sg_parent = doc.find_child(root, "StarterGui").unwrap();
+        let screen = doc.dom.insert(sg_parent, InstanceBuilder::new("ScreenGui"));
+        let container = doc.dom.insert(
+            screen,
+            InstanceBuilder::new("Frame")
+                .with_property("Size", UDim2::new(UDim::new(0.0, 74), UDim::new(0.0, 32))),
+        );
+        let tb = doc.dom.insert(
+            container,
+            InstanceBuilder::new("TextBox")
+                .with_property("Size", UDim2::new(UDim::new(1.0, 0), UDim::new(1.0, 0)))
+                .with_property("AutomaticSize", Enum::from_u32(3)) // XY
+                .with_property("Text", "")
+                .with_property("PlaceholderText", "Tap here to chat with everyone"),
+        );
+        let ctx = egui::Context::default();
+        let mut gui = Gui::default();
+        let cam = Camera::default();
+        let mut store = AssetStore::default();
+        let rect = Rect::from_min_size(Pos2::ZERO, egui::vec2(400.0, 300.0));
+        let mut input = DrawIn { render_state: None, doc: &doc, cam: &cam, rect, store: &mut store, doc_dir: None, playing: false, fixed_step: true, roots: Default::default() };
+        let mut tb_w = 0.0;
+        let mut out = ctx.run_ui(Default::default(), |ui| {
+            let mut walk = Walk { gui: &mut gui, ctx: ui.ctx(), input: &mut input, items: Vec::new(), hits: Vec::new(), seq: 0, boxes: Vec::new(), global_z: false, abs_offset: [0.0; 2], screen: None, fullscreen_ext: None, cur: Ref::none(), rec: Vec::new(), replaying: 0, table_cells: HashMap::new() };
+            walk.children(screen, rect, Down { clip: rect, aff: Aff::ID, scale: 1.0, z: 0, alpha: 1.0, tint: [1.0; 3], turn: 0.0 });
+            tb_w = walk.boxes.iter().find(|(k, _)| *k == tb).unwrap().1.size[0];
+        });
+        out.textures_delta.clear();
+        assert!(
+            tb_w <= 74.5,
+            "empty TextBox PlaceholderText must not widen AutomaticSize.X past its 74px container (got {tb_w})"
         );
     }
 

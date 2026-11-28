@@ -110,6 +110,7 @@ pub const METHODS: &[(&str, &str)] = &[
     ("UnbindCoreAction", "ContextActionService"),
     ("GetBoundCoreActionInfo", "ContextActionService"),
     ("GetAllBoundCoreActionInfo", "ContextActionService"),
+    ("FireActionButtonFoundSignal", "ContextActionService"),
     // LayerCollector / PlayerGui
     ("GetGuiObjectsAtPosition", "LayerCollector"),
     ("GetGuiObjectsAtPosition", "BasePlayerGui"),
@@ -214,12 +215,9 @@ pub const EVENTS: &[(&str, &str)] = &[
     ("UserCFrameChanged", "UserInputService"),
     ("LocalToolEquipped", "ContextActionService"),
     ("LocalToolUnequipped", "ContextActionService"),
-    // The touch-button CoreScript's feed (ContextActionTouch, run by
-    // StarterScript on a touch screen): library.luau fires these from
-    // BindAction / UnbindAction / SetTitle…, GetButton asks with the last.
+    ("BoundActionChanged", "ContextActionService"),
     ("BoundActionAdded", "ContextActionService"),
     ("BoundActionRemoved", "ContextActionService"),
-    ("BoundActionChanged", "ContextActionService"),
     ("GetActionButtonEvent", "ContextActionService"),
     ("SafeZoneOffsetsChanged", "GuiService"),
     ("ErrorMessageChanged", "GuiService"),
@@ -805,6 +803,29 @@ pub fn install(lua: &Lua) -> mlua::Result<()> {
     g.set(
         "gamepads",
         lua.create_function(|lua, ()| Ok(world(lua).map(|w| w.input.gamepads).unwrap_or(0)))?,
+    )?;
+    // The simulated device (Device Simulator): portrait, the whole screen's
+    // size, the safe-area insets (left, top, right, bottom), ten-foot and
+    // GuiService.ViewportDisplaySize's item name.
+    g.set(
+        "device",
+        lua.create_function(|lua, ()| {
+            let w = world(lua)?;
+            let dev = w.input.device;
+            let [sw, sh] = dev.screen_or(w.input.view_size);
+            Ok((
+                dev.portrait,
+                dev.simulated,
+                sw,
+                sh,
+                dev.safe[0],
+                dev.safe[1],
+                dev.safe[2],
+                dev.safe[3],
+                dev.flags.ten_foot,
+                dev.display_size.enum_name(),
+            ))
+        })?,
     )?;
     g.set(
         "mouse",
@@ -1582,6 +1603,17 @@ pub fn engine_message(rt: &Runtime, inst: Ref, player: Ref, args: &[Xfer], map: 
         }
     }
     rt.dispatch();
+}
+
+/// GuiService.TopbarInset's Changed when the view resized it, fired right
+/// after Camera.ViewportSize (ext::fire_layout_changes; Studio's order).
+pub fn step_topbar(lua: &Lua) {
+    if world(lua).is_ok_and(|w| w.mode == RunMode::Edit || w.side != Side::Client) {
+        return;
+    }
+    if let Ok(f) = module(lua).and_then(|m| m.get::<Function>("step_topbar")) {
+        let _ = f.call::<()>(());
+    }
 }
 
 /// Fires the focus changes queued so far (FocusLost of a box a press left)

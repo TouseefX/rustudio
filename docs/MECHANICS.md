@@ -434,6 +434,40 @@ now sit where Place A puts them (Attachment.WorldCFrame was missing).
 | AbsolutePosition / AbsoluteSize / AbsoluteRotation | where the object was drawn last frame (before that: from its UDim2s) | Roblox docs |
 | Cost | Place A's lobby (17 GUIs, several thousand objects) takes ~2.6 ms a frame | measured (`--bench`, load average ~10) |
 
+## Device Simulator
+
+The devices are Studio's own: its built-in device table (EmulatedDevices XML in
+Roblox Studio 0.748) gives each preset's size, pixel density, resolution scale,
+safe areas and keyboard heights (`crates/rustudio-core/src/devices.rs`). The
+rest was measured in Studio's Play with the simulator.
+
+| Value | Setting | Source |
+|---|---|---|
+| Presets | the 43 devices Studio lists (Default and Average Laptop are left out, as Studio hides them) | Studio's device table |
+| Screen size scripts see | the device's points at the view's scale, floored to whole pixels and divided back, floored: iPhone 14 844×390 is 843×389 fitted in a 1914×718 panel; a scale with no remainder keeps it (Xbox One 1080 high in a 718 px panel) | measured; all 43 presets checked in a 1914×718 panel: consoles, desktops, headsets and phones match, some fitted tablets and two desktops (Average MacBook, VGA) are 1 px off |
+| Safe area | Camera.ViewportSize and DeviceSafeInsets are the screen less the device's safe-area insets; on iOS in landscape the bottom inset is not taken off (iPhone 14 749×389, Galaxy S22 677×338) | measured |
+| ScreenInsets None | the whole screen, under the notch: iPhone 14 landscape (−47, −58) 843×389, portrait (0, −105) 389×843; GetInsetArea(None) likewise | measured |
+| Viewport points | the camera projects over the whole screen (FieldOfView spans its full height) and viewport points start at the safe area's corner | measured (iPhone 14 portrait) |
+| Input flags | phones and tablets Touch; Xbox / PlayStation Gamepad and ten-foot; the TV Touch with a gamepad; headsets Mouse + Gamepad; the generic handhelds all four, preferring Gamepad; desktops keyboard and mouse | measured, every preset |
+| Device gamepad | consoles, handhelds, headsets and the TV have Gamepad1 connected while simulated; one for another drops and reconnects it (PreferredInput Changed, GamepadDisconnected, PreferredInput Changed, GamepadConnected); a real pad already in Gamepad1 moves to the next free slot | measured (Xbox One to PS4); the real pad's move is an estimate |
+| Orientation | PlayerGui.CurrentScreenOrientation is Portrait or LandscapeRight on a device (LandscapeLeft with none), and changes one frame after the view | measured |
+| ViewportDisplaySize | each preset's own (consoles and the TV Large, headsets Medium, the rest Small under a 10.35 in diagonal, else Medium); for a custom device the diagonal rule | measured; the rule fitted to the presets |
+| Switch order | flags' Changed (Mouse, Keyboard, Touch, Gamepad), PreferredInput, GamepadDisconnected / Connected, Camera.ViewportSize, GuiService.TopbarInset, then GUI boxes; LastInputTypeChanged does not fire; nothing restarts | measured mid-Play |
+| Fit padding | 17 px round a device's frame (body and side buttons); a frameless device fills the view | measured (iPhone 14 upright and landscape, Xbox One) |
+| Frames | each framed device's bezel, corner radii, cut-out, side buttons and bezel features, in device points | measured from Studio's frame captures (the XML's wireframe_screen_x/y place the screen in Studio's image, not the visible bezel) |
+| Bar | 27 px tall; pills 22 px, fully rounded; icons 13 px, 20 px apart; the device dropdown 168 px wide, rows 17.5 px | measured (1:1 capture, and 1.5x captures divided by 1.5) |
+| Calibrate | an ID card 3.37 × 2.125 in; the slider runs 80 to 250 DPI, linear, default 96 | measured (the top end ±5) |
+| Manage devices limits | name ≤ 200 characters; width 1–7680, height 1–4320, pixel density 72–10000, keyboard heights 0–4320; memory at least 0.5 GB (raised silently) | measured (Studio's device service and dialog) |
+| Mouse as a finger | a still press of 0.5 s is a long press; LeftAlt + drag rotation begins past 0.1 rad and is reported in radians, not wrapped (Studio's emulator jumps past π); the second finger mirrors the pointer about the whole screen's centre | measured |
+| Long press while pinching | a LeftAlt + drag held 0.5 s is a TouchLongPress too, listing only the first (mirrored) touch, with Change on every move | measured |
+| Tap and swipe | a press that moves under 8 points is a tap (and pans only past it); a drag let go at 400 points/s or faster is a swipe | estimates |
+| Finger discs | about 46 points across while LeftAlt is held | measured |
+| Virtual controller keys | Studio's "Generic Gamepad" map: W A S D left stick (F L3), I J K L right stick (H R3), 1 2 3 4 d-pad up / left / down / right, 7 Y, 8 X, 9 A, 0 B, R L1, E L2, O R1, P R2, Q Select, U Start; the Xbox layout uses the same keys | Studio's Controller Emulator panel |
+| Virtual controller events | sticks: InputChanged at each axis −1 / 0 / 1 (W + D is (1, 1), not normalised), InputEnded at (0, 0, 0) on release, no InputBegan; buttons: InputBegan at (0, 0, 1), InputEnded at (0, 0, 0); L2 / R2: InputChanged then InputBegan at (0, 0, 1), InputChanged then InputEnded at (0, 0, 0); unmapped keys reach nothing | measured (iPhone 14, Play) |
+| Virtual controller flags | on: GamepadEnabled and Gamepad1 at once (a real pad in Gamepad1 moves to the next free slot: estimate); PreferredInput turns Gamepad with the first mapped key (at once on the TV, which has a pad of its own); off: the device's own flags and GamepadDisconnected | measured; with Current device, desktop flags plus the pad (estimate) |
+| Virtual controller exceptions | Escape still reaches the game (opens the in-game menu); a focused TextBox keeps every key | estimates |
+| Custom devices | a mobile device is a tablet from a 7 in diagonal; resolution scale PPI ÷ 160 rounded (1 on desktops and consoles); new devices' sizes other than a console's 1920 × 1080 at 96 PPI | estimates |
+
 ## FBX models (InsertService:LoadAsset)
 
 | Value | Setting | Source |

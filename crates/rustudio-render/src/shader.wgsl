@@ -296,7 +296,7 @@ fn sky_color_lod_k(dir: vec3<f32>, lod: f32, k: vec3<f32>) -> vec3<f32> {
 // ------------------------------------------------------------------ sky
 
 struct SkyOut {
-    @builtin(position) pos: vec4<f32>,
+    @invariant @builtin(position) pos: vec4<f32>,
     @location(0) ndc: vec2<f32>,
 };
 
@@ -1161,16 +1161,23 @@ fn fs_see_decode(@builtin(position) p: vec4<f32>, @builtin(sample_index) s: u32)
     return vec4<f32>(see_dec(e.rgb), 1.0);
 }
 
+/// Studio's 4×4-stud checkerboard placeholder for empty/unloaded MeshParts.
+fn placeholder_checker(base: vec3<f32>, objn: vec3<f32>, local: vec3<f32>, half: vec3<f32>, oblique: u32) -> vec3<f32> {
+    let cell = floor(face_studs(objn, local, half, oblique) * 0.25);
+    let odd = abs(fract(cell.x * 0.5) - fract(cell.y * 0.5)) > 0.25;
+    return base * select(0.55, 0.95, odd);
+}
+
 /// Performance > Shading detail "Low": the sun (one shadow-map tap), its
 /// ambient and the fog. No material maps, sky reflection, light grid, local
 /// lights or specular. Called from part_shade after the box faces' surfaces.
-fn part_shade_low(in: PartOut, base: vec3<f32>, alpha: f32, kind: f32) -> vec4<f32> {
+fn part_shade_low(in: PartOut, front: bool, base: vec3<f32>, alpha: f32, kind: f32) -> vec4<f32> {
     var c: vec3<f32>;
     if (kind > 0.5 && kind < 1.5) {
         // Neon: its own colour, unlit (cheap and the same as the full path).
         c = base * base * NEON_GLOW;
     } else {
-        let n = normalize(in.normal);
+        let n = select(-normalize(in.normal), normalize(in.normal), front);
         let l = normalize(g.sun_dir.xyz);
         let ndl = max(dot(n, l), 0.0);
         var light = g.ambient.rgb + g.outdoor.rgb * sky_gain();
@@ -1273,8 +1280,7 @@ fn shade_opaque_low(in: PartOut, use_shadow_map: bool) -> vec4<f32> {
         base *= surface_shade(faces, in.objn, in.local, in.half, local_dx, local_dy);
     }
     if ((packed & 1u) != 0u) {
-        let k = fract((in.world.x + in.world.y + in.world.z) * 0.25);
-        base = mix(base, base * 0.6 + vec3<f32>(0.18, 0.12, 0.3), step(0.5, k) * 0.6);
+        base = placeholder_checker(base, in.objn, in.local, in.half, in.oblique);
     }
     let n = normalize(in.normal);
     let grid = light_grid_channels(in.world, n);
@@ -1341,10 +1347,11 @@ fn part_shade(in: PartOut, front: bool) -> vec4<f32> {
     let mdy = dpdy(muv);
     let wdx = dpdx(in.world);
     let wdy = dpdy(in.world);
-    var n = normalize(in.normal);
-    // Two-sided meshes: light the side that faces the camera, whatever the
-    // triangle winding (imported meshes wind either way).
-    if (dot(n, g.cam_pos.xyz - in.world) < 0.0) { n = -n; }
+    // Two-sided meshes: flip geometric normals only on actual backfaces so
+    // meshes with custom/transferred front-face normals keep their authored
+    // lighting instead of inverting at dot(n, V) == 0.
+    let geo_n = select(-normalize(in.normal), normalize(in.normal), front);
+    var n = geo_n;
     let vtint = sq(in.vtint.rgb);
     var base = in.color.rgb * vtint;
     var alpha = in.color.a;
@@ -1582,15 +1589,14 @@ fn part_shade(in: PartOut, front: bool) -> vec4<f32> {
     if (faces != 0u) {
         base *= surface_shade(faces, in.objn, in.local, in.half, ddx, ddy);
     }
-    // Mesh placeholder: diagonal stripes so unloaded meshes stand out.
+    // Mesh placeholder: Studio's 4×4-stud checkerboard box.
     if ((packed & 1u) == 1u) {
-        let k = fract((in.world.x + in.world.y + in.world.z) * 0.25);
-        base = mix(base, base * 0.6 + vec3<f32>(0.18, 0.12, 0.3), step(0.5, k) * 0.6);
+        base = placeholder_checker(base, in.objn, in.local, in.half, in.oblique);
     }
     // Performance > Shading detail Low: the box faces' surfaces above still
     // draw (one texel); the lighting below is what costs.
     if (low_part) {
-        return part_shade_low(in, base, alpha, kind);
+        return part_shade_low(in, front, base, alpha, kind);
     }
     if (spec_pred(8u, g.lamp1.w > 1.5)) {
         // A ViewportFrame (vf_render.rs): Ambient² + LightColor² × N·L
@@ -1636,27 +1642,29 @@ fn part_shade(in: PartOut, front: bool) -> vec4<f32> {
         // Neon glows at its own colour, unlit (and blooms). See-through
         // Neon blends the same radiance (neon_over_scene below).
         c = base * base * NEON_GLOW;
-    } else if (spec_pred(2u, g.perf.x < 1.5)) {
+    } else if (spec_pred(2u, g.perf.x < 1.5) && kind < 2.5) {
         // Performance > Shading detail "Medium": the same diffuse light as
         // High (sun shadow, sky light grid, ambient), without the
         // environment BRDF, sky reflections, sun highlight or local lights.
+        // Glass (kind == 3) stays on the refraction/composite branch below
+        // because the glass pipeline uses blend: None.
         let l = normalize(g.sun_dir.xyz);
         let ndl = max(dot(n, l), 0.0);
-        let shadow = select(1.0, sun_shadow(in.world, normalize(in.normal)), ndl > 0.0);
-        let sv = light_grid(in.world, normalize(in.normal));
+        let shadow = select(1.0, sun_shadow(in.world, geo_n), ndl > 0.0);
+        let sv = light_grid(in.world, geo_n);
         c = base * (g.ambient.rgb + g.outdoor.rgb * sv * sky_gain()
             + g.sun_color.rgb * g.sun_dir.w * ndl * shadow * sun_cover());
         if (spec_pred(4u, g.perf.w > 0.5)) {
-            c += base * local_grid_light(in.world, normalize(in.normal));
+            c += base * local_grid_light(in.world, geo_n);
         }
     } else {
         let l = normalize(g.sun_dir.xyz);
         let ndl = max(dot(n, l), 0.0);
-        let shadow = select(1.0, sun_shadow(in.world, normalize(in.normal)), ndl > 0.0);
+        let shadow = select(1.0, sun_shadow(in.world, geo_n), ndl > 0.0);
         // Studio's skylight scales OutdoorAmbient and the sky's diffuse
         // light (SkyAmbient, AmbientCube[0..5] in the FS): the light grid,
         // parts and terrain alike.
-        let sv = light_grid(in.world, normalize(in.normal));
+        let sv = light_grid(in.world, geo_n);
         let is_glass = SPEC_SPECIAL_KINDS && kind > 2.5 && kind < 3.5;
         // Studio's HQ part FS (DefaultUnifiedFlatOpaqueFS / TiledFS /
         // PlasticReflectionFS variant 3, Studio measurements "Environment light
@@ -1712,7 +1720,7 @@ fn part_shade(in: PartOut, front: bool) -> vec4<f32> {
         let voxel_sun = spec_pred(16u, g.sun_color.w > 0.5) && !spec_pred(32u, g.env_spec.z > 0.5);
         var back = select(0.0, -nl, nl < 0.0 && g.bloom.z < 0.5);
         if (voxel_sun && nl < 0.0) {
-            back = -nl * sun_shadow(in.world, normalize(in.normal));
+            back = -nl * sun_shadow(in.world, geo_n);
         }
         // LQ TiledFS.0 uses AmbientColorNoIBL / SkyAmbientNoIBL and
         // geometric (vertex) normals, with no environment BRDF contribution.
@@ -1720,7 +1728,7 @@ fn part_shade(in: PartOut, front: bool) -> vec4<f32> {
             + g.ambient.rgb + g.outdoor.rgb * sv * sky_gain()
             + (kd - fs * sS * kd) * sun_light
             + g.lamp1.rgb * kd * back;
-        let local = local_pbr(in.world, select(n, normalize(in.normal), spec_pred(16u, g.sun_color.w > 0.5)), v, rough, f0, kd, sS);
+        let local = local_pbr(in.world, select(n, geo_n, spec_pred(16u, g.sun_color.w > 0.5)), v, rough, f0, kd, sS);
         light += local.diffuse;
         sun_spec += local.specular;
         // RUSTUDIO_SHADE_DEBUG light / local / sun / ambient: that light alone, no albedo.

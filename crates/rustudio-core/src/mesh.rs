@@ -2303,6 +2303,17 @@ pub fn parse_facs_block(b: &[u8]) -> Option<Facs> {
 
 /// The FACS rig of a mesh file, if it has one.
 pub fn parse_mesh_facs(bytes: &[u8]) -> Option<Facs> {
+    let owned;
+    let bytes = if bytes.starts_with(&[0x1f, 0x8b]) {
+        use std::io::Read;
+        let mut d = flate2::read::GzDecoder::new(bytes);
+        let mut v = Vec::new();
+        d.read_to_end(&mut v).ok()?;
+        owned = v;
+        &owned[..]
+    } else {
+        bytes
+    };
     let nl = bytes.iter().position(|c| *c == b'\n')?;
     let ver = std::str::from_utf8(&bytes[..nl]).ok()?.trim().strip_prefix("version ")?.to_string();
     let body = &bytes[nl + 1..];

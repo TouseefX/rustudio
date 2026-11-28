@@ -581,7 +581,13 @@ fn plugin_uri(lua: &Lua, this: Ref) -> mlua::Result<Value> {
 pub fn prop_get(lua: &Lua, _r: Ref, class: &str, key: &str) -> mlua::Result<Option<Value>> {
     match (class, key) {
         ("StudioPublishService", "PublishLocked") => Ok(Some(Value::Boolean(false))),
-        ("StudioService", "InstalledPluginData" | "Secrets") => Ok(Some(lstr(lua, "")?)),
+        ("StudioService", "InstalledPluginData") => Ok(Some(lstr(lua, "")?)),
+        ("StudioService", "Secrets") => {
+            let s = crate::game_settings_ui::encode_secrets_json(
+                &crate::game_settings_ui::load_local_secrets(),
+            );
+            Ok(Some(lstr(lua, &s)?))
+        }
         ("StudioService", "ShowWeldDetails") => Ok(Some(Value::Boolean(false))),
         _ => Ok(None),
     }

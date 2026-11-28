@@ -42,6 +42,9 @@ pub struct Member {
     pub category: String,
     /// Tagged Hidden or NotBrowsable: never listed in Properties.
     pub hidden: bool,
+    /// For Class-typed (`Variant::Ref`) properties, the expected Roblox class
+    /// (e.g. "Attachment", "BasePart", "Instance").
+    pub value_class: Option<String>,
 }
 
 #[derive(Debug, Default)]
@@ -65,6 +68,24 @@ pub struct Api {
     /// the reflection database lacks (ProjectionType, OrthographicMode…)
     /// come from here (ltypes::LEnumItem).
     pub enums: HashMap<String, Vec<(String, u32)>>,
+}
+
+impl Api {
+    /// Expected class for a Class-typed (`Variant::Ref`) property on `class`
+    /// (walking its superclass chain).
+    pub fn prop_value_class(&self, class: &str, prop: &str) -> Option<&str> {
+        let mut cur = Some(class);
+        while let Some(name) = cur {
+            let c = self.classes.get(name)?;
+            if let Some(m) = c.members.get(prop) {
+                if m.kind == Kind::Property {
+                    return m.value_class.as_deref();
+                }
+            }
+            cur = c.superclass.as_deref();
+        }
+        None
+    }
 }
 
 fn dump_path() -> std::path::PathBuf {
@@ -155,6 +176,12 @@ pub fn parse(text: &str) -> Option<Api> {
                         .unwrap_or("")
                         .to_string(),
                     hidden: mtags.contains(&"Hidden") || mtags.contains(&"NotBrowsable"),
+                    value_class: m
+                        .get("ValueType")
+                        .filter(|vt| vt.get("Category").and_then(|c| c.as_str()) == Some("Class"))
+                        .and_then(|vt| vt.get("Name"))
+                        .and_then(|n| n.as_str())
+                        .map(str::to_string),
                 },
             );
         }

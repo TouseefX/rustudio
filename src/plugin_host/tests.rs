@@ -1349,3 +1349,870 @@ fn sound_and_audio_player_props_layout_matches_studio() {
         assert!(rows.contains(&"TimeLength".to_string()), "got {rows:?}");
     }
 }
+
+#[test]
+fn native_plugin_suite_register_toggle_swap_and_unload() {
+    use crate::anim_editor::host::{AnimationEditorPlugin, CAPABILITY, PLUGIN_ID};
+    use rustudio_core::rustudio_settings::{BuiltinToolChoices, ToolImpl};
+
+    let mut host = PluginHost::default();
+    super::native::register_default_suite(host.native_mut());
+    assert!(host.native().has_factory(PLUGIN_ID));
+
+    // Default choices load AnimationEditorPlugin as a modular native plugin
+    // without starting a Luau EditVm.
+    let choices = BuiltinToolChoices::default();
+    host.sync_native_builtins(choices, None);
+    assert!(host.native().is_loaded(PLUGIN_ID));
+    assert!(host.edit_lua().is_none(), "native plugins must not boot the Luau VM");
+    assert!(host.native_plugin::<AnimationEditorPlugin>(PLUGIN_ID).is_some());
+    assert!(host.native().find_by_capability(CAPABILITY).is_some());
+    assert!(host.loaded().iter().any(|p| p.name == PLUGIN_ID && p.running));
+
+    // Toggle widget open / close cleanly.
+    assert_eq!(host.native_mut().toggle_widget(PLUGIN_ID), Some(true));
+    assert_eq!(host.native().widget_views()[0].want_open, true);
+    assert_eq!(host.native_mut().toggle_widget(PLUGIN_ID), Some(false));
+    assert_eq!(host.native().widget_views()[0].want_open, false);
+
+    // Switching BuiltinTool::AnimationEditor to Roblox unloads the native plugin.
+    let roblox_choices = BuiltinToolChoices {
+        plugins_enabled: true,
+        animation_editor: ToolImpl::Roblox,
+        ..Default::default()
+    };
+    host.sync_native_builtins(roblox_choices, None);
+    assert!(!host.native().is_loaded(PLUGIN_ID));
+    assert!(host.native().find_by_capability(CAPABILITY).is_none());
+
+    // Switching back re-instantiates it cleanly.
+    host.sync_native_builtins(choices, None);
+    assert!(host.native().is_loaded(PLUGIN_ID));
+
+    // Can be unregistered/removed from the suite completely.
+    assert!(host.native_mut().unregister_factory(PLUGIN_ID, None));
+    assert!(!host.native().is_loaded(PLUGIN_ID));
+    assert!(!host.native().has_factory(PLUGIN_ID));
+}
+
+#[test]
+fn bundled_luau_directory_plugin_loads_with_shared_packages() {
+    let dir = std::env::temp_dir().join(format!("rustudio_bundled_suite_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let pkgs = dir.join("_packages");
+    let plug = dir.join("QuickTool");
+    std::fs::create_dir_all(&pkgs).unwrap();
+    std::fs::create_dir_all(&plug).unwrap();
+
+    // Shared package (e.g. Vide) mounted at script.Parent.Packages.<Name>
+    std::fs::write(
+        pkgs.join("Vide.luau"),
+        "return { version = 'vide-test-1' }\n",
+    )
+    .unwrap();
+    // Helper ModuleScript inside the plugin directory
+    std::fs::write(
+        plug.join("Helper.luau"),
+        "return function(v) return 'helper:' .. v end\n",
+    )
+    .unwrap();
+    // Entry Script
+    std::fs::write(
+        plug.join("init.server.luau"),
+        r#"
+local Vide = require(script.Parent.Packages.Vide)
+local Helper = require(script.Parent.Helper)
+print("BUNDLED_OK:" .. Helper(Vide.version) .. ":" .. plugin.Name)
+local tb = plugin:CreateToolbar("QuickTool")
+tb:CreateButton("open", "Open", "")
+"#,
+    )
+    .unwrap();
+
+    let mut doc = Document::new_place();
+    let mut host = PluginHost::default();
+    let res = host.load_bundled_dir(&dir);
+    assert_eq!(res.len(), 1);
+    assert!(res[0].is_ok(), "load failed: {:?}", res[0]);
+    frames(&mut host, &mut doc, 3);
+
+    let out = lines(&mut host);
+    assert!(
+        out.iter().any(|l| l.contains("BUNDLED_OK:helper:vide-test-1:rustudio_QuickTool")),
+        "unexpected output: {out:?}"
+    );
+    assert!(ui_ribbon::is_builtin_plugin_group("rustudio_QuickTool"));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn bundled_vide_and_studio_theme_run_reactively_in_plugin_host() {
+    let dir = std::env::temp_dir().join(format!("rustudio_vide_suite_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let pkgs = dir.join("_packages");
+    let plug = dir.join("VideProbe");
+    std::fs::create_dir_all(&pkgs).unwrap();
+    std::fs::create_dir_all(&plug).unwrap();
+
+    // Copy the actual shipped Vide.luau and StudioTheme.luau packages!
+    let repo_pkgs = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("plugins")
+        .join("_packages");
+    std::fs::copy(repo_pkgs.join("Vide.luau"), pkgs.join("Vide.luau")).unwrap();
+    std::fs::copy(repo_pkgs.join("StudioTheme.luau"), pkgs.join("StudioTheme.luau")).unwrap();
+
+    std::fs::write(
+        plug.join("init.server.luau"),
+        r#"
+local Vide = require(script.Parent.Packages.Vide)
+local StudioTheme = require(script.Parent.Packages.StudioTheme)
+
+local count = Vide.source(0)
+local doubled = Vide.derive(function() return count() * 2 end)
+local shown = Vide.source(true)
+
+local container = Instance.new("Folder")
+local labelRef
+local unmount = Vide.mount(function()
+    return Vide.create "Frame" {
+        Name = "Root",
+        BackgroundColor3 = StudioTheme.color(Enum.StudioStyleGuideColor.MainBackground),
+        {
+            Vide.create "TextLabel" {
+                Name = "Counter",
+                Text = function() return string.format("n=%d,2n=%d", count(), doubled()) end,
+                Vide.action(function(inst) labelRef = inst end),
+            },
+            Vide.show(shown, function()
+                return Vide.create "TextLabel" { Name = "Badge", Text = "ON" }
+            end),
+        },
+    }
+end, container)
+
+local root = container:FindFirstChild("Root")
+local t0 = labelRef and labelRef.Text or "nil"
+local bg0 = root and root.BackgroundColor3
+local hasBadge0 = root and root:FindFirstChild("Badge") ~= nil
+
+count(3)
+local t1 = labelRef and labelRef.Text or "nil"
+
+shown(false)
+local hasBadge1 = root and root:FindFirstChild("Badge") ~= nil
+
+unmount()
+local rootAfter = container:FindFirstChild("Root")
+
+print(string.format(
+    "VIDE_OK:%s|%s|badge=%s->%s|bg=%s|unmounted=%s",
+    t0,
+    t1,
+    tostring(hasBadge0),
+    tostring(hasBadge1),
+    tostring(bg0 ~= nil),
+    tostring(rootAfter == nil)
+))
+"#,
+    )
+    .unwrap();
+
+    let mut doc = Document::new_place();
+    let mut host = PluginHost::default();
+    let res = host.load_bundled_dir(&dir);
+    assert_eq!(res.len(), 1);
+    assert!(res[0].is_ok(), "load failed: {:?}", res[0]);
+    frames(&mut host, &mut doc, 3);
+
+    let out = lines(&mut host);
+    assert!(
+        out.iter()
+            .any(|l| l.contains("VIDE_OK:n=0,2n=0|n=3,2n=6|badge=true->false|bg=true|unmounted=true")),
+        "unexpected Vide output: {out:?}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn suite_disable_persists_and_survives_sync_builtin_choices() {
+    use crate::anim_editor::host::PLUGIN_ID;
+    use rustudio_core::rustudio_settings::BuiltinToolChoices;
+
+    let prefs_path = std::env::temp_dir().join(format!("rustudio_suite_prefs_{}.json", std::process::id()));
+    let _ = std::fs::remove_file(&prefs_path);
+
+    let mut host = PluginHost::default();
+    host.native_mut().attach_prefs_file(prefs_path.clone());
+    super::native::register_default_suite(host.native_mut());
+    host.sync_native_builtins(BuiltinToolChoices::default(), None);
+    assert!(host.native().is_loaded(PLUGIN_ID));
+
+    // Disable via Built-in Suite toggle -> unloads and persists to JSON.
+    host.native_mut().set_suite_enabled_pref(PLUGIN_ID, false);
+    host.sync_native_builtins(BuiltinToolChoices::default(), None);
+    assert!(!host.native().is_loaded(PLUGIN_ID));
+
+    // A fresh PluginHost reading the same prefs file keeps it disabled!
+    let mut host2 = PluginHost::default();
+    host2.native_mut().attach_prefs_file(prefs_path.clone());
+    super::native::register_default_suite(host2.native_mut());
+    host2.sync_native_builtins(BuiltinToolChoices::default(), None);
+    assert!(!host2.native().is_loaded(PLUGIN_ID));
+
+    // Re-enabling loads it immediately again.
+    host2.native_mut().set_suite_enabled_pref(PLUGIN_ID, true);
+    host2.sync_native_builtins(BuiltinToolChoices::default(), None);
+    assert!(host2.native().is_loaded(PLUGIN_ID));
+
+    let _ = std::fs::remove_file(&prefs_path);
+}
+
+#[test]
+fn all_nine_rust_builtin_suite_plugins_register_toggle_and_coordinate_with_choices() {
+    use super::builtin_suite;
+    use rustudio_core::rustudio_settings::{BuiltinToolChoices, ToolImpl};
+
+    let mut host = PluginHost::default();
+    super::native::register_default_suite(host.native_mut());
+
+    let expected = [
+        crate::anim_editor::host::PLUGIN_ID,
+        crate::command_bar::PLUGIN_ID,
+        builtin_suite::TOOLBOX_ID,
+        builtin_suite::TERRAIN_EDITOR_ID,
+        builtin_suite::ASSET_MANAGER_ID,
+        builtin_suite::RIG_BUILDER_ID,
+        builtin_suite::VIEW_SELECTOR_ID,
+        builtin_suite::MATERIAL_PICKER_ID,
+        builtin_suite::DRAGGERS_ID,
+    ];
+    let registered: Vec<&str> = host.native().registered().map(|m| m.id).collect();
+    assert_eq!(registered.len(), expected.len(), "expected all 9 native Rust suite plugins");
+    for id in expected {
+        assert!(host.native().has_factory(id), "missing factory for {id}");
+    }
+
+    // Default choices load all 9 without starting a Luau EditVm.
+    host.sync_native_builtins(BuiltinToolChoices::default(), None);
+    assert!(host.edit_lua().is_none());
+    for id in expected {
+        assert!(host.native().is_loaded(id), "{id} should be loaded by default");
+    }
+
+    // Disabling each plugin via suite toggle unloads only that plugin.
+    for id in builtin_suite::ALL_IDS {
+        host.native_mut().set_suite_enabled_pref(id, false);
+        host.sync_native_builtins(BuiltinToolChoices::default(), None);
+        assert!(!host.native().is_loaded(id), "{id} should unload when disabled");
+        host.native_mut().set_suite_enabled_pref(id, true);
+        host.sync_native_builtins(BuiltinToolChoices::default(), None);
+        assert!(host.native().is_loaded(id), "{id} should reload when re-enabled");
+    }
+
+    // Switching all Roblox-backed BuiltinTools to Roblox unloads the 7
+    // duplicated native Rust tools while keeping Command Bar & Asset Manager.
+    let all_roblox = BuiltinToolChoices {
+        plugins_enabled: true,
+        toolbox: ToolImpl::Roblox,
+        terrain_editor: ToolImpl::Roblox,
+        draggers: ToolImpl::Roblox,
+        view_selector: ToolImpl::Roblox,
+        rig_builder: ToolImpl::Roblox,
+        material_picker: ToolImpl::Roblox,
+        animation_editor: ToolImpl::Roblox,
+    };
+    host.sync_native_builtins(all_roblox, None);
+    for id in [
+        crate::anim_editor::host::PLUGIN_ID,
+        builtin_suite::TOOLBOX_ID,
+        builtin_suite::TERRAIN_EDITOR_ID,
+        builtin_suite::RIG_BUILDER_ID,
+        builtin_suite::VIEW_SELECTOR_ID,
+        builtin_suite::MATERIAL_PICKER_ID,
+        builtin_suite::DRAGGERS_ID,
+    ] {
+        assert!(!host.native().is_loaded(id), "{id} should unload when switched to Roblox");
+    }
+    assert!(host.native().is_loaded(crate::command_bar::PLUGIN_ID));
+    assert!(host.native().is_loaded(builtin_suite::ASSET_MANAGER_ID));
+}
+
+#[test]
+fn bundled_vide_tag_editor_mounts_reacts_and_unmounts_cleanly() {
+    use rbx_dom_weak::types::Variant;
+    use rbx_dom_weak::InstanceBuilder;
+
+    let suite_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("plugins");
+    assert!(
+        suite_dir.join("TagEditor").join("init.server.luau").is_file(),
+        "expected shipped TagEditor Vide plugin in {}",
+        suite_dir.display()
+    );
+
+    let mut doc = Document::new_place();
+    let ws = doc.workspace().expect("workspace");
+    // Pre-populate a tagged part in Workspace so Tag Editor renders live data.
+    let part = doc.dom.insert(
+        ws,
+        InstanceBuilder::new("Part")
+            .with_name("TaggedBlock")
+            .with_property("Tags", Variant::Tags(vec!["Interactable".into(), "SpawnZone".into()].into())),
+    );
+    doc.selection = vec![part];
+
+    let mut host = PluginHost::default();
+    let results = host.load_bundled_dir(&suite_dir);
+    assert!(!results.is_empty(), "expected at least TagEditor bundled plugin");
+    for r in &results {
+        assert!(r.is_ok(), "bundled plugin failed to load: {r:?}");
+    }
+    frames(&mut host, &mut doc, 5);
+
+    // Zero runtime errors from loading TagEditor.
+    let loaded = host.loaded();
+    let te = loaded
+        .iter()
+        .find(|p| p.name == "rustudio_TagEditor")
+        .expect("rustudio_TagEditor should be loaded");
+    assert!(te.running, "TagEditor should be running");
+    assert!(te.errors.is_empty(), "TagEditor had startup errors: {:?}", te.errors);
+
+    // Toolbar button exists and is initially inactive; widget starts closed & unmounted (0 children).
+    let model = host.ui_model_for_edit(&doc);
+    let btn = model
+        .groups
+        .iter()
+        .find(|g| g.plugin_name == "rustudio_TagEditor")
+        .and_then(|g| g.buttons.first())
+        .expect("TagEditor toolbar button");
+    assert_eq!(btn.id, "tag_editor");
+    assert!(!btn.active);
+
+    let widget_ref = host
+        .ui_items()
+        .into_iter()
+        .find_map(|u| match u.kind {
+            super::UiKind::DockWidget { ref id, .. } if id == "TagEditor" => Some(u.r),
+            _ => None,
+        })
+        .expect("TagEditor DockWidgetPluginGui");
+    assert_eq!(
+        doc.dom.get_by_ref(widget_ref).map(|i| i.children().len()),
+        Some(0),
+        "lazy TagEditor widget must mount 0 GUI instances while closed"
+    );
+
+    // Click the button -> widget opens and mounts Vide UI with rows for both tags.
+    host.trigger(super::Trigger::Fire(btn.r, "Click"));
+    frames(&mut host, &mut doc, 4);
+    assert_eq!(
+        doc.prop(widget_ref, "Enabled"),
+        Some(Variant::Bool(true)),
+        "clicking TagEditor button should open widget"
+    );
+    let root = doc
+        .dom
+        .get_by_ref(widget_ref)
+        .and_then(|w| w.children().first().copied())
+        .expect("mounted TagEditorRoot Frame");
+    assert_eq!(doc.dom.get_by_ref(root).map(|i| i.name.as_str()), Some("TagEditorRoot"));
+
+    let tag_list = doc.find_named(root, "TagList").expect("TagList ScrollingFrame");
+    let row_interactable = doc.find_named(tag_list, "Row_Interactable")
+        .unwrap_or_else(|| panic!("Row_Interactable missing; logs={:?}", host.take_log()));
+    let row_spawn = doc.find_named(tag_list, "Row_SpawnZone").expect("Row_SpawnZone");
+    let chk = doc.find_named(row_interactable, "Checkbox").expect("Checkbox");
+    assert_eq!(
+        doc.prop(chk, "Text"),
+        Some(Variant::String("✔".into())),
+        "selected tagged part should show checked state"
+    );
+    let badge = doc.find_named(row_spawn, "CountBadge").expect("CountBadge");
+    assert_eq!(doc.prop(badge, "Text"), Some(Variant::String("1".into())));
+
+    // Clicking the checkbox removes the tag from the selected part!
+    host.trigger(super::Trigger::Fire(chk, "Activated"));
+    frames(&mut host, &mut doc, 3);
+    let logs = host.take_log();
+    assert_eq!(
+        doc.prop(chk, "Text"),
+        Some(Variant::String("".into())),
+        "clicking Checkbox should uncheck and remove tag from selection (part tags={:?}, logs={logs:?})",
+        doc.prop(part, "Tags"),
+    );
+    assert_eq!(
+        doc.prop(doc.find_named(row_interactable, "CountBadge").unwrap(), "Text"),
+        Some(Variant::String("0".into()))
+    );
+
+    // Closing the widget tears down the entire Vide tree (0 leftover GUI children).
+    host.trigger(super::Trigger::Fire(btn.r, "Click"));
+    frames(&mut host, &mut doc, 3);
+    assert_eq!(doc.prop(widget_ref, "Enabled"), Some(Variant::Bool(false)));
+    assert_eq!(
+        doc.dom.get_by_ref(widget_ref).map(|i| i.children().len()),
+        Some(0),
+        "closing TagEditor widget must unmount all GUI instances cleanly"
+    );
+}
+
+#[test]
+fn bundled_vide_suite_plugins_load_act_and_unmount_cleanly() {
+    use rbx_dom_weak::types::{CFrame, Matrix3, Variant, Vector3};
+    use rbx_dom_weak::InstanceBuilder;
+
+    let suite_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("plugins");
+    let mut doc = Document::new_place();
+    let ws = doc.workspace().expect("workspace");
+
+    // Two parts at different X positions for AlignmentTool.
+    let p1 = doc.dom.insert(
+        ws,
+        InstanceBuilder::new("Part")
+            .with_name("PartA")
+            .with_property("Size", Variant::Vector3(Vector3::new(4.0, 2.0, 2.0)))
+            .with_property("CFrame", Variant::CFrame(CFrame::new(Vector3::new(0.0, 5.0, 0.0), Matrix3::identity()))),
+    );
+    let p2 = doc.dom.insert(
+        ws,
+        InstanceBuilder::new("Part")
+            .with_name("PartB")
+            .with_property("Size", Variant::Vector3(Vector3::new(4.0, 2.0, 2.0)))
+            .with_property("CFrame", Variant::CFrame(CFrame::new(Vector3::new(10.0, 5.0, 0.0), Matrix3::identity()))),
+    );
+    // One Sound for AudioDiscovery.
+    let _snd = doc.dom.insert(
+        ws,
+        InstanceBuilder::new("Sound")
+            .with_name("WindLoop")
+            .with_property("SoundId", Variant::String("rbxassetid://1848354536".into())),
+    );
+    doc.selection = vec![p1, p2];
+
+    let mut host = PluginHost::default();
+    let res = host.load_bundled_dir(&suite_dir);
+    assert!(res.len() >= 5, "expected at least 5 Vide suite plugins, got {}", res.len());
+    for r in &res {
+        assert!(r.is_ok(), "bundled plugin failed to load: {r:?}");
+    }
+    frames(&mut host, &mut doc, 6);
+
+    for name in [
+        "rustudio_AlignmentTool",
+        "rustudio_AudioDiscovery",
+        "rustudio_CollisionGroups",
+        "rustudio_TagEditor",
+        "rustudio_WindControl",
+    ] {
+        let info = host
+            .loaded()
+            .into_iter()
+            .find(|p| p.name == name)
+            .unwrap_or_else(|| panic!("expected {name} to be loaded"));
+        assert!(info.running, "{name} should be running");
+        assert!(info.errors.is_empty(), "{name} had startup errors: {:?}", info.errors);
+    }
+
+    let model = host.ui_model_for_edit(&doc);
+    let btn_of = |plugin_name: &str| {
+        model
+            .groups
+            .iter()
+            .find(|g| g.plugin_name == plugin_name)
+            .and_then(|g| g.buttons.first())
+            .unwrap_or_else(|| panic!("missing button for {plugin_name}"))
+            .r
+    };
+    let ui_items = host.ui_items();
+    let widget_of = |wid: &str| {
+        ui_items
+            .iter()
+            .find_map(|u| match u.kind {
+                super::UiKind::DockWidget { ref id, .. } if id == wid => Some(u.r),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("missing widget {wid}"))
+    };
+
+    // 1) AlignmentTool: open, click Align (default Center + X) -> both parts move to X = 5.0!
+    let align_btn = btn_of("rustudio_AlignmentTool");
+    let align_w = widget_of("AlignmentTool");
+    assert_eq!(doc.dom.get_by_ref(align_w).map(|i| i.children().len()), Some(0));
+    host.trigger(super::Trigger::Fire(align_btn, "Click"));
+    frames(&mut host, &mut doc, 4);
+    let align_go = doc.find_named(align_w, "AlignButton").expect("AlignButton");
+    host.trigger(super::Trigger::Fire(align_go, "Activated"));
+    frames(&mut host, &mut doc, 3);
+    let x1 = match doc.prop(p1, "CFrame") {
+        Some(Variant::CFrame(cf)) => cf.position.x,
+        other => panic!("unexpected p1 CFrame: {other:?}"),
+    };
+    let x2 = match doc.prop(p2, "CFrame") {
+        Some(Variant::CFrame(cf)) => cf.position.x,
+        other => panic!("unexpected p2 CFrame: {other:?}"),
+    };
+    assert!((x1 - 5.0).abs() < 0.01 && (x2 - 5.0).abs() < 0.01, "expected aligned X=5.0, got {x1}, {x2}");
+    host.trigger(super::Trigger::Fire(align_btn, "Click"));
+    frames(&mut host, &mut doc, 2);
+    assert_eq!(doc.dom.get_by_ref(align_w).map(|i| i.children().len()), Some(0));
+
+    // 2) WindControl: open (mounts CoreGui ScreenGui overlay!), verify GlobalWind HUD & unmount cleanly.
+    let wind_btn = btn_of("rustudio_WindControl");
+    let core_gui = doc.find_child(doc.dom.root_ref(), "CoreGui").expect("CoreGui");
+    assert!(doc.find_named(core_gui, "RusTudioWindControlGui").is_none());
+    host.trigger(super::Trigger::Fire(wind_btn, "Click"));
+    frames(&mut host, &mut doc, 4);
+    let wind_gui = doc.find_named(core_gui, "RusTudioWindControlGui").expect("CoreGui WindControl HUD");
+    let val_disp = doc.find_named(wind_gui, "ValueDisplay").expect("ValueDisplay");
+    assert_eq!(doc.prop(val_disp, "Text"), Some(Variant::String("0.0 sps".into())));
+    host.trigger(super::Trigger::Fire(wind_btn, "Click"));
+    frames(&mut host, &mut doc, 2);
+    assert!(doc.find_named(core_gui, "RusTudioWindControlGui").is_none());
+
+    // 3) CollisionGroups: open, click Default row -> verify Default checkbox renders & toggles cleanly!
+    let cg_btn = btn_of("rustudio_CollisionGroups");
+    let cg_w = widget_of("CollisionGroups");
+    host.trigger(super::Trigger::Fire(cg_btn, "Click"));
+    frames(&mut host, &mut doc, 4);
+    let sel_def = doc.find_named(cg_w, "SelectGroup_Default").expect("SelectGroup_Default");
+    host.trigger(super::Trigger::Fire(sel_def, "Activated"));
+    frames(&mut host, &mut doc, 3);
+    let def_toggle = doc.find_named(cg_w, "Toggle_Default").expect("Toggle_Default");
+    assert_eq!(doc.prop(def_toggle, "Text"), Some(Variant::String("✔".into())));
+    host.trigger(super::Trigger::Fire(def_toggle, "Activated"));
+    frames(&mut host, &mut doc, 3);
+    assert_eq!(doc.prop(def_toggle, "Text"), Some(Variant::String("".into())));
+    host.trigger(super::Trigger::Fire(cg_btn, "Click"));
+    frames(&mut host, &mut doc, 2);
+    assert_eq!(doc.dom.get_by_ref(cg_w).map(|i| i.children().len()), Some(0));
+
+    // 4) AudioDiscovery: open, verify WindLoop row renders with its SoundId!
+    let ad_btn = btn_of("rustudio_AudioDiscovery");
+    let ad_w = widget_of("AudioDiscovery");
+    host.trigger(super::Trigger::Fire(ad_btn, "Click"));
+    frames(&mut host, &mut doc, 4);
+    let row = doc.find_named(ad_w, "Audio_WindLoop").expect("Audio_WindLoop");
+    let id_lbl = doc.find_named(row, "AssetIdLabel").expect("AssetIdLabel");
+    assert_eq!(
+        doc.prop(id_lbl, "Text"),
+        Some(Variant::String("rbxassetid://1848354536".into()))
+    );
+    host.trigger(super::Trigger::Fire(ad_btn, "Click"));
+    frames(&mut host, &mut doc, 2);
+    assert_eq!(doc.dom.get_by_ref(ad_w).map(|i| i.children().len()), Some(0));
+
+    // Verify the remaining 12 Vide plugins also loaded with zero errors,
+    // exercise their core actions, and unmount cleanly!
+    for name in [
+        "rustudio_MaterialManager",
+        "rustudio_PivotEditor",
+        "rustudio_StyleEditor",
+        "rustudio_LocalizationTools",
+        "rustudio_FindInPlace",
+        "rustudio_ObjectBrowser",
+        "rustudio_9SliceEditor",
+        "rustudio_PathEditor",
+        "rustudio_TextureViewer",
+        "rustudio_PlayerEmulator",
+        "rustudio_EventEmulator",
+        "rustudio_ForceVisualizationControl",
+    ] {
+        let info = host
+            .loaded()
+            .into_iter()
+            .find(|p| p.name == name)
+            .unwrap_or_else(|| panic!("expected {name} to be loaded"));
+        assert!(info.running, "{name} should be running");
+        assert!(info.errors.is_empty(), "{name} had startup errors: {:?}", info.errors);
+    }
+
+    // 5) MaterialManager: open, click CreateVariantBtn -> inserts MaterialVariant under MaterialService.
+    let mm_btn = btn_of("rustudio_MaterialManager");
+    let mm_w = widget_of("MaterialManager");
+    host.trigger(super::Trigger::Fire(mm_btn, "Click"));
+    frames(&mut host, &mut doc, 4);
+    let create_var = doc.find_named(mm_w, "CreateVariantBtn").expect("CreateVariantBtn");
+    host.trigger(super::Trigger::Fire(create_var, "Activated"));
+    frames(&mut host, &mut doc, 3);
+    let ms = doc.find_child(doc.dom.root_ref(), "MaterialService").expect("MaterialService");
+    assert!(
+        doc.dom.get_by_ref(ms).unwrap().children().iter().any(|c| doc.class_of(*c).as_deref() == Some("MaterialVariant")),
+        "MaterialManager should create a MaterialVariant under MaterialService"
+    );
+    host.trigger(super::Trigger::Fire(mm_btn, "Click"));
+    frames(&mut host, &mut doc, 2);
+    assert_eq!(doc.dom.get_by_ref(mm_w).map(|i| i.children().len()), Some(0));
+
+    // 6) PivotEditor: open, click SnapBottom -> sets PartA PivotOffset.Y = -1.0, then ResetPivotBtn resets to 0.
+    doc.selection = vec![p1, p2];
+    frames(&mut host, &mut doc, 2);
+    let piv_btn = btn_of("rustudio_PivotEditor");
+    let piv_w = widget_of("PivotEditor");
+    host.trigger(super::Trigger::Fire(piv_btn, "Click"));
+    frames(&mut host, &mut doc, 4);
+    let snap_bot = doc.find_named(piv_w, "SnapBottom").expect("SnapBottom");
+    host.trigger(super::Trigger::Fire(snap_bot, "Activated"));
+    frames(&mut host, &mut doc, 3);
+    let py = match doc.prop(p1, "PivotOffset") {
+        Some(Variant::CFrame(cf)) => cf.position.y,
+        other => panic!("unexpected PivotOffset after SnapBottom: {other:?}"),
+    };
+    assert!((py - (-1.0)).abs() < 0.01, "expected SnapBottom PivotOffset.Y=-1.0, got {py}");
+    let reset_piv = doc.find_named(piv_w, "ResetPivotBtn").expect("ResetPivotBtn");
+    host.trigger(super::Trigger::Fire(reset_piv, "Activated"));
+    frames(&mut host, &mut doc, 3);
+    let py2 = match doc.prop(p1, "PivotOffset") {
+        Some(Variant::CFrame(cf)) => cf.position.y,
+        other => panic!("unexpected PivotOffset after Reset: {other:?}"),
+    };
+    assert!(py2.abs() < 0.01, "expected Reset PivotOffset.Y=0.0, got {py2}");
+    host.trigger(super::Trigger::Fire(piv_btn, "Click"));
+    frames(&mut host, &mut doc, 2);
+    assert_eq!(doc.dom.get_by_ref(piv_w).map(|i| i.children().len()), Some(0));
+
+    // 7) StyleEditor: open, click NewSheetBtn + AddRuleBtn -> creates StyleSheet + StyleRule.
+    let se_btn = btn_of("rustudio_StyleEditor");
+    let se_w = widget_of("StyleEditor");
+    host.trigger(super::Trigger::Fire(se_btn, "Click"));
+    frames(&mut host, &mut doc, 4);
+    let new_sheet = doc.find_named(se_w, "NewSheetBtn").expect("NewSheetBtn");
+    host.trigger(super::Trigger::Fire(new_sheet, "Activated"));
+    frames(&mut host, &mut doc, 3);
+    let add_rule = doc.find_named(se_w, "AddRuleBtn").expect("AddRuleBtn");
+    host.trigger(super::Trigger::Fire(add_rule, "Activated"));
+    frames(&mut host, &mut doc, 3);
+    let rs = doc.find_child(doc.dom.root_ref(), "ReplicatedStorage").expect("ReplicatedStorage");
+    assert!(
+        doc.dom.descendants_of(rs).any(|i| i.class == "StyleRule"),
+        "StyleEditor should create StyleSheet + StyleRule under ReplicatedStorage"
+    );
+    host.trigger(super::Trigger::Fire(se_btn, "Click"));
+    frames(&mut host, &mut doc, 2);
+    assert_eq!(doc.dom.get_by_ref(se_w).map(|i| i.children().len()), Some(0));
+
+    // 8) LocalizationTools: open, click NewTableBtn -> creates LocalizationTable under LocalizationService.
+    let loc_btn = btn_of("rustudio_LocalizationTools");
+    let loc_w = widget_of("LocalizationTools");
+    host.trigger(super::Trigger::Fire(loc_btn, "Click"));
+    frames(&mut host, &mut doc, 4);
+    let new_tbl = doc.find_named(loc_w, "NewTableBtn").expect("NewTableBtn");
+    host.trigger(super::Trigger::Fire(new_tbl, "Activated"));
+    frames(&mut host, &mut doc, 3);
+    let ls = doc.find_child(doc.dom.root_ref(), "LocalizationService").expect("LocalizationService");
+    assert!(
+        doc.dom.descendants_of(ls).any(|i| i.class == "LocalizationTable"),
+        "LocalizationTools should create LocalizationTable under LocalizationService"
+    );
+    host.trigger(super::Trigger::Fire(loc_btn, "Click"));
+    frames(&mut host, &mut doc, 2);
+    assert_eq!(doc.dom.get_by_ref(loc_w).map(|i| i.children().len()), Some(0));
+
+    // 9) FindInPlace: open, verify root mounts and unmounts cleanly.
+    let fip_btn = btn_of("rustudio_FindInPlace");
+    let fip_w = widget_of("FindInPlace");
+    host.trigger(super::Trigger::Fire(fip_btn, "Click"));
+    frames(&mut host, &mut doc, 4);
+    assert!(doc.find_named(fip_w, "FindInput").is_some());
+    host.trigger(super::Trigger::Fire(fip_btn, "Click"));
+    frames(&mut host, &mut doc, 2);
+    assert_eq!(doc.dom.get_by_ref(fip_w).map(|i| i.children().len()), Some(0));
+
+    // 10) ObjectBrowser: open, verify live Enum list populates and unmounts cleanly.
+    let ob_btn = btn_of("rustudio_ObjectBrowser");
+    let ob_w = widget_of("ObjectBrowser");
+    host.trigger(super::Trigger::Fire(ob_btn, "Click"));
+    frames(&mut host, &mut doc, 4);
+    let enum_list = doc.find_named(ob_w, "EnumList").expect("EnumList");
+    assert!(
+        doc.dom.get_by_ref(enum_list).map(|i| i.children().len()).unwrap_or(0) > 10,
+        "ObjectBrowser should list live Studio Enums"
+    );
+    host.trigger(super::Trigger::Fire(ob_btn, "Click"));
+    frames(&mut host, &mut doc, 2);
+    assert_eq!(doc.dom.get_by_ref(ob_w).map(|i| i.children().len()), Some(0));
+
+    // 11) 9SliceEditor: select an ImageLabel, open, apply "16 px" preset -> updates SliceCenter, then Revert restores it.
+    let starter_gui = doc.find_child(doc.dom.root_ref(), "StarterGui").expect("StarterGui");
+    let sg = doc.dom.insert(starter_gui, InstanceBuilder::new("ScreenGui").with_name("SliceGui"));
+    let img = doc.dom.insert(sg, InstanceBuilder::new("ImageLabel").with_name("SliceImg"));
+    doc.selection = vec![img];
+    frames(&mut host, &mut doc, 2);
+    let ns_btn = btn_of("rustudio_9SliceEditor");
+    let ns_w = widget_of("9SliceEditor");
+    host.trigger(super::Trigger::Fire(ns_btn, "Click"));
+    frames(&mut host, &mut doc, 4);
+    let preset16 = doc.find_named(ns_w, "Preset_16 px").expect("Preset_16 px");
+    host.trigger(super::Trigger::Fire(preset16, "Activated"));
+    frames(&mut host, &mut doc, 3);
+    match doc.prop(img, "SliceCenter") {
+        Some(Variant::Rect(rc)) => {
+            assert!((rc.min.x - 16.0).abs() < 0.5 && (rc.min.y - 16.0).abs() < 0.5, "unexpected SliceCenter: {rc:?}");
+        }
+        other => panic!("unexpected SliceCenter after Preset_16 px: {other:?}"),
+    }
+    let revert_btn = doc.find_named(ns_w, "RevertButton").expect("RevertButton");
+    host.trigger(super::Trigger::Fire(revert_btn, "Activated"));
+    frames(&mut host, &mut doc, 3);
+    host.trigger(super::Trigger::Fire(ns_btn, "Click"));
+    frames(&mut host, &mut doc, 2);
+    assert_eq!(doc.dom.get_by_ref(ns_w).map(|i| i.children().len()), Some(0));
+
+    // 12) PathEditor: open, click CreatePathBtn -> inserts starter Path2D with 3 control points, then apply S-Curve.
+    doc.selection = vec![sg];
+    frames(&mut host, &mut doc, 2);
+    let pe_btn = btn_of("rustudio_PathEditor");
+    let pe_w = widget_of("PathEditor");
+    host.trigger(super::Trigger::Fire(pe_btn, "Click"));
+    frames(&mut host, &mut doc, 4);
+    let create_path = doc.find_named(pe_w, "CreatePathBtn").expect("CreatePathBtn");
+    host.trigger(super::Trigger::Fire(create_path, "Activated"));
+    frames(&mut host, &mut doc, 4);
+    assert!(
+        doc.dom.descendants_of(sg).any(|i| i.class == "Path2D"),
+        "PathEditor should create a Path2D under ScreenGui"
+    );
+    let preset_s = doc.find_named(pe_w, "PresetSCurve").expect("PresetSCurve");
+    host.trigger(super::Trigger::Fire(preset_s, "Activated"));
+    frames(&mut host, &mut doc, 3);
+    host.trigger(super::Trigger::Fire(pe_btn, "Click"));
+    frames(&mut host, &mut doc, 2);
+    assert_eq!(doc.dom.get_by_ref(pe_w).map(|i| i.children().len()), Some(0));
+
+    // 13) TextureViewer: add a Decal with a Texture URI, open, verify table lists it and unmounts cleanly.
+    let _dec = doc.dom.insert(
+        p1,
+        InstanceBuilder::new("Decal")
+            .with_name("TestDecal")
+            .with_property("Texture", Variant::Content("rbxassetid://123456".into())),
+    );
+    frames(&mut host, &mut doc, 1);
+    let tv_btn = btn_of("rustudio_TextureViewer");
+    let tv_w = widget_of("TextureViewer");
+    host.trigger(super::Trigger::Fire(tv_btn, "Click"));
+    frames(&mut host, &mut doc, 4);
+    assert!(doc.find_named(tv_w, "TexRow_1").is_some(), "TextureViewer should find Decal.Texture");
+    host.trigger(super::Trigger::Fire(tv_btn, "Click"));
+    frames(&mut host, &mut doc, 2);
+    assert_eq!(doc.dom.get_by_ref(tv_w).map(|i| i.children().len()), Some(0));
+
+    // 14) PlayerEmulator: open, toggle MainSwitchToggle, open Country dropdown & pick JP, unmount cleanly.
+    let pem_btn = btn_of("rustudio_PlayerEmulator");
+    let pem_w = widget_of("PlayerEmulator");
+    host.trigger(super::Trigger::Fire(pem_btn, "Click"));
+    frames(&mut host, &mut doc, 4);
+    let main_sw = doc.find_named(pem_w, "MainSwitchToggle").expect("MainSwitchToggle");
+    host.trigger(super::Trigger::Fire(main_sw, "Activated"));
+    frames(&mut host, &mut doc, 2);
+    let c_dd = doc.find_named(pem_w, "CountryDropdownBtn").expect("CountryDropdownBtn");
+    host.trigger(super::Trigger::Fire(c_dd, "Activated"));
+    frames(&mut host, &mut doc, 2);
+    let jp_btn = doc.find_named(pem_w, "Country_JP").expect("Country_JP");
+    host.trigger(super::Trigger::Fire(jp_btn, "Activated"));
+    frames(&mut host, &mut doc, 3);
+    host.trigger(super::Trigger::Fire(pem_btn, "Click"));
+    frames(&mut host, &mut doc, 2);
+    assert_eq!(doc.dom.get_by_ref(pem_w).map(|i| i.children().len()), Some(0));
+
+    // 15) EventEmulator: open, click SaveBtn & SendBtn -> adds RepopulatableHistory item, unmount cleanly.
+    let ev_btn = btn_of("rustudio_EventEmulator");
+    let ev_w = widget_of("EventEmulator");
+    host.trigger(super::Trigger::Fire(ev_btn, "Click"));
+    frames(&mut host, &mut doc, 4);
+    let save_btn = doc.find_named(ev_w, "SaveBtn").expect("SaveBtn");
+    host.trigger(super::Trigger::Fire(save_btn, "Activated"));
+    frames(&mut host, &mut doc, 2);
+    let send_btn = doc.find_named(ev_w, "SendBtn").expect("SendBtn");
+    host.trigger(super::Trigger::Fire(send_btn, "Activated"));
+    frames(&mut host, &mut doc, 2);
+    assert!(doc.find_named(ev_w, "HistoryItem_2").is_some(), "EventEmulator SaveBtn should append to RepopulatableHistory");
+    host.trigger(super::Trigger::Fire(ev_btn, "Click"));
+    frames(&mut host, &mut doc, 2);
+    assert_eq!(doc.dom.get_by_ref(ev_w).map(|i| i.children().len()), Some(0));
+
+    // 16) ForceVisualizationControl: CoreGui viewport HUD mounts, toggles DrawTotalNetForce, and unmounts cleanly.
+    let fv_btn = btn_of("rustudio_ForceVisualizationControl");
+    let cg = doc.find_child(doc.dom.root_ref(), "CoreGui").expect("CoreGui");
+    host.trigger(super::Trigger::Fire(fv_btn, "Click"));
+    frames(&mut host, &mut doc, 4);
+    let fv_hud = doc.find_named(cg, "RusTudioForceVisualization").expect("ForceVisualization CoreGui HUD");
+    let net_btn = doc.find_named(fv_hud, "Toggle_DrawTotalNetForce").expect("Toggle_DrawTotalNetForce");
+    host.trigger(super::Trigger::Fire(net_btn, "Activated"));
+    frames(&mut host, &mut doc, 2);
+    host.trigger(super::Trigger::Fire(fv_btn, "Click"));
+    frames(&mut host, &mut doc, 2);
+    assert!(doc.find_named(cg, "RusTudioForceVisualization").is_none(), "ForceVisualization HUD should unmount cleanly");
+
+    // Verify every bundled Vide plugin's placement matches STUDIO-PANELS.md.
+    use crate::panels::{placement, Spot};
+    for (plugin_name, want_spot) in [
+        ("rustudio_AlignmentTool", Spot::Left),
+        ("rustudio_FindInPlace", Spot::Left),
+        ("rustudio_LocalizationTools", Spot::Left),
+        ("rustudio_PlayerEmulator", Spot::Left),
+        ("rustudio_TagEditor", Spot::Right),
+        ("rustudio_CollisionGroups", Spot::Right),
+        ("rustudio_StyleEditor", Spot::Right),
+        ("rustudio_PathEditor", Spot::Right),
+        ("rustudio_EventEmulator", Spot::Right),
+        ("rustudio_MaterialManager", Spot::Bottom),
+        ("rustudio_AudioDiscovery", Spot::Bottom),
+        ("rustudio_TextureViewer", Spot::Bottom),
+        ("rustudio_ObjectBrowser", Spot::Center),
+    ] {
+        let pk = super::widgets_ui::studio_plugin_placement_key(plugin_name)
+            .unwrap_or_else(|| panic!("missing placement_key for {plugin_name}"));
+        let p = placement(pk);
+        assert_eq!(p.spot, want_spot, "{plugin_name} ({pk}) should dock at {want_spot:?}");
+        assert!(!p.floats, "{plugin_name} ({pk}) should open docked, not floating");
+    }
+    // WindControl uses a CoreGui viewport HUD; PivotEditor, 9SliceEditor, and ForceVisualizationControl float.
+    assert_eq!(super::widgets_ui::studio_plugin_placement_key("rustudio_WindControl"), None);
+    assert_eq!(super::widgets_ui::studio_plugin_placement_key("rustudio_PivotEditor"), None);
+    assert_eq!(super::widgets_ui::studio_plugin_placement_key("rustudio_9SliceEditor"), None);
+    assert_eq!(super::widgets_ui::studio_plugin_placement_key("rustudio_ForceVisualizationControl"), None);
+    let piv_state = ui_items
+        .iter()
+        .find_map(|u| match &u.kind {
+            super::UiKind::DockWidget { id, info } if id == "PivotEditor" => Some(info.initial_dock_state.as_str()),
+            _ => None,
+        })
+        .expect("missing DockInfo for PivotEditor");
+    assert_eq!(piv_state, "Float", "PivotEditor should open floating");
+
+    // Regression: opening a new place calls replace_builtins(choices) with
+    // Roblox plugins_enabled=false; all bundled Vide suite plugins must reload
+    // so Align / TagEditor / WindControl / etc. never turn greyed out!
+    let mut doc2 = Document::new_place();
+    host.replace_builtins(rustudio_core::rustudio_settings::BuiltinToolChoices {
+        plugins_enabled: false,
+        ..Default::default()
+    });
+    frames(&mut host, &mut doc2, 4);
+    for name in [
+        "rustudio_AlignmentTool",
+        "rustudio_WindControl",
+        "rustudio_TagEditor",
+        "rustudio_CollisionGroups",
+        "rustudio_MaterialManager",
+        "rustudio_ObjectBrowser",
+        "rustudio_LocalizationTools",
+        "rustudio_FindInPlace",
+        "rustudio_StyleEditor",
+        "rustudio_AudioDiscovery",
+        "rustudio_PivotEditor",
+        "rustudio_9SliceEditor",
+        "rustudio_PathEditor",
+        "rustudio_TextureViewer",
+        "rustudio_PlayerEmulator",
+        "rustudio_EventEmulator",
+        "rustudio_ForceVisualizationControl",
+    ] {
+        let info = host
+            .loaded()
+            .into_iter()
+            .find(|p| p.name == name)
+            .unwrap_or_else(|| panic!("{name} missing after replace_builtins on new place"));
+        assert!(info.running, "{name} should be running after replace_builtins");
+        assert!(info.errors.is_empty(), "{name} had errors after replace_builtins: {:?}", info.errors);
+    }
+}

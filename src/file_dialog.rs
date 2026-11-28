@@ -48,12 +48,13 @@ pub enum Purpose {
     TemplateThumb(String),
     /// … another place file for one of the person's templates.
     TemplateReplace(String),
-    /// Animation Editor > Import > From FBX Animation…
-    AnimImportFbx,
-    /// Animation Editor > Import > From File (.rbxm/.rbxmx)…
-    AnimImportRbxm,
-    /// Animation Editor > Export > Export to File (.rbxm)…
-    AnimExportRbxm,
+    /// A modular native plugin's file picker / save dialog (routed back to
+    /// `NativePlugin::on_file_dialog(tag, path, ctx)`).
+    NativePlugin { plugin_id: String, tag: String },
+    /// Experience Settings > Basic Info > Upload Game Icon.
+    GameSettingsIcon,
+    /// Experience Settings > Basic Info > Add Screenshot.
+    GameSettingsThumbnail,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

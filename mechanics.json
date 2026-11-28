@@ -2418,6 +2418,154 @@
    "group": "terrain",
    "value": "surfaces over the camera only (normal y >= 0.5, seen from below)",
    "source": "offline Studio: terrain Place A (surface drawn) and Place B F4 (no water walls)"
+  },
+  {
+   "name": "device simulator fit padding",
+   "group": "device simulator",
+   "value": 17,
+   "unit": "px",
+   "source": "Roblox Studio's Device Simulator, measured: iPhone 14's frame 17 px from a 718 px panel's edges upright, its buttons 17-19 px in landscape"
+  },
+  {
+   "name": "device simulator screen size rounding",
+   "group": "device simulator",
+   "value": "floor(floor(points × scale) / scale)",
+   "source": "Roblox Studio's Device Simulator, measured: iPhone 14 844x390 reports 843x389 fitted in a 1914x718 panel"
+  },
+  {
+   "name": "device simulator bar height",
+   "group": "device simulator",
+   "value": 27,
+   "unit": "px",
+   "source": "Roblox Studio 0.748, 1:1 capture of the simulator bar"
+  },
+  {
+   "name": "device simulator pill height",
+   "group": "device simulator",
+   "value": 22,
+   "unit": "px",
+   "source": "Roblox Studio 0.748, 1:1 capture"
+  },
+  {
+   "name": "device simulator bar icon size",
+   "group": "device simulator",
+   "value": 13,
+   "unit": "px",
+   "source": "Roblox Studio 0.748, measured: 12-14 px glyphs"
+  },
+  {
+   "name": "device simulator bar button step",
+   "group": "device simulator",
+   "value": 20,
+   "unit": "px",
+   "source": "Roblox Studio 0.748, measured: 19-20 px from one bar button to the next"
+  },
+  {
+   "name": "device simulator bar text size",
+   "group": "device simulator",
+   "value": 12.5,
+   "unit": "px",
+   "source": "Roblox Studio 0.748, the pills' cap height",
+   "estimated": true
+  },
+  {
+   "name": "device simulator scroll bar",
+   "group": "device simulator",
+   "value": 8,
+   "unit": "px",
+   "source": "Roblox Studio 0.748, measured: 12 screen px at 1.5x"
+  },
+  {
+   "name": "device simulator dropdown width",
+   "group": "device simulator",
+   "value": 168,
+   "unit": "px",
+   "source": "Roblox Studio 0.748, measured: 250 screen px at 1.5x"
+  },
+  {
+   "name": "device simulator dropdown row",
+   "group": "device simulator",
+   "value": 17.5,
+   "unit": "px",
+   "source": "Roblox Studio 0.748, measured: 26 screen px at 1.5x"
+  },
+  {
+   "name": "device simulator calibrate card",
+   "group": "device simulator",
+   "value": [3.37, 2.125],
+   "unit": "in",
+   "source": "Studio's Calibrate text: an ID card, 8.56 cm or 3.37 in wide"
+  },
+  {
+   "name": "device simulator calibrate range",
+   "group": "device simulator",
+   "value": [
+    80,
+    250,
+    96
+   ],
+   "unit": "DPI",
+   "source": "Roblox Studio's Calibrate physical scaling: 80 at the slider's left end, 96 default; the top end from the slider position (+-5)"
+  },
+  {
+   "name": "device simulator custom device limits",
+   "group": "device simulator",
+   "value": {
+    "name": 200,
+    "width": [
+     1,
+     7680
+    ],
+    "height": [
+     1,
+     4320
+    ],
+    "ppi": [
+     72,
+     10000
+    ],
+    "keyboard": [
+     0,
+     4320
+    ],
+    "memory_min_gb": 0.5
+   },
+   "source": "Roblox Studio's StudioDeviceSimulatorService:CreateDeviceAsync errors and its Manage devices dialog"
+  },
+  {
+   "name": "touch long press",
+   "group": "device simulator",
+   "value": 0.5,
+   "unit": "s",
+   "source": "Roblox Studio's Device Simulator, measured: TouchLongPress Begin after 0.5 s"
+  },
+  {
+   "name": "touch rotate start",
+   "group": "device simulator",
+   "value": 0.1,
+   "unit": "rad",
+   "source": "Roblox Studio's Device Simulator, measured: TouchRotate begins past about 0.1"
+  },
+  {
+   "name": "touch tap slop",
+   "group": "device simulator",
+   "value": 8,
+   "unit": "points",
+   "estimated": true
+  },
+  {
+   "name": "touch swipe speed",
+   "group": "device simulator",
+   "value": 400,
+   "unit": "points/s",
+   "estimated": true
+  },
+  {
+   "name": "touch marker size",
+   "group": "device simulator",
+   "value": 46,
+   "unit": "points",
+   "source": "Roblox Studio's Device Simulator, measured: about 46 points across"
   }
  ]
 }

@@ -61,6 +61,7 @@ pub const METHODS: &[(&str, &str)] = &[
     ("ArePartsTouchingOthers", "WorldRoot"),
     ("IsRegion3Empty", "WorldRoot"),
     ("IsRegion3EmptyWithIgnoreList", "WorldRoot"),
+    ("StepPhysics", "WorldRoot"),
     ("GetStreamingEnabled", "Workspace"),
     ("GetNumAwakeParts", "Workspace"),
     ("GetPhysicsThrottling", "Workspace"),

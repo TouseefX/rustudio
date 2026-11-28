@@ -68,6 +68,7 @@ pub fn joint_enabled(doc: &Document, j: Ref) -> bool {
     }
     match i.properties.get(&crate::ukey!("State")) {
         Some(Variant::Int32(s)) if i.class == "WeldConstraint" => s & 1 != 0,
+        _ if i.class == "WeldConstraint" => true,
         _ => !matches!(doc.prop(j, "Enabled"), Some(Variant::Bool(false))),
     }
 }

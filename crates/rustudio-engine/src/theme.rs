@@ -24,6 +24,19 @@ pub const SELECT_BG: Color32 = Color32::from_rgb(38, 62, 120);
 pub const HOVER_BG: Color32 = Color32::from_rgb(44, 45, 51);
 /// 3D hover outline (Studio's "Hover Over Color").
 pub const HOVER_3D: Color32 = Color32::from_rgb(179, 230, 255);
+/// The Device Simulator (sampled from Studio 0.748's captures): its bar,
+/// the bar's pills (light while their menu is open), the device frame's
+/// black and dark grey bodies, its side buttons and side frame, and the
+/// speaker, camera and home button in older bezels.
+pub const DEVICE_BAR_BG: Color32 = Color32::from_rgb(19, 18, 21);
+pub const DEVICE_PILL_BG: Color32 = Color32::from_rgb(40, 42, 47);
+pub const DEVICE_PILL_OPEN_BG: Color32 = Color32::from_rgb(237, 238, 241);
+pub const DEVICE_FRAME_BODY: Color32 = Color32::from_rgb(0, 0, 0);
+pub const DEVICE_FRAME_BODY_GREY: Color32 = Color32::from_rgb(11, 11, 11);
+pub const DEVICE_SIDE_BUTTON: Color32 = Color32::from_rgb(42, 42, 42);
+pub const DEVICE_BEZEL_FEATURE: Color32 = Color32::from_rgb(30, 30, 30);
+/// The size chip in the device dropdown.
+pub const DEVICE_CHIP_BG: Color32 = Color32::from_rgb(44, 46, 52);
 pub const WARN: Color32 = Color32::from_rgb(240, 200, 90);
 pub const ERROR: Color32 = Color32::from_rgb(240, 96, 86);
 

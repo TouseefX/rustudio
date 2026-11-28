@@ -68,6 +68,7 @@ jobs:
           lipo -archs target/macos/rustudio.app/Contents/MacOS/rustudio | grep -q 'x86_64 arm64'
           codesign --verify --strict target/macos/rustudio.app
           test -f target/macos/rustudio.app/Contents/Resources/api-dump.json
+          test -d target/macos/rustudio.app/Contents/Resources/plugins
       - uses: actions/upload-artifact@v4
         with:
           name: rustudio-macos-universal
@@ -109,6 +110,7 @@ jobs:
           New-Item -ItemType Directory -Force $d | Out-Null
           Copy-Item target/release/rustudio.exe, api-dump.json, LICENSE-MIT, LICENSE-APACHE, README.md $d
           Copy-Item tools/windows/install.ps1, tools/windows/install.cmd, tools/windows/uninstall.cmd $d
+          if (Test-Path plugins) { Copy-Item -Recurse plugins "$d\plugins" }
           Compress-Archive -Path $d -DestinationPath dist/rustudio-windows-x64.zip
       - name: Verify Windows installation
         shell: pwsh

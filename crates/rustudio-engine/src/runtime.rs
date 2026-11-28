@@ -269,6 +269,17 @@ pub struct World {
     pub abs_seen: HashMap<Ref, ext::AbsBox>,
     pub scroll_seen: HashMap<Ref, ([f32; 2], [f32; 2])>,
     pub viewport_seen: Option<[f32; 2]>,
+    /// The simulated device and its pad as scripts last saw them
+    /// (`ext::fire_device_changes`), and a CurrentScreenOrientation change
+    /// due next frame.
+    pub device_seen: Option<ext::DeviceInput>,
+    pub pad_seen: Option<u8>,
+    pub orientation_due: bool,
+    /// MouseEnabled / KeyboardEnabled as last announced (Changed).
+    pub kbm_seen: Option<[bool; 2]>,
+    /// Since the last touch turned the keyboard flip off on this device,
+    /// MouseEnabled / KeyboardEnabled change silently.
+    pub kbm_quiet: bool,
     /// GUI instances with live connections or waiters.
     pub gui_listening: rustc_hash::FxHashSet<Ref>,
     pub layout_listening: rustc_hash::FxHashSet<Ref>,
@@ -301,6 +312,8 @@ pub struct World {
     /// (`Runtime::start_core_scripts`): the modules' bytecode by instance
     /// and the CoreScripts by name.
     pub core_scripts: rustudio_core::core_scripts::Installed,
+    /// Per-WorldRoot physics worlds created lazily by `WorldRoot:StepPhysics`.
+    pub(crate) step_physics: HashMap<Ref, Box<rustudio_physics::physics::Physics>>,
 }
 
 impl World {
@@ -806,6 +819,11 @@ impl World {
             abs_seen: HashMap::new(),
             scroll_seen: HashMap::new(),
             viewport_seen: None,
+            device_seen: None,
+            pad_seen: None,
+            orientation_due: false,
+            kbm_seen: None,
+            kbm_quiet: false,
             gui_listening: Default::default(),
             layout_listening: Default::default(),
             listen_new: Default::default(),
@@ -821,6 +839,7 @@ impl World {
             prop_ref_edges: HashMap::new(),
             prop_ref_counts: HashMap::new(),
             core_scripts: Default::default(),
+            step_physics: HashMap::new(),
             requests: Default::default(),
             input: Default::default(),
             started: HashSet::new(),
@@ -6917,6 +6936,21 @@ impl Runtime {
                 Ok((joints, frames, length))
             })?,
         )?;
+        // The simulated device's whole screen and safe-area corner (the
+        // camera projects over the whole screen), and its ten-foot flag:
+        // zeros with no device (library.luau cam_basis, IsTenFootInterface).
+        g.set(
+            "__rs_view_frame",
+            lua.create_function(|lua, ()| {
+                let w = world(lua)?;
+                let dev = w.input.device;
+                if !dev.simulated {
+                    return Ok((0.0f32, 0.0f32, 0.0f32, 0.0f32, false, false, false));
+                }
+                let [sw, sh] = dev.screen_or(w.input.view_size);
+                Ok((sw, sh, dev.safe[0], dev.safe[1], true, dev.portrait, dev.flags.ten_foot))
+            })?,
+        )?;
         // A public asset's download state: true (on disk), false (downloading
         // in the background) or the reason it can't be had.
         g.set(
@@ -7455,6 +7489,26 @@ impl Runtime {
 
     pub fn inst(&self, r: Ref) -> Value {
         inst_value(&self.lua, r).unwrap_or(Value::Nil)
+    }
+
+    /// Returns the client's `PlayerMouse` instance, creating it lazily if no
+    /// script has called `LocalPlayer:GetMouse()` yet (e.g. `Tool.Equipped`).
+    pub fn ensure_mouse(&self) -> Value {
+        let lua = &self.lua;
+        let existing = world(lua).ok().and_then(|w| w.input.mouse);
+        let m = match existing {
+            Some(m) if world(lua).is_ok_and(|w| w.d().exists(m)) => Some(m),
+            _ => match ext::create_any(lua, "PlayerMouse") {
+                Ok(m) => {
+                    if let Ok(mut w) = world(lua) {
+                        w.input.mouse = Some(m);
+                    }
+                    Some(m)
+                }
+                Err(_) => None,
+            },
+        };
+        m.and_then(|r| inst_value(lua, r).ok()).unwrap_or(Value::Nil)
     }
 
     /// Re-anchors pending timers' wall-clock timestamps to now so synchronous
@@ -10020,7 +10074,7 @@ mod legacy_tests {
     }
 
     /// Touch screens (src/play.rs's finger dispatch, src/library.luau's
-    /// `__rs_touch_event` / `__rs_touch_gesture`, src/domains/gui_input.luau's
+    /// `__rs_finger_event` / `__rs_touch_gesture`, src/domains/gui_input.luau's
     /// Fingers): a finger's Begin / Change / End reaches a Touch
     /// ContextActionService binding, UserInputService's InputBegan,
     /// TouchStarted / TouchMoved / TouchEnded with ONE InputObject per
@@ -10074,7 +10128,7 @@ mod legacy_tests {
         let touch = |state: &str, x: f64, y: f64, dx: f64, dy: f64| {
             let began_on = rt.lua.create_table().unwrap();
             rt.spawn_global(
-                "__rs_touch_event",
+                "__rs_finger_event",
                 vec![
                     str(state),
                     Value::Number(1.0),
@@ -10162,7 +10216,7 @@ mod legacy_tests {
         for (state, x) in [("Begin", 100.0), ("Change", 110.0), ("End", 120.0)] {
             let began_on = rt.lua.create_table().unwrap();
             rt.spawn_global(
-                "__rs_touch_event",
+                "__rs_finger_event",
                 vec![
                     str(state),
                     Value::Number(1.0),
@@ -10577,7 +10631,7 @@ mod legacy_tests {
         let uis = |state: &str, x: f64, y: f64| {
             let began_on = rt.lua.create_table().unwrap();
             rt.spawn_global(
-                "__rs_touch_event",
+                "__rs_finger_event",
                 vec![
                     str(state),
                     Value::Number(7.0),

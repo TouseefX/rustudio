@@ -98,6 +98,8 @@ if ($Uninstall) {
         $path = Join-Path $Prefix $file
         if (Test-Path -LiteralPath $path) { Remove-Item -LiteralPath $path }
     }
+    $pluginsDst = Join-Path $Prefix 'plugins'
+    if (Test-Path -LiteralPath $pluginsDst) { Remove-Item -LiteralPath $pluginsDst -Recurse -Force }
     if ((Test-Path $Prefix) -and @(Get-ChildItem -LiteralPath $Prefix -Force).Count -eq 0) {
         Remove-Item -LiteralPath $Prefix
     }
@@ -113,6 +115,14 @@ foreach ($file in $files) {
     $destination = Join-Path $Prefix $file
     if ([IO.Path]::GetFullPath($source) -ne [IO.Path]::GetFullPath($destination)) {
         Copy-Item -LiteralPath $source -Destination $destination -Force
+    }
+}
+$pluginsSrc = Join-Path $PSScriptRoot 'plugins'
+if (Test-Path -LiteralPath $pluginsSrc) {
+    $pluginsDst = Join-Path $Prefix 'plugins'
+    if ([IO.Path]::GetFullPath($pluginsSrc) -ne [IO.Path]::GetFullPath($pluginsDst)) {
+        if (Test-Path -LiteralPath $pluginsDst) { Remove-Item -LiteralPath $pluginsDst -Recurse -Force }
+        Copy-Item -LiteralPath $pluginsSrc -Destination $pluginsDst -Recurse -Force
     }
 }
 if (!$NoShortcut) {

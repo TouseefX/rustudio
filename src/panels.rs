@@ -103,6 +103,8 @@ pub const PLACEMENTS: &[Placement] = &[
     row("live_collaborators", "Live Collaborators", Right, &[], 0.2),
     row("controller_emulator", "Controller Emulator", Right, &[], 0.2),
     row("style_editor", "Style Editor", Right, &[], 0.24),
+    row("path_editor", "Path2D Editor", Right, &[], 0.24),
+    row("event_emulator", "Event Emulator", Right, &[], 0.24),
     // Left.
     row("toolbox", "Toolbox", Left, &[], 0.2),
     row("terrain_editor", "Terrain Editor", Left, &[TabWith("toolbox")], 0.29),
@@ -128,6 +130,8 @@ pub const PLACEMENTS: &[Placement] = &[
     row("watch", "Watch", Bottom, &[TabWith("breakpoints"), TabWith("call_stack")], 0.22),
     row("call_stack", "Call Stack", Bottom, &[TabWith("breakpoints"), TabWith("watch")], 0.22),
     row("material_manager", "Material Manager", Bottom, &[], 0.22),
+    row("audio_discovery", "Audio Discovery", Bottom, &[TabWith("output")], 0.24),
+    row("texture_viewer", "Texture Viewer", Bottom, &[TabWith("output")], 0.24),
     row("clip_editor", "Animation Editor", Bottom, &[], 0.3),
     row("scene_analysis", "Scene Analysis", Bottom, &[], 0.22),
     // A narrow full-width strip under all the panes.
@@ -159,7 +163,13 @@ pub fn plugin_placement(key: &'static str, state: &str) -> Placement {
 
 /// The row for `key` (unknown keys dock at the bottom).
 pub fn placement(key: &str) -> Placement {
-    if let Some((k, state)) = crate::plugin_host::widgets_ui::slot_placement(key) {
+    if let Some((k, state, override_key)) = crate::plugin_host::widgets_ui::slot_placement(key) {
+        if let Some(pk) = override_key {
+            if let Some(mut p) = PLACEMENTS.iter().copied().find(|p| p.key == pk) {
+                p.key = k;
+                return p;
+            }
+        }
         return plugin_placement(k, &state);
     }
     PLACEMENTS
@@ -179,10 +189,10 @@ impl Tab {
             Tab::Output => "output",
             Tab::AvatarSettings => "avatar_settings",
             Tab::TerrainEditor => "terrain_editor",
-            Tab::AnimationEditor => "clip_editor",
             Tab::Toolbox => "toolbox",
             Tab::AssetManager => "asset_manager",
             Tab::FileSync => "file_sync",
+            Tab::ControllerEmulator => "controller_emulator",
             Tab::Profiler => "microprofiler",
             Tab::Script(_) => "script",
             Tab::Plugin(n) => crate::plugin_host::widgets_ui::slot_key(*n),
@@ -217,7 +227,7 @@ fn fraction_ok(f: f32) -> f32 {
 pub fn place(dock: &mut DockState<Tab>, tab: Tab, homes: &HashMap<String, Home>) {
     if let Some(Home::Topology(json)) = homes.get("__topology") {
         if let Ok(saved) = serde_json::from_str::<DockState<crate::layout_store::SavedTab>>(json) {
-            let mut full = saved.map_tabs(|t| t.tab());
+            let mut full = saved.filter_map_tabs(|t| t.to_tab());
             let visible: Vec<Tab> = dock.iter_all_tabs().map(|(_, t)| *t).collect();
             let mut projected = full.clone();
             retain_visible(&mut projected, |t| visible.contains(t));
@@ -279,12 +289,20 @@ pub fn place(dock: &mut DockState<Tab>, tab: Tab, homes: &HashMap<String, Home>)
         }
         _ => {}
     }
-    // A plugin widget joins another of the same InitialDockState.
-    if matches!(tab, Tab::Plugin(_)) {
+    let generic_plugin = matches!(tab, Tab::Plugin(_))
+        && !crate::plugin_host::widgets_ui::is_studio_placed_plugin_tab(&tab);
+    // A generic plugin widget joins another of the same InitialDockState.
+    if generic_plugin {
         let mate = tree.iter().enumerate().find_map(|(i, n)| {
             let tabs = n.get_leaf()?.tabs();
             tabs.iter()
-                .any(|t| matches!(t, Tab::Plugin(_)) && *t != tab && placement(t.key()).spot == p.spot && !placement(t.key()).floats)
+                .any(|t| {
+                    matches!(t, Tab::Plugin(_))
+                        && !crate::plugin_host::widgets_ui::is_studio_placed_plugin_tab(t)
+                        && *t != tab
+                        && placement(t.key()).spot == p.spot
+                        && !placement(t.key()).floats
+                })
                 .then_some(NodeIndex(i))
         });
         if let Some(n) = mate {
@@ -318,7 +336,7 @@ pub fn place(dock: &mut DockState<Tab>, tab: Tab, homes: &HashMap<String, Home>)
         }
     }
     // A group already on its side (not the 3D view's, not the Command Bar's).
-    if p.spot != Spot::BottomFull && p.spot != Spot::Top && !matches!(tab, Tab::Plugin(_)) {
+    if p.spot != Spot::BottomFull && p.spot != Spot::Top && !generic_plugin {
         let side = tree.iter().enumerate().find_map(|(i, n)| {
             let tabs = n.get_leaf()?.tabs();
             let same = tabs.iter().any(|t| {
@@ -410,7 +428,10 @@ fn topology(dock: &DockState<Tab>) -> String {
 pub fn record_homes(dock: &DockState<Tab>, homes: &mut HashMap<String, Home>) {
     let keep = match homes.get("__topology") {
         Some(Home::Topology(json)) => serde_json::from_str::<DockState<crate::layout_store::SavedTab>>(json)
-            .ok().is_some_and(|d| d.iter_all_tabs().any(|(_, t)| dock.find_tab(&t.tab()).is_none())),
+            .ok().is_some_and(|d| {
+                d.iter_all_tabs()
+                    .any(|(_, t)| t.to_tab().is_some_and(|tab| dock.find_tab(&tab).is_none()))
+            }),
         _ => false,
     };
     if !keep {
@@ -647,7 +668,7 @@ impl Panels {
             w.dock.find_tab(&crate::layout_store::SavedTab::from_tab(&tab)?).map(|_| w)
         });
         let Some(saved) = saved else { return false };
-        let mut full = saved.dock.map_tabs(|t| t.tab());
+        let mut full = saved.dock.filter_map_tabs(|t| t.to_tab());
         if let Some(w) = self.popped.iter_mut().find(|w| w.key == saved.key) {
             let visible = w.tabs();
             let mut projection = full.clone();

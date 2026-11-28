@@ -30,12 +30,14 @@ public class IconResource {
     if ($link.IconLocation -ne "$(Join-Path $prefix 'rustudio.exe'),0") { throw 'Wrong shortcut icon' }
     if ($link.WorkingDirectory -ne $prefix) { throw 'Wrong working directory' }
     if ((Get-FileHash (Join-Path $prefix 'api-dump.json')).Hash -ne (Get-FileHash (Join-Path $bundle 'api-dump.json')).Hash) { throw 'API data missing or changed' }
+    if (!(Test-Path (Join-Path $prefix 'plugins\9SliceEditor\init.server.luau'))) { throw 'Bundled plugins missing after install' }
     Set-Content (Join-Path $prefix 'user-project.rbxl') 'preserve'
     & $installer -Prefix $prefix -ProgramsDirectory $programs
     & (Join-Path $prefix 'install.ps1') -Uninstall -Prefix $prefix -ProgramsDirectory $programs
     & $installer -Uninstall -Prefix $prefix -ProgramsDirectory $programs
     if (Test-Path (Join-Path $programs 'rustudio.lnk')) { throw 'Shortcut remains' }
     if (Test-Path (Join-Path $prefix 'rustudio.exe')) { throw 'Executable remains' }
+    if (Test-Path (Join-Path $prefix 'plugins')) { throw 'Bundled plugins remain after uninstall' }
     if ((Get-Content (Join-Path $prefix 'user-project.rbxl')) -ne 'preserve') { throw 'User data lost' }
     & $installer -Prefix $prefix -ProgramsDirectory $programs -NoShortcut
     if (Test-Path (Join-Path $programs 'rustudio.lnk')) { throw 'Unwanted shortcut created' }

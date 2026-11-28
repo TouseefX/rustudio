@@ -272,7 +272,10 @@ pub enum GuiArg {
     },
     /// A finger's InputObject (UserInputType.Touch; one object per finger
     /// for its whole life, `__rs_touch_object`): the finger, its state,
-    /// position and motion since its last event.
+    /// position and motion since its last event — a touch screen's finger
+    /// (`Gui::touch_input`) or the mouse as a finger on a simulated device
+    /// (`Gui::as_touch`; the same object UserInputService's Touch events
+    /// carry).
     Touch {
         id: u64,
         state: TouchState,
@@ -530,11 +533,27 @@ pub(super) fn ui_time(ctx: &egui::Context) -> f64 {
     rustudio_core::sim_clock::seconds().unwrap_or_else(|| ctx.input(|i| i.time))
 }
 
+/// A simulated device's screen (Device Simulator): the view's GUI is laid
+/// out in device points, its whole screen `screen` around the safe area the
+/// view's rect is, and drawn `scale` window points per device point.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct DeviceFrame {
+    pub screen: Rect,
+    pub scale: f32,
+}
+
 #[derive(Default)]
 pub struct Gui {
     /// Where the game's mouse is when it isn't the pointer: the middle of
     /// the view while LockCenter holds the cursor (mouse_lock::game_pointer).
     pub pointer_override: Option<Pos2>,
+    /// The simulated device the view's GUI is laid out on, and the map from
+    /// window points to its points for the pointer (`Gui::input`).
+    pub device: Option<DeviceFrame>,
+    pub pointer_map: Option<egui::emath::TSTransform>,
+    /// Mouse-as-touch: the finger the pointer is (its touch id). The GUI
+    /// then gets Touch InputObjects, no hover, and no right button or wheel.
+    pub touch_id: Option<u32>,
     /// The inset input positions are measured below (InputObject.Position,
     /// MouseEnter's x, y): None, the game's top bar (GUI_TOP_INSET); a
     /// plugin widget's or the edit viewport's CoreGui: 0.
@@ -4079,7 +4098,7 @@ pub(crate) fn layout_slots(
     let mut walk = walk::Walk {
         gui: &mut gui, ctx: &ctx, input: &mut input, items: Vec::new(),
         hits: Vec::new(), seq: 0, boxes: Vec::new(), global_z: false,
-        abs_offset: [0.0; 2], screen: None, cur: parent, rec: Vec::new(),
+        abs_offset: [0.0; 2], screen: None, fullscreen_ext: None, cur: parent, rec: Vec::new(),
         replaying: 0, table_cells: HashMap::new(),
     };
     let slots = walk.place_children(parent, rect, scale, true);

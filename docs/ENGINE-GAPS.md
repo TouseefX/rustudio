@@ -69,6 +69,31 @@ UIModifier is a second button held with UIButton, context Priority and Sink
 apply as for keys, and a press that never gets its MouseButton1Up ends when
 the left mouse button comes up or the button leaves the game.
 
+## Device Simulator (the device's input and screen)
+
+Scripts always saw a desktop: UserInputService's TouchEnabled / GamepadEnabled
+were false, PreferredInput KeyboardAndMouse, IsTenFootInterface false,
+CurrentScreenOrientation LandscapeLeft, ViewportDisplaySize Medium, and the
+ScreenInsets only knew the top bar. With Test > Device Simulator (or
+`--device ID`) they now answer for the simulated device, with the numbers
+measured in Studio's Play for each of its 43 presets (docs/MECHANICS.md,
+Device Simulator):
+
+| Member | Status |
+|---|---|
+| UserInputService TouchEnabled, KeyboardEnabled, MouseEnabled, GamepadEnabled, PreferredInput | **done**: the device's own flags; Changed fires on a switch mid-Play, in Studio's order |
+| GuiService:IsTenFootInterface() | **done**: true on Xbox / PlayStation |
+| PlayerGui.CurrentScreenOrientation | **done**: Portrait / LandscapeRight on a device, a frame after the view turns |
+| GuiService.ViewportDisplaySize | **done**: the device's own |
+| ScreenInsets None / DeviceSafeInsets, GuiService:GetInsetArea, Camera.ViewportSize | **done**: the safe area, and the whole screen under the notch for None |
+| Camera:ViewportPointToRay / WorldToViewportPoint on a device | **done**: projected over the whole screen, from the safe area's corner |
+| UserInputService.GamepadConnected / GamepadDisconnected for the device's own pad | **done**: consoles, headsets, the handhelds and the TV hold Gamepad1 |
+| Edit-mode ScreenGui insets and view size on a device | estimate: the edit view's GUIs keep covering the safe area; flags are the device's (measured) |
+| UserInputService TouchStarted / TouchMoved / TouchEnded, TouchTap, TouchTapInWorld, TouchLongPress, TouchPan, TouchSwipe, TouchPinch, TouchRotate; InputBegan / Changed / Ended with UserInputType Touch (UserInputService, bound actions and GuiObjects) | **done** (mouse-as-touch on a simulated phone or tablet): one InputObject per finger; Roblox's PlayerModule thumbstick and jump button work from it |
+| Input action system KeyCode TouchPosition (with a UIModifier), TouchDelta, TouchPinch | **done**: Roblox's Input Action System player scripts (Workspace.PlayerScriptsUseInputActionSystem) get their DynamicThumbstick, touch camera and pinch zoom from fingers; which fingers count and the pinch's units are estimates |
+| Virtual controller (Controller Emulator): gamepad InputBegan / Changed / Ended from keys, GamepadConnected / Disconnected, GamepadEnabled, PreferredInput Gamepad | **done**: Studio's key map and events; Roblox's PlayerModule walks and jumps from it |
+| GuiObject.TouchTap | open: not fired yet (GuiObjects get the Touch InputBegan / InputEnded and their buttons' MouseButton1Click / Activated) |
+
 ## Round 19: the whole corpus, and what was wrong rather than missing
 
 Ranked by `RUSTUDIO_GAPS` calls summed over the six fidelity places (Place A's
@@ -171,7 +196,7 @@ E / F), with `RUSTUDIO_GAPS` (`../checks/coverage/gaps-*-r14.json`):
 | 2 | 18 | TweenBase.PlaybackState | default-only | Place B | **done**: Begin / Delayed / Playing / Paused / Completed / Cancelled from the tween's run |
 | 3 | 7 | Model.WorldPivot (write) | write-ignored | newer Place A build (Bo3Map) | **done**: with a PrimaryPart, sets its PivotOffset = PrimaryPart.CFrame⁻¹ · pivot; else the model's WorldPivotData; GetPivot / WorldPivot read it back |
 | 4 | 2 | UIGridStyleLayout.AbsoluteContentSize | default-only | Godelz RPG | **done**: the extent of the visible GuiObjects it lays out, as drawn last frame (UDim2 rects before) |
-| 5 | 2 | UserInputService.GamepadDisconnected | event-unwired | Place A, newer Place A | **done**: Play scans the joystick devices (/dev/input/by-id/*-event-joystick; Linux only, none on macOS or Windows yet) about once a second and fires GamepadConnected / GamepadDisconnected with Gamepad1…8; GetConnectedGamepads / GetNavigationGamepads / GetGamepadConnected answer from it (buttons and sticks: not yet) |
+| 5 | 2 | UserInputService.GamepadDisconnected | event-unwired | Place A, newer Place A | **done**: Play scans the joystick devices (/dev/input/by-id/*-event-joystick; Linux only, none on macOS or Windows yet) about once a second and fires GamepadConnected / GamepadDisconnected with Gamepad1…8; GetConnectedGamepads / GetNavigationGamepads / GetGamepadConnected answer from it. Since then host pads are read through gilrs on every platform, buttons and sticks included (crates/rustudio-player/src/gamepad.rs) |
 | 6 | 2 | Mouse.Icon | stub default | PlayerModule (shift-lock) | **done**: UserInputService.MouseIcon, else the PlayerMouse's Icon, is drawn centred on the pointer over the game view in place of the system arrow |
 
 After these, a stub-hit count from the noise of unset object properties
@@ -408,7 +433,7 @@ camera 75 → 100 with the 2° tolerance unchanged.
    ComputeSmoothPathAsync / FindPathAsync; `geometry_tests.rs`).
 3. **TextService:GetTextSize / GetTextBoundsAsync** — UI layout code.
 4. ~~GuiService.MenuOpened / MenuClosed with an in-game Esc menu~~ (round 13).
-5. Gamepad input (GamepadConnected / Disconnected, gamepad KeyCodes).
+5. ~~Gamepad input (GamepadConnected / Disconnected, gamepad KeyCodes)~~ (crates/rustudio-player/src/gamepad.rs).
 6. The rest of `missing_game_members_by_class` in the coverage report.
 7. ~~Touch for games~~ (Android, docs/ANDROID.md "Fingers in Play"): on a
    touch screen `UserInputService.TouchEnabled` / `TouchScreenEnabled` /

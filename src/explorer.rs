@@ -733,7 +733,30 @@ impl Editor {
                 ui.close();
             }
         });
-        resp.on_hover_text_at_pointer(RichText::new(class).small());
+        if let Some(pick) = self.props.ref_pick.as_ref() {
+            let ok = self.ref_pick_accepts(r);
+            if resp.hovered() {
+                let stroke = if ok {
+                    Color32::from_rgb(90, 155, 255)
+                } else {
+                    Color32::from_rgb(160, 70, 70)
+                };
+                painter.rect_stroke(rect, 0.0, egui::Stroke::new(1.0, stroke), egui::StrokeKind::Inside);
+                ui.ctx().set_cursor_icon(if ok {
+                    egui::CursorIcon::Crosshair
+                } else {
+                    egui::CursorIcon::NotAllowed
+                });
+            }
+            let tip = if ok {
+                format!("Click to assign {} to {}", name, pick.prop)
+            } else {
+                format!("{class} (expected {})", pick.expected_class)
+            };
+            resp.on_hover_text_at_pointer(RichText::new(tip).small());
+        } else {
+            resp.on_hover_text_at_pointer(RichText::new(class).small());
+        }
     }
 
     fn apply_row_action(&mut self, a: RowAction, rows: &[(Ref, usize)]) {
@@ -744,6 +767,14 @@ impl Editor {
                 }
             }
             RowAction::Click(r, toggle, range) => {
+                if self.props.ref_pick.is_some() {
+                    if !self.commit_ref_pick(r) {
+                        if let Some(pk) = self.props.ref_pick.as_ref() {
+                            self.warn(format!("Cannot assign to {}: expected {}", pk.prop, pk.expected_class));
+                        }
+                    }
+                    return;
+                }
                 if range {
                     let anchor = self.explorer.anchor.unwrap_or(r);
                     let a = rows.iter().position(|(x, _)| *x == anchor);
@@ -765,7 +796,12 @@ impl Editor {
                 }
                 self.explorer.anchor = Some(r);
             }
-            RowAction::ClearSelection => self.game.doc.selection.clear(),
+            RowAction::ClearSelection => {
+                if self.props.ref_pick.take().is_some() {
+                    return;
+                }
+                self.game.doc.selection.clear();
+            }
             RowAction::StartRename(r) => {
                 let name = self.game.doc.dom.get_by_ref(r).map(|i| i.name.clone()).unwrap_or_default();
                 self.explorer.renaming = Some((r, name));

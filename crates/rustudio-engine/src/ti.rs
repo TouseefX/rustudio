@@ -37,7 +37,50 @@ fn filled() -> &'static HashMap<&'static str, char> {
 /// shapes in a triangle (pink triangle on top, blue circle bottom left,
 /// amber square bottom right), Roblox's colourful Model idea with
 /// rustudio's own shapes.
-const DRAWN: &[&str] = &["rs-model"];
+const DRAWN: &[&str] = &["rs-model", "rs-virtual-controller"];
+
+/// The Device Simulator's virtual controller: a gamepad outline with a gear
+/// in a gap at its lower right (Tabler has no such icon; drawn on a
+/// 12-unit grid, stroke 0.85, like the rest of the bar's icons).
+fn paint_virtual_controller(p: &Painter, r: Rect, color: Color32) {
+    use egui::{pos2, Pos2, Stroke};
+    let n = r.width().min(r.height());
+    let o = r.center() - egui::vec2(n, n) / 2.0;
+    let at = |x: f32, y: f32| pos2(o.x + x / 12.0 * n, o.y + y / 12.0 * n);
+    let stroke = Stroke::new((0.85 / 12.0 * n).max(1.0), color);
+    let body: [(f32, f32); 15] = [
+        (3.8, 2.1), (8.2, 2.1), (9.35, 2.5), (10.05, 3.85), (10.6, 7.75), (10.3, 8.7), (8.9, 8.8),
+        (7.9, 7.9), (4.1, 7.9), (3.0, 8.8), (1.7, 8.7), (1.3, 7.75), (1.85, 3.85), (2.6, 2.5), (3.8, 2.1),
+    ];
+    let gear = (9.4, 9.0);
+    let cut = 2.3;
+    for w in body.windows(2) {
+        // (the outline stops short of the gear's gap)
+        let pts: Vec<Pos2> = (0..=8)
+            .map(|i| {
+                let t = i as f32 / 8.0;
+                (w[0].0 + (w[1].0 - w[0].0) * t, w[0].1 + (w[1].1 - w[0].1) * t)
+            })
+            .filter(|(x, y)| ((x - gear.0).powi(2) + (y - gear.1).powi(2)).sqrt() > cut)
+            .map(|(x, y)| at(x, y))
+            .collect();
+        if pts.len() >= 2 {
+            p.line(pts, stroke);
+        }
+    }
+    p.line_segment([at(4.0, 4.2), at(4.0, 5.4)], stroke);
+    p.line_segment([at(3.4, 4.8), at(4.6, 4.8)], stroke);
+    p.circle_filled(at(7.5, 4.5), stroke.width * 0.6, color);
+    p.circle_filled(at(8.4, 5.3), stroke.width * 0.6, color);
+    let c = at(gear.0, gear.1);
+    let u = n / 12.0;
+    for i in 0..8 {
+        let a = i as f32 * std::f32::consts::TAU / 8.0;
+        let d = egui::vec2(a.cos(), a.sin());
+        p.line_segment([c + d * 0.9 * u, c + d * 1.6 * u], Stroke::new(0.7 * u, color));
+    }
+    p.circle_stroke(c, 0.85 * u, Stroke::new(0.6 * u, color));
+}
 
 fn paint_model(p: &Painter, r: Rect) {
     use egui::{pos2, Pos2, Shape, Stroke};
@@ -92,6 +135,10 @@ pub fn text(name: &str, size: f32) -> egui::RichText {
 
 /// Paints icon `name` centred in `r`, sized to fit.
 pub fn paint(p: &Painter, r: Rect, name: &str, color: Color32) {
+    if name == "rs-virtual-controller" {
+        paint_virtual_controller(p, r, color);
+        return;
+    }
     if name == "rs-model" {
         // its own colours, whatever the caller's tint
         let _ = color;

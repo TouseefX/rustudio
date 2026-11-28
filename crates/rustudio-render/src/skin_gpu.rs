@@ -127,6 +127,10 @@ pub struct Request<'a> {
 }
 
 impl SkinGpu {
+    pub fn is_available(&self) -> bool {
+        self.pipeline.is_some()
+    }
+
     pub fn new(device: &wgpu::Device, compute: bool) -> Self {
         if !compute {
             return SkinGpu { pipeline: None, sources: HashMap::new(), jobs: HashMap::new(), due: Vec::new(), bytes: 0 };

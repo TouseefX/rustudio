@@ -63,6 +63,7 @@ impl DialPlan {
 /// A join script with no UDMUX endpoint and no `NetStackTokenValue`
 /// [seen live 2026-11-24] is a direct dial: `relay` is then the RCC itself
 /// and `token` is `None`, so no RUPP header is used.
+#[derive(Clone)]
 pub struct QuicTarget {
     pub relay: std::net::SocketAddr,
     pub rcc: (std::net::Ipv4Addr, u16),
@@ -77,7 +78,9 @@ impl QuicTarget {
         self.token.is_none()
     }
 
-    pub fn from_join(js: &JoinScript) -> Result<QuicTarget> {
+    /// Ordered list of relay targets from the join script (every valid UDMUX
+    /// endpoint, falling back to `MachineAddress` directly when none are listed).
+    pub fn candidates_from_join(js: &JoinScript) -> Result<Vec<QuicTarget>> {
         use base64::Engine;
         let b64 = base64::engine::general_purpose::STANDARD;
         let port = js
@@ -87,13 +90,6 @@ impl QuicTarget {
             .machine_address
             .parse()
             .map_err(|_| NetError::JoinScript("MachineAddress is not IPv4".into()))?;
-        let relay_ip: std::net::IpAddr = match js.udmux_endpoints.first() {
-            Some(e) => e
-                .address
-                .parse()
-                .map_err(|_| NetError::JoinScript("bad UDMUX address".into()))?,
-            None => std::net::IpAddr::V4(rcc_ip),
-        };
         let token = if js.udmux_endpoints.is_empty() && js.net_stack_token_value.is_empty() {
             // Direct dial: nothing to relay through, nothing to present.
             None
@@ -106,7 +102,7 @@ impl QuicTarget {
             })?;
             Some(token)
         };
-        let cert_hashes = js
+        let cert_hashes: Vec<[u8; 32]> = js
             .net_stack_config
             .as_ref()
             .map(|c| {
@@ -116,12 +112,38 @@ impl QuicTarget {
                     .collect()
             })
             .unwrap_or_default();
-        Ok(QuicTarget {
-            relay: std::net::SocketAddr::new(relay_ip, port),
-            rcc: (rcc_ip, port),
-            token,
-            cert_hashes,
-        })
+
+        let mut relays: Vec<std::net::SocketAddr> = Vec::new();
+        for e in &js.udmux_endpoints {
+            if let Ok(ip) = e.address.parse::<std::net::IpAddr>() {
+                let addr = std::net::SocketAddr::new(ip, port);
+                if !relays.contains(&addr) {
+                    relays.push(addr);
+                }
+            }
+        }
+        if relays.is_empty() {
+            if !js.udmux_endpoints.is_empty() {
+                return Err(NetError::JoinScript("bad UDMUX address".into()));
+            }
+            relays.push(std::net::SocketAddr::new(std::net::IpAddr::V4(rcc_ip), port));
+        }
+        Ok(relays
+            .into_iter()
+            .map(|relay| QuicTarget {
+                relay,
+                rcc: (rcc_ip, port),
+                token,
+                cert_hashes: cert_hashes.clone(),
+            })
+            .collect())
+    }
+
+    pub fn from_join(js: &JoinScript) -> Result<QuicTarget> {
+        Self::candidates_from_join(js)?
+            .into_iter()
+            .next()
+            .ok_or_else(|| NetError::JoinScript("no relay targets".into()))
     }
 }
 
@@ -315,7 +337,7 @@ mod tests {
         // base64 "0123456789abcdef" is 16 bytes; a fake cert hash.
         let js = JoinScript::parse(
             r#"{"MachineAddress":"10.1.2.3","ServerPort":100,"NetStackPort":64852,
-                "NetStackTokenValue":"MDEyMzQ1Njc4OWFiY2RlZg==",
+                "NetStackTokenValue":"YWFhYWFhYWFhYWFhYWFhYQ==",
                 "UdmuxEndpoints":[{"Address":"128.116.63.33","Port":64852}],
                 "NetStackConfig":"{\"pubKey\":\"\",\"port\":64852,\"caps\":\"\",\"certHashes\":[\"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=\"]}"}"#,
         )
@@ -323,10 +345,30 @@ mod tests {
         let t = QuicTarget::from_join(&js).unwrap();
         assert_eq!(t.relay.to_string(), "128.116.63.33:64852");
         assert_eq!(t.rcc, ("10.1.2.3".parse().unwrap(), 64852));
-        assert_eq!(t.token, Some(*b"0123456789abcdef"));
+        assert_eq!(t.token, Some(*b"aaaaaaaaaaaaaaaa"));
         assert!(!t.is_direct());
         assert_eq!(t.cert_hashes.len(), 1);
         assert_eq!(t.cert_hashes[0], [0u8; 32]);
+    }
+
+    #[test]
+    fn candidates_from_join_keeps_every_valid_relay_in_order() {
+        let js = JoinScript::parse(
+            r#"{"MachineAddress":"10.1.2.3","ServerPort":100,"NetStackPort":64852,
+                "NetStackTokenValue":"YWFhYWFhYWFhYWFhYWFhYQ==",
+                "UdmuxEndpoints":[
+                    {"Address":"128.116.63.33","Port":64852},
+                    {"Address":"128.116.63.34","Port":64852},
+                    {"Address":"128.116.63.33","Port":64852}
+                ]}"#,
+        )
+        .unwrap();
+        let relays: Vec<String> = QuicTarget::candidates_from_join(&js)
+            .unwrap()
+            .into_iter()
+            .map(|t| t.relay.to_string())
+            .collect();
+        assert_eq!(relays, vec!["128.116.63.33:64852", "128.116.63.34:64852"]);
     }
 
     #[test]

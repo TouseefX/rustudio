@@ -77,22 +77,16 @@ pub struct PropertiesState {
     active_for: Option<Ref>,
     /// Each drawn row's rect, by property name (the self-test reads them).
     pub row_rects: HashMap<String, Rect>,
-    /// A Ref property being set by picking an instance (`RefPick`).
+    /// Active Instance (`Variant::Ref`) property picker: clicking an instance
+    /// in Explorer or the 3D viewport assigns it to `prop` without changing selection.
     pub ref_pick: Option<RefPick>,
 }
 
-/// A Ref property (Part0 / Part1, Attachment0 / Attachment1, PrimaryPart,
-/// CameraSubject…) being set the way Studio sets one: the cell was
-/// clicked, and the next instance selected — in the Explorer or the 3D
-/// view — becomes the value, after which the selection goes back to the
-/// owners so the panel still shows them. Until then Ref cells were shown
-/// by name and could not be changed at all (the 2026-11-25 report: a
-/// WeldConstraint's parts "cannot be modified").
+#[derive(Clone, Debug)]
 pub struct RefPick {
-    /// The property.
     pub prop: String,
-    /// The instances whose property it is: the selection at the click.
-    pub owners: Vec<Ref>,
+    pub targets: Vec<Ref>,
+    pub expected_class: String,
 }
 
 pub struct SliderDrag {
@@ -147,12 +141,31 @@ pub const PROPS_FILTER_ID: &str = "properties_filter";
 
 /// The Properties panel's title: Studio's "Properties - Class "Name"".
 pub fn panel_title(ed: &Editor) -> String {
+    let side = ed
+        .game
+        .play
+        .as_ref()
+        .filter(|p| p.mode == rustudio_engine::runtime::RunMode::Play)
+        .map(|p| if p.showing == rustudio_engine::runtime::Side::Server { " [Server]" } else { " [Client]" })
+        .unwrap_or("");
     let sel = &ed.game.doc.selection;
     match sel.first().and_then(|r| ed.game.doc.dom.get_by_ref(*r)) {
-        Some(i) if sel.len() > 1 => format!("Properties - {} \"{}\" (+{} more)", i.class, i.name, sel.len() - 1),
-        Some(i) => format!("Properties - {} \"{}\"", i.class, i.name),
-        None => "Properties".into(),
+        Some(i) if sel.len() > 1 => format!("Properties - {} \"{}\" (+{} more){side}", i.class, i.name, sel.len() - 1),
+        Some(i) => format!("Properties - {} \"{}\"{side}", i.class, i.name),
+        None => format!("Properties{side}"),
     }
+}
+
+/// Expected target class for a `Variant::Ref` property (from the Studio API dump,
+/// falling back to `"Instance"`).
+pub fn expected_ref_class(class: &str, prop: &str) -> String {
+    if prop == "Parent" {
+        return "Instance".into();
+    }
+    rustudio_core::api::get()
+        .and_then(|api| api.prop_value_class(class, prop))
+        .unwrap_or("Instance")
+        .to_string()
 }
 
 /// Studio's number text: up to 3 decimals, no trailing zeros.
@@ -479,7 +492,6 @@ impl Editor {
         ui.add_space(2.0);
         self.props.drawn.clear();
         self.ui_rects.insert("props.panel", ui.max_rect());
-        self.ref_pick_tick(ui.ctx());
         let sel = self.game.doc.selection.clone();
         let Some(&first) = sel.first() else {
             self.hud.property_rows = 0;
@@ -652,85 +664,6 @@ impl Editor {
             FontId::proportional(FONT)
         };
         painter.text(Pos2::new(x, r.center().y), egui::Align2::LEFT_CENTER, name, font, color);
-    }
-
-    /// A Ref pick in progress (`RefPick`): the selection moved off the
-    /// owners onto the picked instance — the value — or away (nothing
-    /// selected, Escape): the pick ends either way, the owners selected again.
-    fn ref_pick_tick(&mut self, ctx: &egui::Context) {
-        let Some(pick) = self.props.ref_pick.take() else { return };
-        let owners: Vec<Ref> = pick.owners.iter().copied().filter(|r| self.game.doc.exists(*r)).collect();
-        if owners.is_empty() {
-            return;
-        }
-        let sel = &self.game.doc.selection;
-        if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
-            self.select(owners);
-            return;
-        }
-        if *sel == pick.owners || sel.iter().all(|r| owners.contains(r)) && !sel.is_empty() {
-            // Still waiting (a click on an owner changes nothing).
-            self.props.ref_pick = Some(pick);
-            return;
-        }
-        let Some(&picked) = sel.first() else {
-            // Deselected: the pick is given up.
-            self.select(owners);
-            return;
-        };
-        let changes: Vec<(Ref, rbx_dom_weak::Ustr, Variant)> = owners
-            .iter()
-            .copied()
-            .filter(|r| self.game.doc.class_of(*r).is_some_and(|c| has_prop(&c, &pick.prop)))
-            .map(|r| (r, ustr(&pick.prop), Variant::Ref(picked)))
-            .collect();
-        if !changes.is_empty() {
-            self.game.doc.set_props(&format!("Set {}", pick.prop), changes, None);
-        }
-        self.select(owners);
-    }
-
-    /// A Ref property's cell: the instance's name; a click starts a pick
-    /// (`RefPick`: the next instance selected is the value, the cell says
-    /// so meanwhile; a second click ends it), and a set value has a × at
-    /// the cell's right that clears it.
-    #[allow(clippy::too_many_arguments)]
-    fn ref_cell(&mut self, p: &mut Painter, name: &str, cur: Ref, mixed: bool, v: Rect, resp: &egui::Response, clicked_value: bool, edits: &mut Vec<Edit>) {
-        let picking = self.props.ref_pick.as_ref().is_some_and(|k| k.prop == name);
-        let shown = if mixed {
-            String::new()
-        } else {
-            self.game.doc.dom.get_by_ref(cur).map(|i| i.name.clone()).unwrap_or_default()
-        };
-        if picking {
-            Self::value_label(p, v, "Select an instance in the Explorer or the view…", rustudio_engine::theme::ACCENT);
-        } else {
-            Self::value_label(p, v, &shown, TEXT);
-        }
-        // The clear button, for a set value.
-        let mut on_clear = false;
-        if cur.is_some() && !mixed && !picking {
-            let br = Rect::from_center_size(Pos2::new(v.max.x - 10.0, v.center().y), Vec2::splat(16.0));
-            on_clear = resp.interact_pointer_pos().is_some_and(|q| br.contains(q));
-            let hovered = resp.hover_pos().is_some_and(|q| br.contains(q));
-            p.ui.painter_at(v).text(
-                br.center(),
-                egui::Align2::CENTER_CENTER,
-                "×",
-                FontId::proportional(FONT + 2.0),
-                if hovered { TEXT } else { READ_ONLY.gamma_multiply(1.6) },
-            );
-            if clicked_value && on_clear {
-                edits.push(Edit::Prop(name.to_string(), Variant::Ref(Ref::none())));
-            }
-        }
-        if clicked_value && !on_clear {
-            if picking {
-                self.props.ref_pick = None;
-            } else {
-                self.props.ref_pick = Some(RefPick { prop: name.to_string(), owners: self.game.doc.selection.clone() });
-            }
-        }
     }
 
     fn value_label(p: &mut Painter, v: Rect, text: &str, color: Color32) {
@@ -1293,7 +1226,37 @@ impl Editor {
             Variant::Rect(rc) => {
                 let comps = [rc.min.x, rc.min.y, rc.max.x, rc.max.y];
                 let shown = if mixed { String::new() } else { value_text(&self.game.doc, &value) };
-                if let Some(t) = self.text_cell(p, name, v, &shown, ro, clicked_value && !ro) {
+                let has_9slice_btn = name == "SliceCenter" && !ro && v.width() > 36.0;
+                let (text_v, btn_clicked) = if has_9slice_btn {
+                    let btn_r = Rect::from_min_max(
+                        Pos2::new(v.max.x - 20.0, v.min.y + 1.0),
+                        Pos2::new(v.max.x - 1.0, v.max.y - 1.0),
+                    );
+                    let resp = p.ui.interact(btn_r, egui::Id::new(("slice_editor_btn", name)), Sense::click());
+                    let bg = if resp.hovered() {
+                        Color32::from_rgb(66, 70, 82)
+                    } else {
+                        Color32::from_rgb(48, 51, 60)
+                    };
+                    p.ui.painter().rect_filled(btn_r, 2.0, bg);
+                    p.ui.painter().text(
+                        btn_r.center(),
+                        egui::Align2::CENTER_CENTER,
+                        "…",
+                        FontId::proportional(FONT),
+                        TEXT,
+                    );
+                    let clicked = resp.on_hover_text("Open 9-Slice Editor").clicked();
+                    (Rect::from_min_max(v.min, Pos2::new(btn_r.min.x - 2.0, v.max.y)), clicked)
+                } else {
+                    (v, false)
+                };
+                if btn_clicked {
+                    if self.action_state("nine_slice_editor").1 != Some(true) {
+                        self.trigger_capability("nine_slice_editor");
+                    }
+                }
+                if let Some(t) = self.text_cell(p, name, text_v, &shown, ro, clicked_value && !btn_clicked && !ro) {
                     if let Some(nv) = parse_like(&value, &t) {
                         edits.push(Edit::Prop(name.to_string(), nv));
                     }
@@ -1508,10 +1471,74 @@ impl Editor {
                 }
             }
             Variant::Tags(_) | Variant::Attributes(_) => {}
-            // (Parent is moved in the Explorer, not set here.)
-            Variant::Ref(cur) if !ro && name != "Parent" => {
-                let cur = *cur;
-                self.ref_cell(p, name, cur, mixed, v, &resp, clicked_value, edits);
+            Variant::Ref(cur) => {
+                let picking_this = self.props.ref_pick.as_ref().is_some_and(|pk| pk.prop == name);
+                if picking_this {
+                    p.ui.painter().rect_filled(v, 2.0, Color32::from_rgb(26, 56, 118));
+                    p.ui.painter().rect_stroke(v, 2.0, egui::Stroke::new(1.0, Color32::from_rgb(90, 155, 255)), egui::StrokeKind::Inside);
+                }
+                let can_clear = !ro && name != "Parent" && (mixed || cur.is_some());
+                let (label_v, clear_clicked) = if can_clear && v.width() > 36.0 {
+                    let btn_r = Rect::from_min_max(
+                        Pos2::new(v.max.x - 18.0, v.min.y + 1.0),
+                        Pos2::new(v.max.x - 1.0, v.max.y - 1.0),
+                    );
+                    let cresp = p.ui.interact(btn_r, egui::Id::new(("ref_clear", name)), Sense::click());
+                    let fg = if cresp.hovered() { Color32::WHITE } else { READ_ONLY };
+                    p.ui.painter().text(
+                        btn_r.center(),
+                        egui::Align2::CENTER_CENTER,
+                        "×",
+                        FontId::proportional(FONT),
+                        fg,
+                    );
+                    let clicked = cresp.on_hover_text("Clear reference (set to nil)").clicked();
+                    (Rect::from_min_max(v.min, Pos2::new(btn_r.min.x - 2.0, v.max.y)), clicked)
+                } else {
+                    (v, false)
+                };
+                if clear_clicked {
+                    if picking_this {
+                        self.props.ref_pick = None;
+                    }
+                    edits.push(Edit::Prop(name.to_string(), Variant::Ref(Ref::none())));
+                } else {
+                    let expected = expected_ref_class(class, name);
+                    let label = if picking_this {
+                        format!("Pick {expected}…")
+                    } else if mixed {
+                        String::new()
+                    } else {
+                        value_text(&self.game.doc, &value)
+                    };
+                    let text_col = if picking_this {
+                        Color32::from_rgb(180, 215, 255)
+                    } else {
+                        color
+                    };
+                    Self::value_label(p, label_v, &label, text_col);
+                    if !ro && clicked_value {
+                        if picking_this {
+                            self.props.ref_pick = None;
+                        } else {
+                            self.props.ref_pick = Some(RefPick {
+                                prop: name.to_string(),
+                                targets: sel.to_vec(),
+                                expected_class: expected,
+                            });
+                        }
+                    }
+                    if picking_this {
+                        if p.ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+                            self.props.ref_pick = None;
+                        } else if name != "Parent"
+                            && p.ui.input(|i| i.key_pressed(egui::Key::Backspace) || i.key_pressed(egui::Key::Delete))
+                        {
+                            self.props.ref_pick = None;
+                            edits.push(Edit::Prop(name.to_string(), Variant::Ref(Ref::none())));
+                        }
+                    }
+                }
             }
             other if !ro && number_of(other).is_some() && crate::prop_slider::spec_for(class, name).is_some() => {
                 let spec = crate::prop_slider::spec_for(class, name).unwrap_or(crate::prop_slider::SliderSpec { min: 0.0, max: 1.0, ticks: 20.0, square: false });
@@ -1965,9 +1992,66 @@ impl Editor {
         }
     }
 
+    /// Whether `candidate` can be assigned to the currently active `Variant::Ref` picker.
+    pub fn ref_pick_accepts(&self, candidate: Ref) -> bool {
+        let Some(pick) = self.props.ref_pick.as_ref() else {
+            return false;
+        };
+        let Some(class) = self.game.doc.class_of(candidate) else {
+            return false;
+        };
+        if !doc::is_a(&class, &pick.expected_class) {
+            return false;
+        }
+        if pick.prop == "Parent" {
+            // Reject reparenting an instance into itself or any of its descendants.
+            if pick.targets.iter().any(|&t| t == candidate || self.game.doc.is_ancestor(t, candidate)) {
+                return false;
+            }
+        }
+        true
+    }
+
+    /// Completes the active `Variant::Ref` picker with `picked`, keeping selection intact.
+    pub fn commit_ref_pick(&mut self, picked: Ref) -> bool {
+        if !self.ref_pick_accepts(picked) {
+            return false;
+        }
+        let Some(pick) = self.props.ref_pick.take() else {
+            return false;
+        };
+        if pick.prop == "Parent" {
+            let n = self.game.doc.reparent(&pick.targets, picked);
+            if n > 0 {
+                self.explorer.expanded.insert(picked);
+            }
+            return n > 0;
+        }
+        let changes: Vec<_> = pick
+            .targets
+            .iter()
+            .copied()
+            .filter(|r| self.game.doc.class_of(*r).is_some_and(|c| has_prop(&c, &pick.prop)))
+            .map(|r| (r, ustr(&pick.prop), Variant::Ref(picked)))
+            .collect();
+        if !changes.is_empty() {
+            self.game.doc.set_props(&format!("Set {}", pick.prop), changes, None);
+            true
+        } else {
+            false
+        }
+    }
+
     fn apply_prop_edits(&mut self, sel: &[Ref], first: Ref, edits: Vec<Edit>) {
         for e in edits {
             match e {
+                Edit::Prop(name, Variant::Ref(target)) if name == "Parent" => {
+                    if target.is_some()
+                        && !sel.iter().any(|&t| t == target || self.game.doc.is_ancestor(t, target))
+                    {
+                        self.game.doc.reparent(sel, target);
+                    }
+                }
                 Edit::Prop(name, v) if name == "Name" => {
                     if let Variant::String(n) = v {
                         let n = n.trim().to_string();
@@ -1996,6 +2080,24 @@ impl Editor {
                         .copied()
                         .filter(|r| self.game.doc.class_of(*r).is_some_and(|c| doc::is_a(&c, "BaseScript")))
                         .flat_map(|r| [(r, ustr("Enabled"), Variant::Bool(on)), (r, ustr("Disabled"), Variant::Bool(!on))])
+                        .collect();
+                    self.game.doc.set_props("Set Enabled", changes, None);
+                }
+                // A WeldConstraint's Enabled box keeps `State` bit 0 in sync so
+                // saving and Team Create replication persist the enabled flag.
+                Edit::Prop(name, Variant::Bool(on)) if name == "Enabled" && self.game.doc.class_of(first).as_deref() == Some("WeldConstraint") => {
+                    let changes = sel
+                        .iter()
+                        .copied()
+                        .filter(|r| self.game.doc.class_of(*r).as_deref() == Some("WeldConstraint"))
+                        .flat_map(|r| {
+                            let prev = match self.game.doc.prop(r, "State") {
+                                Some(Variant::Int32(s)) => s,
+                                _ => 3,
+                            };
+                            let next = if on { prev | 1 } else { prev & !1 };
+                            [(r, ustr("Enabled"), Variant::Bool(on)), (r, ustr("State"), Variant::Int32(next))]
+                        })
                         .collect();
                     self.game.doc.set_props("Set Enabled", changes, None);
                 }
@@ -2353,14 +2455,10 @@ fn is_non_default(class: &str, name: &str, value: &Variant, ro: bool) -> bool {
     if name == "Name" {
         return matches!(value, Variant::String(s) if s != class);
     }
-    let db = doc::db();
-    let Some(desc) = db.classes.get(class) else {
+    let Some(def) = doc::class_default(class, name) else {
         return false;
     };
-    let Some(def) = db.superclasses_iter(desc).find_map(|c| c.default_properties.get(name)) else {
-        return false;
-    };
-    !variant_eq(value, def)
+    !variant_eq(value, &def)
 }
 
 /// A property with no stored value and no default in the reflection
@@ -2529,9 +2627,10 @@ fn parse_like(old: &Variant, raw: &str) -> Option<Variant> {
             ))
         }
         // Studio NumberRangePropertyItem:
-        // "min, max" (or "min max") or single number "v" -> (v, v).
+        // "min, max" (or "min max" / "(min, max)") or single number "v" -> (v, v).
         Variant::NumberRange(_) => {
-            let nums: Vec<f32> = t
+            let trimmed = t.trim().trim_matches(|c| c == '(' || c == ')');
+            let nums: Vec<f32> = trimmed
                 .split(|c: char| c == ',' || c.is_whitespace())
                 .filter(|x| !x.is_empty())
                 .map(|x| x.parse::<f32>().ok())
@@ -2651,6 +2750,8 @@ mod tests {
         let Some(Variant::NumberRange(nr)) = super::parse_like(&nr_old, "10, 3") else { panic!() };
         assert_eq!((nr.min, nr.max), (3.0, 10.0));
         assert_eq!(super::value_text(&doc, &Variant::NumberRange(nr)), "3, 10");
+        let Some(Variant::NumberRange(nr)) = super::parse_like(&nr_old, "(2, 8)") else { panic!() };
+        assert_eq!((nr.min, nr.max), (2.0, 8.0));
 
         // NumberSequence 
         let ns_old = Variant::NumberSequence(NumberSequence { keypoints: vec![] });
@@ -2760,5 +2861,15 @@ mod tests {
         assert_eq!(super::fmt_num(100000.0), "100000");
         assert_eq!(super::fmt_num(-0.0001), "0");
         assert_eq!(super::fmt_v3(glam::Vec3::new(4.0, 1.2, 2.0)), "4, 1.2, 2");
+    }
+
+    #[test]
+    fn expected_ref_class_reads_api_dump() {
+        assert_eq!(super::expected_ref_class("Part", "Parent"), "Instance");
+        if rustudio_core::api::get().is_some() {
+            assert_eq!(super::expected_ref_class("WeldConstraint", "Part0"), "BasePart");
+            assert_eq!(super::expected_ref_class("Beam", "Attachment0"), "Attachment");
+            assert_eq!(super::expected_ref_class("Model", "PrimaryPart"), "BasePart");
+        }
     }
 }

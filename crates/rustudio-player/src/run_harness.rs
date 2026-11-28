@@ -83,6 +83,9 @@ pub struct HarnessInput {
     pub pointer: Option<egui::Pos2>,
     /// `--shift S:HOLD`: Shift held (egui reports it as a modifier, not a key).
     pub shift: bool,
+    /// Modifiers held through a `--ldrag alt+…` / `alt+shift+…` (mouse-as-touch's
+    /// pinch and two-finger pan).
+    pub mods: egui::Modifiers,
 }
 
 /// The process's exit code once a harness run finished (finish_run).
@@ -617,6 +620,8 @@ pub enum HarnessAction {
     /// frames, as a real click arrives (egui widgets need the hover first).
     UiPointer(f32, f32),
     UiButton(f32, f32, bool),
+    /// Modifiers held from now on (`--ldrag alt+…`).
+    Mods(egui::Modifiers),
 }
 
 pub fn parse_harness_key(spec: &str) -> Option<(egui::Key, egui::Modifiers)> {
@@ -794,6 +799,14 @@ impl HarnessAction {
     }
 
     pub fn parse_ldrag(s: &str) -> Option<Vec<(f32, HarnessAction)>> {
+        // (alt+ / alt+shift+: the modifiers held through the drag)
+        let (mods, s) = if let Some(rest) = s.strip_prefix("alt+shift+") {
+            (egui::Modifiers { alt: true, shift: true, ..Default::default() }, rest)
+        } else if let Some(rest) = s.strip_prefix("alt+") {
+            (egui::Modifiers { alt: true, ..Default::default() }, rest)
+        } else {
+            (egui::Modifiers::NONE, s)
+        };
         let (what, at) = s.split_once('@')?;
         let at: f32 = at.trim().parse().ok()?;
         let (a, b) = what.split_once('>')?;
@@ -808,6 +821,10 @@ impl HarnessAction {
             v.push((at + 0.05 * k as f32, HarnessAction::PointerAt(x1 + (x2 - x1) * f, y1 + (y2 - y1) * f)));
         }
         v.push((at + 0.6, HarnessAction::LeftButton(x2, y2, false)));
+        if mods != egui::Modifiers::NONE {
+            v.insert(0, (at - 0.25, HarnessAction::Mods(mods)));
+            v.push((at + 0.7, HarnessAction::Mods(egui::Modifiers::NONE)));
+        }
         Some(v)
     }
 
@@ -843,7 +860,9 @@ impl HarnessAction {
 
 impl HarnessInput {
     /// Timed harness input, injected like real events.
-    pub fn inject(&mut self, view: egui::Rect, locked: bool, now: Option<f32>, raw: &mut egui::RawInput, mut ui_action: impl FnMut(String, &mut egui::RawInput)) {
+    /// `view_scale`: window points per view unit (a simulated device's
+    /// scale: --click X,Y are then the device screen's points).
+    pub fn inject(&mut self, view: egui::Rect, view_scale: f32, locked: bool, now: Option<f32>, raw: &mut egui::RawInput, mut ui_action: impl FnMut(String, &mut egui::RawInput)) {
         let Some(t) = now else { return };
         // No 3D view yet (the start page): clicks are window coordinates.
         let vp = if view.is_finite() {
@@ -877,7 +896,7 @@ impl HarnessInput {
             match a {
                 HarnessAction::Luau(..) | HarnessAction::LuauCore(..) => {}
                 HarnessAction::Click(x, y) => {
-                    let p = if locked { held_at } else { vp.min + egui::vec2(x, y) };
+                    let p = if locked { held_at } else { vp.min + egui::vec2(x, y) * view_scale };
                     if !locked {
                         raw.events.push(egui::Event::PointerMoved(p));
                     }
@@ -930,7 +949,7 @@ impl HarnessInput {
                 }
                 HarnessAction::Paste(text) => raw.events.push(egui::Event::Paste(text)),
                 HarnessAction::Wheel(n, at) => {
-                    let p = at.map_or(vp.center(), |(x, y)| vp.min + egui::vec2(x, y));
+                    let p = at.map_or(vp.center(), |(x, y)| vp.min + egui::vec2(x, y) * view_scale);
                     raw.events.push(egui::Event::PointerMoved(p));
                     raw.events.push(egui::Event::MouseWheel {
                         unit: egui::MouseWheelUnit::Line,
@@ -941,6 +960,10 @@ impl HarnessInput {
                 }
                 HarnessAction::Text(text) => raw.events.push(egui::Event::Text(text)),
                 HarnessAction::Shift(on) => self.shift = on,
+                HarnessAction::Mods(m) => {
+                    self.mods = m;
+                    raw.events.push(egui::Event::ModifiersChanged(m));
+                }
                 HarnessAction::RightButton(pressed) => {
                     let p = if locked { held_at } else { vp.center() };
                     if !locked {
@@ -955,11 +978,11 @@ impl HarnessInput {
                 }
                 HarnessAction::PointerAt(x, y) => {
                     if !locked {
-                        raw.events.push(egui::Event::PointerMoved(vp.min + egui::vec2(x, y)));
+                        raw.events.push(egui::Event::PointerMoved(vp.min + egui::vec2(x, y) * view_scale));
                     }
                 }
                 HarnessAction::LeftButton(x, y, pressed) => {
-                    let p = if locked { held_at } else { vp.min + egui::vec2(x, y) };
+                    let p = if locked { held_at } else { vp.min + egui::vec2(x, y) * view_scale };
                     if !locked {
                         raw.events.push(egui::Event::PointerMoved(p));
                     }

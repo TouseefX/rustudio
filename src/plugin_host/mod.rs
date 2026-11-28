@@ -30,8 +30,10 @@
 
 pub mod api;
 pub mod builtin_lazy;
+pub mod builtin_suite;
 pub mod edit_sync;
 mod glue;
+pub mod native;
 pub mod widgets_ui;
 pub mod permissions;
 pub mod prompts;
@@ -184,6 +186,7 @@ pub struct PluginHost {
     play_ui: SharedPlayUi,
     deferred_rev: u64,
     pending_triggers: Vec<PendingTrigger>,
+    native: native::NativePluginHost,
 }
 
 #[derive(Default)]
@@ -232,6 +235,7 @@ impl Default for PluginHost {
             play_ui: Default::default(),
             deferred_rev: 0,
             pending_triggers: Vec::new(),
+            native: Default::default(),
         }
     }
 }
@@ -490,8 +494,11 @@ impl PluginHost {
             });
             self.deferred_rev = self.deferred_rev.wrapping_add(1);
         }
-        if self.enabled && choices.plugins_enabled {
-            let _ = self.load_builtins_with_choices(choices);
+        if self.enabled {
+            let _ = self.load_bundled_suite();
+            if choices.plugins_enabled {
+                let _ = self.load_builtins_with_choices(choices);
+            }
         }
     }
 
@@ -506,7 +513,8 @@ impl PluginHost {
     }
 
     pub fn loaded(&self) -> Vec<PluginInfo> {
-        self.specs
+        let mut out: Vec<PluginInfo> = self
+            .specs
             .iter()
             .map(|s| PluginInfo {
                 id: s.id,
@@ -515,27 +523,201 @@ impl PluginHost {
                 running: s.running,
                 errors: s.errors.clone(),
             })
-            .collect()
+            .collect();
+        out.extend(self.native.loaded_info());
+        out
     }
 
     /// `--result`'s "plugins": each plugin's name, source, whether it runs,
-    /// and its load / script errors.
+    /// and its load / script errors (covering both Luau and modular native
+    /// Rust plugins).
     pub fn result_json(&self) -> serde_json::Value {
-        serde_json::Value::Array(
-            self.specs
-                .iter()
-                .map(|s| {
-                    serde_json::json!({
-                        "id": s.id.0,
-                        "name": s.name,
-                        "source": s.source.path().map(|p| p.display().to_string()),
-                        "running": s.running,
-                        "deferred": s.deferred.is_some(),
-                        "errors": s.errors,
-                    })
+        let mut out: Vec<serde_json::Value> = self
+            .specs
+            .iter()
+            .map(|s| {
+                serde_json::json!({
+                    "id": s.id.0,
+                    "name": s.name,
+                    "source": s.source.path().map(|p| p.display().to_string()),
+                    "running": s.running,
+                    "deferred": s.deferred.is_some(),
+                    "errors": s.errors,
                 })
-                .collect(),
-        )
+            })
+            .collect();
+        for p in self.native.loaded() {
+            out.push(serde_json::json!({
+                "id": p.id.0,
+                "name": p.meta.id,
+                "source": format!("native:{}", p.meta.id),
+                "kind": "native",
+                "running": true,
+                "deferred": false,
+                "widget_open": p.widget_open,
+                "errors": serde_json::Value::Array(Vec::new()),
+            }));
+        }
+        serde_json::Value::Array(out)
+    }
+
+    /// Loads every bundled RusTudio Luau plugin in `dir` that isn't disabled in
+    /// the Built-in Suite preferences.
+    pub fn load_bundled_dir(&mut self, dir: &std::path::Path) -> Vec<Result<PluginId, String>> {
+        match source::bundled_dir_order(dir) {
+            Ok(list) => {
+                let mut out = Vec::new();
+                for src in list {
+                    if !self.native.is_suite_disabled(&src.plugin_name()) {
+                        out.push(self.load(src));
+                    }
+                }
+                out
+            }
+            Err(e) => {
+                self.log.push((Level::Error, format!("Bundled plugins folder: {e}")));
+                vec![Err(e)]
+            }
+        }
+    }
+
+    /// Loads RusTudio's bundled Luau plugin suite from `rustudio_suite_plugins_dir()`
+    /// if the directory exists.
+    pub fn load_bundled_suite(&mut self) -> Vec<Result<PluginId, String>> {
+        if !self.enabled {
+            return Vec::new();
+        }
+        let Some(dir) = source::rustudio_suite_plugins_dir() else {
+            return Vec::new();
+        };
+        self.load_bundled_dir(&dir)
+    }
+
+    /// Snapshot of all discovered bundled Luau plugins in `rustudio_suite_plugins_dir()`,
+    /// paired with their live host state (used by Manage Plugins → Built-in Suite).
+    pub fn bundled_suite_entries(&self) -> Vec<(String, String, std::path::PathBuf, bool, Vec<String>)> {
+        let Some(dir) = source::rustudio_suite_plugins_dir() else {
+            return Vec::new();
+        };
+        let Ok(sources) = source::bundled_dir_order(&dir) else {
+            return Vec::new();
+        };
+        sources
+            .into_iter()
+            .filter_map(|src| {
+                let path = src.path()?.to_path_buf();
+                let plugin_id = src.plugin_name();
+                let display = plugin_id
+                    .strip_prefix("rustudio_")
+                    .unwrap_or(&plugin_id)
+                    .to_string();
+                let live = self
+                    .specs
+                    .iter()
+                    .find(|s| s.source.is_bundled() && s.source.path() == Some(path.as_path()));
+                let enabled = live.is_some() && !self.native.is_suite_disabled(&plugin_id);
+                let errors = live.map(|s| s.errors.clone()).unwrap_or_default();
+                Some((plugin_id, display, path, enabled, errors))
+            })
+            .collect()
+    }
+
+    /// Enables or disables a bundled Luau plugin live (loading or unloading it
+    /// immediately and persisting the preference).
+    pub fn set_bundled_enabled(&mut self, path: &std::path::Path, on: bool) {
+        let src = PluginSource::Bundled(path.to_path_buf());
+        let id_str = src.plugin_name();
+        self.native.set_suite_enabled_pref(&id_str, on);
+        let existing = self
+            .specs
+            .iter()
+            .find(|s| s.source.is_bundled() && s.source.path() == Some(path))
+            .map(|s| s.id);
+        if on {
+            if existing.is_none() && self.enabled {
+                let _ = self.load(src);
+            }
+        } else if let Some(pid) = existing {
+            self.unload(pid);
+        }
+    }
+
+    /// Hot-reloads a bundled Luau plugin from disk.
+    pub fn reload_bundled(&mut self, path: &std::path::Path) {
+        if let Some(pid) = self
+            .specs
+            .iter()
+            .find(|s| s.source.is_bundled() && s.source.path() == Some(path))
+            .map(|s| s.id)
+        {
+            self.reload(pid);
+        } else if self.enabled {
+            let _ = self.load(PluginSource::Bundled(path.to_path_buf()));
+        }
+    }
+
+    /// Allocates a unique [`PluginId`] in this host's id space.
+    pub fn alloc_id(&mut self) -> PluginId {
+        let id = PluginId(self.next);
+        self.next += 1;
+        id
+    }
+
+    /// Modular native Rust plugins hosted inside this `PluginHost`.
+    pub fn native(&self) -> &native::NativePluginHost {
+        &self.native
+    }
+
+    pub fn native_mut(&mut self) -> &mut native::NativePluginHost {
+        &mut self.native
+    }
+
+    /// Registers a modular native Rust plugin factory in this host.
+    pub fn register_native_factory(&mut self, entry: native::NativePluginEntry) {
+        self.native.register_factory(entry);
+    }
+
+    /// Loads a registered modular native Rust plugin by its stable `native_id`.
+    pub fn load_native(&mut self, native_id: &str) -> Result<PluginId, String> {
+        let next = &mut self.next;
+        self.native.load(native_id, || {
+            let id = PluginId(*next);
+            *next += 1;
+            id
+        })
+    }
+
+    /// Unloads a running modular native Rust plugin by its stable `native_id`.
+    pub fn unload_native(&mut self, native_id: &str, ctx: Option<&mut native::NativeHostCtx<'_>>) -> bool {
+        self.native.unload(native_id, ctx)
+    }
+
+    /// Synchronizes loaded native Rust built-in plugins against `choices`.
+    pub fn sync_native_builtins(
+        &mut self,
+        choices: rustudio_core::rustudio_settings::BuiltinToolChoices,
+        ctx: Option<&mut native::NativeHostCtx<'_>>,
+    ) {
+        let next = &mut self.next;
+        self.native.sync_builtin_choices(
+            choices,
+            || {
+                let id = PluginId(*next);
+                *next += 1;
+                id
+            },
+            ctx,
+        );
+    }
+
+    /// Typed read access to a loaded native plugin.
+    pub fn native_plugin<T: native::NativePlugin>(&self, native_id: &str) -> Option<&T> {
+        self.native.get::<T>(native_id)
+    }
+
+    /// Typed mutable access to a loaded native plugin.
+    pub fn native_plugin_mut<T: native::NativePlugin>(&mut self, native_id: &str) -> Option<&mut T> {
+        self.native.get_mut::<T>(native_id)
     }
 
     /// Edit-DataModel ribbon / shortcuts model combining running plugins with

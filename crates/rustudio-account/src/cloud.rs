@@ -28,6 +28,10 @@ pub struct Endpoints {
     pub groups: String,
     pub thumbnails: String,
     pub assetdelivery: String,
+    pub voice: String,
+    pub publish: String,
+    pub economy: String,
+    pub badges: String,
 }
 
 impl Default for Endpoints {
@@ -39,6 +43,10 @@ impl Default for Endpoints {
             groups: "https://groups.roblox.com".into(),
             thumbnails: "https://thumbnails.roblox.com".into(),
             assetdelivery: "https://assetdelivery.roblox.com".into(),
+            voice: "https://voice.roblox.com".into(),
+            publish: "https://publish.roblox.com".into(),
+            economy: "https://economy.roblox.com".into(),
+            badges: "https://badges.roblox.com".into(),
         }
     }
 }
@@ -54,6 +62,10 @@ impl Endpoints {
             groups: h("groups"),
             thumbnails: h("thumbnails"),
             assetdelivery: h("assetdelivery"),
+            voice: h("voice"),
+            publish: h("publish"),
+            economy: h("economy"),
+            badges: h("badges"),
         }
     }
 }
@@ -273,12 +285,12 @@ pub struct CloudApi {
     pub ep: Endpoints,
 }
 
-fn json(text: &str) -> Option<serde_json::Value> {
+pub(crate) fn json(text: &str) -> Option<serde_json::Value> {
     serde_json::from_str(text).ok()
 }
 
 /// Roblox's error message in a reply body, if it has one.
-fn error_message(text: &str) -> Option<String> {
+pub(crate) fn error_message(text: &str) -> Option<String> {
     let v = json(text)?;
     v.pointer("/errors/0/message")
         .or_else(|| v.get("message"))
@@ -413,7 +425,7 @@ impl CloudApi {
         CloudApi { session, ep }
     }
 
-    fn get_json(&self, url: &str, what: &str) -> Result<serde_json::Value> {
+    pub(crate) fn get_json(&self, url: &str, what: &str) -> Result<serde_json::Value> {
         // A 429 (rate limited) is retried after 1, 2 and 4 s: the Start Page
         // asks for many group lists at once.
         let mut wait = 1;

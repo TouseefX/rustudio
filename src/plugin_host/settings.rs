@@ -9,11 +9,14 @@
 //! ("Grass"), anything else (an Instance, a function) as its type name.
 //! GetSetting of a missing key is nil.
 //!
-//! The files live under rustudio's own data folder (paths::data()/
-//! plugin-data; RUSTUDIO_PLUGIN_DATA moves it, for tests), never in a
-//! Studio or Vinegar folder.
+//! The files live under rustudio's plugin store root (`<data>/rustudio`,
+//! matching `plugin_store::default_root()`; `RUSTUDIO_PLUGIN_DATA` moves it,
+//! for tests), never in a Studio or Vinegar folder. Legacy files written
+//! under `<data>/plugin-data` are still read as a fallback if no file exists
+//! at the store root yet.
 
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 
 use mlua::{Lua, Value};
@@ -27,12 +30,29 @@ pub use rustudio_engine::runtime::domains::plugin_api::{set_user_id, user_id};
 /// Serializes reads and writes of the settings files (the edit and Play
 /// VMs share them).
 static LOCK: Mutex<()> = Mutex::new(());
+static TMP_SEQ: AtomicU64 = AtomicU64::new(0);
 
 pub fn data_root() -> PathBuf {
     match std::env::var_os("RUSTUDIO_PLUGIN_DATA") {
         Some(p) if !p.is_empty() => PathBuf::from(p),
-        _ => rustudio_core::paths::data().join("plugin-data"),
+        _ => crate::plugin_store::default_root(),
     }
+}
+
+fn legacy_file(key: &str) -> Option<PathBuf> {
+    if std::env::var_os("RUSTUDIO_PLUGIN_DATA").is_some_and(|p| !p.is_empty())
+        || std::env::var_os("RUSTUDIO_PLUGIN_ROOT").is_some_and(|p| !p.is_empty())
+    {
+        return None;
+    }
+    Some(
+        rustudio_core::paths::data()
+            .join("plugin-data")
+            .join(user_id().to_string())
+            .join("InstalledPlugins")
+            .join(key)
+            .join("settings.json"),
+    )
 }
 
 pub fn file(key: &str) -> PathBuf {
@@ -43,15 +63,48 @@ pub fn file(key: &str) -> PathBuf {
         .join("settings.json")
 }
 
+fn read_json_map(path: &std::path::Path) -> Option<Map<String, Json>> {
+    for attempt in 0..2 {
+        match std::fs::read(path) {
+            Ok(bytes) => match serde_json::from_slice::<Json>(&bytes) {
+                Ok(Json::Object(m)) => return Some(m),
+                Ok(_) => {
+                    log::warn!("plugin settings file {} is not a JSON object", path.display());
+                    return None;
+                }
+                Err(err) if attempt == 0 => {
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                    let _ = err;
+                }
+                Err(err) => {
+                    log::warn!("could not parse plugin settings {}: {err}", path.display());
+                    return None;
+                }
+            },
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return None,
+            Err(_) if attempt == 0 => std::thread::sleep(std::time::Duration::from_millis(10)),
+            Err(err) => {
+                log::warn!("could not read plugin settings {}: {err}", path.display());
+                return None;
+            }
+        }
+    }
+    None
+}
+
 fn read_all(key: &str) -> Map<String, Json> {
-    std::fs::read(file(key))
-        .ok()
-        .and_then(|b| serde_json::from_slice::<Json>(&b).ok())
-        .and_then(|v| match v {
-            Json::Object(m) => Some(m),
-            _ => None,
-        })
-        .unwrap_or_default()
+    let path = file(key);
+    if let Some(m) = read_json_map(&path) {
+        return m;
+    }
+    if !path.exists() {
+        if let Some(old) = legacy_file(key) {
+            if let Some(m) = read_json_map(&old) {
+                return m;
+            }
+        }
+    }
+    Map::new()
 }
 
 pub fn get(key: &str, name: &str) -> Option<Json> {
@@ -59,7 +112,7 @@ pub fn get(key: &str, name: &str) -> Option<Json> {
     read_all(key).remove(name)
 }
 
-/// Sets (or with None removes) one setting and writes the file.
+/// Sets (or with None removes) one setting and writes the file atomically.
 pub fn set(key: &str, name: &str, value: Option<Json>) -> Result<(), String> {
     let _g = LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let mut all = read_all(key);
@@ -72,11 +125,26 @@ pub fn set(key: &str, name: &str, value: Option<Json>) -> Result<(), String> {
         }
     }
     let path = file(key);
-    if let Some(dir) = path.parent() {
-        std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
-    }
+    let dir = path.parent().ok_or_else(|| format!("no parent for {}", path.display()))?;
+    std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
     let text = studio_json(&Json::Object(all), true);
-    std::fs::write(&path, text).map_err(|e| format!("{}: {e}", path.display()))
+    let seq = TMP_SEQ.fetch_add(1, Ordering::Relaxed);
+    let tmp = dir.join(format!(".settings.{}.{seq}.tmp", std::process::id()));
+    std::fs::write(&tmp, text).map_err(|e| format!("{}: {e}", tmp.display()))?;
+    let mut last_err = None;
+    for attempt in 0..3 {
+        match std::fs::rename(&tmp, &path) {
+            Ok(()) => return Ok(()),
+            Err(e) => {
+                last_err = Some(e);
+                if attempt < 2 {
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+            }
+        }
+    }
+    let _ = std::fs::remove_file(&tmp);
+    Err(format!("{}: {}", path.display(), last_err.unwrap()))
 }
 
 /// Studio's own layout for the file: `{ "a":1, "t":{  "x":[ true,"y" ] } }`.
@@ -149,7 +217,7 @@ pub fn to_json(lua: &Lua, v: &Value, depth: usize) -> Option<Json> {
                         other => lua_tostring(lua, other),
                     };
                     if let Some(j) = to_json(lua, &v, depth + 1) {
-                        m.insert(key.replace('.', "_"), j);
+                        m.insert(key, j);
                     }
                 }
                 Json::Object(m)
@@ -218,5 +286,13 @@ mod tests {
     fn studio_layout() {
         let v: Json = serde_json::from_str(r#"{"a":1,"t":{"x":[true,"y"],"e":[]}}"#).unwrap();
         assert_eq!(studio_json(&v, true), r#"{ "a":1, "t":{  "x":[ true,"y" ], "e":[  ] } }"#);
+    }
+
+    #[test]
+    fn nested_table_keys_preserve_dots() {
+        let lua = Lua::new();
+        let v: Value = lua.load(r#"return { ["user_Plugin.rbxm"] = { ["1.2.3"] = true } }"#).eval().unwrap();
+        let j = to_json(&lua, &v, 0).unwrap();
+        assert_eq!(j["user_Plugin.rbxm"]["1.2.3"], Json::Bool(true));
     }
 }

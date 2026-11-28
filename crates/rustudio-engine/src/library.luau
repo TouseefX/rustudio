@@ -1166,32 +1166,87 @@ function __rs_input_event(state, uit, key, x, y, z, dx, dy, gpe)
     end
     return sunk
 end
-function __rs_input_frame_end() mouse_delta = Vector2.zero end
--- Fingers (UserInputType.Touch; touch screens, src/play_game.rs "Fingers
--- in Play"): one InputObject per finger for its life, as Roblox's (the
--- PlayerModule keys tables by them), its Position the finger's in GUI
--- coordinates and its Delta the motion since its last event. The engine
--- asks for it for the GUI's InputBegan / InputChanged / InputEnded first,
--- then calls __rs_touch_event for the finger's event: the bound actions
--- (ContextActionService, Enum.UserInputType.Touch bindings; not for a
--- finger the GUI took), then UserInputService's InputBegan / InputChanged
--- / InputEnded and TouchStarted / TouchMoved / TouchEnded, with
--- gameProcessedEvent. `began_on` lists the GuiButtons under the finger
--- when it landed (the input action system's UIButton / UIModifier,
--- domains/gui_input.luau).
+-- Mouse-as-touch on a simulated phone or tablet (crates/rustudio-player/src/touch.rs):
+-- one InputObject per finger for its whole life, shared by the GUI's and
+-- UserInputService's events (the PlayerModule's thumbstick keeps the one
+-- its frame's InputBegan gave it and watches TouchMoved / TouchEnded for it).
 local touch_objects = {}
-function __rs_touch_object(finger, state, x, y, dx, dy)
-    local io = touch_objects[finger]
+local touch_done = {}
+function __rs_touch_object(id, state, x, y, dx, dy)
+    local io = touch_objects[id]
     if not io then
         io = new_input_object({ UserInputType = Enum.UserInputType.Touch, KeyCode = keycode_unknown })
-        touch_objects[finger] = io
+        touch_objects[id] = io
     end
-    io.UserInputState = Enum.UserInputState[state]
-    io.Position = Vector3.new(x, y, 0)
-    io.Delta = Vector3.new(dx, dy, 0)
+    if state then io.UserInputState = Enum.UserInputState[state] end
+    if x then io.Position = Vector3.new(x, y, 0) end
+    if dx then io.Delta = Vector3.new(dx, dy, 0) end
     return io
 end
-function __rs_touch_event(state, finger, x, y, dx, dy, gpe, began_on)
+local function v2_list(flat)
+    local out = {}
+    for i = 1, #flat, 2 do table.insert(out, Vector2.new(flat[i], flat[i + 1])) end
+    return out
+end
+local GESTURE = { Begin = "Begin", Change = "Change", End = "End" }
+-- kind: Began / Moved / Ended (a finger), or a gesture: Tap, LongPress, Pan,
+-- Swipe, Pinch, Rotate (Roblox's UserInputService signatures).
+function __rs_touch_event(kind, id, x, y, dx, dy, gpe, a, b, c, d)
+    local uis = game:GetService("UserInputService")
+    gpe = gpe or false
+    if kind == "Began" or kind == "Moved" or kind == "Ended" then
+        local state = kind == "Began" and "Begin" or kind == "Moved" and "Change" or "End"
+        local io = __rs_touch_object(id, state, x, y, dx, dy)
+        if last_input() ~= "Touch" then
+            last_input_type = "Touch"
+            fire(uis, "LastInputTypeChanged", Enum.UserInputType.Touch)
+        end
+        if not gpe then run_actions(io, io.UserInputState) end
+        fire(uis, kind == "Began" and "InputBegan" or kind == "Moved" and "InputChanged" or "InputEnded", io, gpe)
+        fire(uis, kind == "Began" and "TouchStarted" or kind == "Moved" and "TouchMoved" or "TouchEnded", io, gpe)
+        if kind == "Ended" then table.insert(touch_done, id) end
+    elseif kind == "Tap" then
+        local positions = v2_list(a)
+        fire(uis, "TouchTap", positions, gpe)
+        if positions[1] then fire(uis, "TouchTapInWorld", positions[1], gpe) end
+    elseif kind == "LongPress" then
+        fire(uis, "TouchLongPress", v2_list(a), Enum.UserInputState[GESTURE[b]], gpe)
+    elseif kind == "Pan" then
+        fire(uis, "TouchPan", v2_list(a), Vector2.new(b[1], b[2]), Vector2.new(c[1], c[2]), Enum.UserInputState[GESTURE[d]], gpe)
+    elseif kind == "Swipe" then
+        fire(uis, "TouchSwipe", Enum.SwipeDirection[a], b, gpe)
+    elseif kind == "Pinch" then
+        fire(uis, "TouchPinch", v2_list(a), b, c, Enum.UserInputState[GESTURE[d]], gpe)
+    elseif kind == "Rotate" then
+        fire(uis, "TouchRotate", v2_list(a), b, c, Enum.UserInputState[GESTURE[d]], gpe)
+    end
+end
+-- (a lifted finger's object goes once the frame's GUI events had it)
+local function drop_done_touches()
+    for _, id in touch_done do touch_objects[id] = nil end
+    table.clear(touch_done)
+end
+function __rs_input_frame_end()
+    mouse_delta = Vector2.zero
+    drop_done_touches()
+end
+-- Fingers of a touch screen (UserInputType.Touch; src/play_game.rs "Fingers
+-- in Play"), the second way a finger reaches the scripts, next to the
+-- simulated device's mouse-as-touch above: one InputObject per finger for
+-- its life, as Roblox's (the PlayerModule keys tables by them) — the same
+-- objects, `__rs_touch_object`, so the GUI's InputBegan / InputChanged /
+-- InputEnded (the engine asks for the object first) and UserInputService's
+-- events carry one object per finger whichever way it came. Its Position
+-- is the finger's in GUI coordinates and its Delta the motion since its
+-- last event. Then __rs_finger_event for the finger's event: the bound
+-- actions (ContextActionService, Enum.UserInputType.Touch bindings; not
+-- for a finger the GUI took), then UserInputService's InputBegan /
+-- InputChanged / InputEnded and TouchStarted / TouchMoved / TouchEnded,
+-- with gameProcessedEvent. `began_on` lists the GuiButtons under the
+-- finger when it landed (the input action system's UIButton / UIModifier,
+-- domains/gui_input.luau). A lifted finger's object goes at the frame's
+-- end with the simulated ones (`touch_done`).
+function __rs_finger_event(state, finger, x, y, dx, dy, gpe, began_on)
     local io = __rs_touch_object(finger, state, x, y, dx, dy)
     local uis = game:GetService("UserInputService")
     local sunk = false
@@ -1207,7 +1262,7 @@ function __rs_touch_event(state, finger, x, y, dx, dy, gpe, began_on)
     local processed = gpe == true or sunk
     fire(uis, state == "Begin" and "InputBegan" or over and "InputEnded" or "InputChanged", io, processed)
     fire(uis, state == "Begin" and "TouchStarted" or over and "TouchEnded" or "TouchMoved", io, processed)
-    if over then touch_objects[finger] = nil end
+    if over then table.insert(touch_done, finger) end
     return sunk
 end
 -- The fingers' gestures (src/touch_gestures.rs): UserInputService's
@@ -1342,7 +1397,11 @@ function M.GetUserCFrame() return CFrame.new() end
 function M.GetUserCFrameEnabled() return false end
 function M.RecenterUserHeadCFrame() end
 function M.RequestNavigation() end
-function M.IsTenFootInterface() return false end
+-- Consoles (a simulated Xbox / PlayStation) are ten-foot.
+function M.IsTenFootInterface()
+    local _, _, _, _, _, _, ten_foot = __rs_view_frame()
+    return ten_foot == true
+end
 -- Studio's Play reports a 58 px top bar (Studio, GuiService:GetGuiInset());
 -- the edit DataModel has none (plugins: src/plugin_host/widgets_ui.rs).
 local function edit_dm()
@@ -1392,10 +1451,17 @@ function M.ClearTouchMovementModes() table.clear(__rs_ps_modes.TouchMovement) en
 -- Rays and projections from the camera's CFrame, FieldOfView (vertical) and
 -- ViewportSize; "Screen" coordinates start under the 58 px top bar.
 local INSET = 58
+-- On a simulated device the projection spans the whole screen, notch and
+-- all, and viewport points start at the safe area's corner (measured,
+-- iPhone 14 portrait: a point straight ahead is at (389/2, 843/2 - 47)).
 local function cam_basis(cam)
     local vs = cam.ViewportSize
     local th = math.tan(math.rad(cam.FieldOfView) / 2)
-    return cam.CFrame, vs, th, vs.X / math.max(vs.Y, 1)
+    local sw, sh, sl, st = __rs_view_frame()
+    if sw and sw > 0 and (sl ~= 0 or st ~= 0 or sw ~= vs.X or sh ~= vs.Y) then
+        return cam.CFrame, vs, th, sw / math.max(sh, 1), Vector2.new(sw, sh), Vector2.new(sl, st)
+    end
+    return cam.CFrame, vs, th, vs.X / math.max(vs.Y, 1), vs, Vector2.zero
 end
 -- ProjectionType Orthographic (Studio with SupportOrthoCameraApi): half the
 -- view's width and height in studs from OrthographicSize / Mode and
@@ -1414,20 +1480,20 @@ local function ortho_half(cam, vs)
     return h * a * cam.ViewStretch, h
 end
 function M.ViewportPointToRay(self, x, y, depth)
-    local cf, vs, th, asp = cam_basis(self)
+    local cf, vs, th, asp, full, off = cam_basis(self)
     local ow, oh = ortho_half(self, vs)
     if ow then
         local o = cf.Position + cf.RightVector * ((2 * x / vs.X - 1) * ow) + cf.UpVector * ((1 - 2 * y / vs.Y) * oh)
         return Ray.new(o + cf.LookVector * (tonumber(depth) or 0), cf.LookVector)
     end
-    local nx = (2 * x / vs.X - 1) * th * asp
-    local ny = (1 - 2 * y / vs.Y) * th
+    local nx = (2 * (x + off.X) / full.X - 1) * th * asp
+    local ny = (1 - 2 * (y + off.Y) / full.Y) * th
     local dir = (cf.RightVector * nx + cf.UpVector * ny + cf.LookVector).Unit
     return Ray.new(cf.Position + dir * (tonumber(depth) or 0), dir)
 end
 function M.ScreenPointToRay(self, x, y, depth) return M.ViewportPointToRay(self, x, y + (edit_dm() and 0 or INSET), depth) end
 function M.WorldToViewportPoint(self, p)
-    local cf, vs, th, asp = cam_basis(self)
+    local cf, vs, th, asp, full, off = cam_basis(self)
     local lp = cf:PointToObjectSpace(p)
     local z = -lp.Z
     local ow, oh = ortho_half(self, vs)
@@ -1437,8 +1503,8 @@ function M.WorldToViewportPoint(self, p)
         return Vector3.new(x, y, z), z > 0 and x >= 0 and x <= vs.X and y >= 0 and y <= vs.Y
     end
     local sz = math.abs(z) > 1e-6 and z or 1e-6
-    local x = (lp.X / (sz * th * asp) + 1) / 2 * vs.X
-    local y = (1 - lp.Y / (sz * th)) / 2 * vs.Y
+    local x = (lp.X / (sz * th * asp) + 1) / 2 * full.X - off.X
+    local y = (1 - lp.Y / (sz * th)) / 2 * full.Y - off.Y
     return Vector3.new(x, y, z), z > 0 and x >= 0 and x <= vs.X and y >= 0 and y <= vs.Y
 end
 function M.WorldToScreenPoint(self, p)

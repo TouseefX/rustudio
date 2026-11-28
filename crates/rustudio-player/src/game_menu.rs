@@ -195,6 +195,24 @@ struct Asked {
 }
 
 impl Game {
+    /// The Device Simulator's Android back button: Roblox's in-game menu
+    /// opens or closes (GuiService.MenuOpened fires), with no key event
+    /// (measured in Studio). With Roblox's CoreScripts it is their
+    /// SettingsHub.
+    pub fn android_back(&mut self) {
+        let core_scripts = self.play.as_ref().is_some_and(|s| s.game.core_scripts_active);
+        if !core_scripts {
+            self.toggle_game_menu();
+            return;
+        }
+        let _ = self.run_luau_as(
+            rustudio_engine::runtime::Side::Client,
+            r#"local hub = require(game:GetService("CoreGui").RobloxGui.Modules.Settings.SettingsHub)
+hub:ToggleVisibility()"#,
+            rustudio_engine::runtime::security::CORE,
+        );
+    }
+
     /// Esc during Play opens (and closes) the in-game menu, as in Roblox; a
     /// focused TextBox or the chat box take Esc first. On a confirmation
     /// page Esc goes back to the tab it came from (SettingsHub:PopMenu).
@@ -402,14 +420,15 @@ impl Game {
         let confirm = matches!(page, MenuPage::ConfirmReset | MenuPage::ConfirmLeave);
         // SettingsHub's sizes: the page view is as tall as the screen allows
         // (5% margins, the bars), at most 600 and at least 150.
-        let hub_w = HUB_W.min(rect.width() - 2.0 * PAD_X - 24.0).max(320.0);
+        let pad_x = PAD_X.min((rect.width() * 0.05).max(8.0));
+        let hub_w = HUB_W.min((rect.width() - 2.0 * pad_x - 16.0).max(160.0));
         let buffer = 0.05 * rect.height();
-        let page_h = (rect.height() - 2.0 * buffer - BAR_H - BOTTOM_H).clamp(150.0, 600.0);
+        let page_h = (rect.height() - 2.0 * buffer - BAR_H - BOTTOM_H).clamp(120.0, 600.0);
         let size = if confirm {
             // The confirmation page: its question (200 tall) and two 200×50 buttons.
-            Vec2::new(hub_w + 2.0 * PAD_X, 250.0 + PAD_BOTTOM + 20.0)
+            Vec2::new(hub_w + 2.0 * pad_x, 250.0 + PAD_BOTTOM + 20.0)
         } else {
-            Vec2::new(hub_w + 2.0 * PAD_X, BAR_H + page_h + BOTTOM_H + PAD_BOTTOM)
+            Vec2::new(hub_w + 2.0 * pad_x, BAR_H + page_h + BOTTOM_H + PAD_BOTTOM)
         };
         // Centred, 10 px low (Theme.MenuContainerPosition).
         let container = Rect::from_center_size(rect.center() + Vec2::new(0.0, 10.0 + dy), size);
@@ -423,8 +442,8 @@ impl Game {
         let shield = ui.interact(rect, ui.id().with("game_menu_shield"), Sense::click());
         let _ = shield;
         let inner = Rect::from_min_max(
-            container.min + Vec2::new(PAD_X, 0.0),
-            container.max - Vec2::new(PAD_X, PAD_BOTTOM),
+            container.min + Vec2::new(pad_x, 0.0),
+            container.max - Vec2::new(pad_x, PAD_BOTTOM),
         );
         let mut asked = Asked::default();
         let mut rects: HashMap<&'static str, Rect> = HashMap::new();

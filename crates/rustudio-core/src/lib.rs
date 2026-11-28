@@ -40,6 +40,7 @@ pub mod bench;
 pub mod profiler;
 pub mod collision_groups;
 pub mod crash;
+pub mod devices;
 pub mod diagnostics;
 pub mod default_scripts;
 pub mod core_scripts;

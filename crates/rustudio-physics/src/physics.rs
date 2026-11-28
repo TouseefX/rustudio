@@ -842,17 +842,20 @@ fn read_mover(doc: &Document, ws: Ref, r: Ref) -> Option<Mover> {
             Limit::Magnitude(num(doc, r, mag, inf).abs())
         }
     };
+    let vec_alias = |primary: &str, legacy: &str| {
+        vec3_of(doc.prop(r, primary).or_else(|| doc.prop(r, legacy))).unwrap_or(Vec3::ZERO)
+    };
     let law = match class {
         "BodyForce" => Law::Force {
-            force: vec(doc, r, "Force"),
+            force: vec_alias("Force", "force"),
             frame: Frame::World,
             at: None,
             at_att0: false,
         },
         "BodyThrust" => Law::Force {
-            force: vec(doc, r, "Force"),
+            force: vec_alias("Force", "force"),
             frame: Frame::Part,
-            at: Some(vec(doc, r, "Location")),
+            at: Some(vec_alias("Location", "location")),
             at_att0: false,
         },
         "VectorForce" => Law::Force {
@@ -866,8 +869,8 @@ fn read_mover(doc: &Document, ws: Ref, r: Ref) -> Option<Mover> {
             frame: actuator_frame(e("RelativeTo")),
         },
         "BodyVelocity" => Law::BodyVelocity {
-            vel: vec(doc, r, "Velocity"),
-            max: vec(doc, r, "MaxForce").abs(),
+            vel: vec_alias("Velocity", "velocity"),
+            max: vec_alias("MaxForce", "maxForce").abs(),
             p: num(doc, r, "P", 1250.0),
         },
         "LinearVelocity" => {
@@ -1232,8 +1235,51 @@ impl PhysicsJob {
     }
 }
 
+#[derive(Clone, Copy)]
+enum JournalSource {
+    Readers { main: doc::Reader, joints: doc::Reader },
+    Cursor { main: Option<u64>, joints: Option<u64> },
+}
+
+impl JournalSource {
+    fn take_main(&mut self, doc: &mut Document) -> doc::Marks {
+        match self {
+            JournalSource::Readers { main, .. } => doc.marks_for(*main),
+            JournalSource::Cursor { main, .. } => {
+                let out = match *main {
+                    Some(pos) => doc.marks_since(pos).map_or(doc::Marks::All, |m| doc::Marks::Some(m.to_vec())),
+                    None => doc::Marks::All,
+                };
+                *main = Some(doc.journal_end());
+                out
+            }
+        }
+    }
+
+    fn take_joints(&mut self, doc: &mut Document) -> doc::Marks {
+        match self {
+            JournalSource::Readers { joints, .. } => doc.marks_for(*joints),
+            JournalSource::Cursor { joints, .. } => {
+                let out = match *joints {
+                    Some(pos) => doc.marks_since(pos).map_or(doc::Marks::All, |m| doc::Marks::Some(m.to_vec())),
+                    None => doc::Marks::All,
+                };
+                *joints = Some(doc.journal_end());
+                out
+            }
+        }
+    }
+}
+
 pub struct Physics {
     world: rp::PhysicsWorld,
+    /// Root `WorldRoot` container (`None` = `doc.workspace()`, `Some(r)` = a `WorldModel`).
+    root: Option<Ref>,
+    /// Change journal reader / cursor so `StepPhysics` never steals Play's `Reader::Physics`.
+    journal: JournalSource,
+    /// `WorldRoot:StepPhysics(dt, parts)` subset filter: `Some(set)` simulates only
+    /// assemblies containing at least one part in `set`, treating all others as anchored.
+    step_filter: Option<HashSet<Ref>>,
     parts: rustc_hash::FxHashMap<Ref, PartBody>,
     asms: HashMap<u32, Assembly>,
     next_asm: u32,
@@ -1508,6 +1554,9 @@ impl Physics {
         };
         let mut p = Physics {
             world: new_world(gravity),
+            root: None,
+            journal: JournalSource::Readers { main: doc::Reader::Physics, joints: doc::Reader::SolverJoints },
+            step_filter: None,
             hum_controller,
             anchored_vel: HashMap::default(),
             pending_vel: HashMap::default(),
@@ -1577,13 +1626,198 @@ impl Physics {
         };
         p.skip = skip;
         // Start reading the journal from here.
-        let _ = doc.marks_for(doc::Reader::Physics);
+        let _ = p.journal.take_main(doc);
         p.reconcile(doc);
         p
     }
 
+    /// A standalone simulation for `WorldRoot:StepPhysics(dt, parts)` on `root`
+    /// (`Workspace` or a `WorldModel`). Uses its own journal reader/cursor so it
+    /// never steals marks from Play's main `Physics` world.
+    pub fn new_step_physics(
+        doc: &mut Document,
+        root: Ref,
+        groups: rustudio_core::collision_groups::Shared,
+        filter: Option<HashSet<Ref>>,
+    ) -> Self {
+        let is_workspace = doc.workspace() == Some(root);
+        let gravity = doc
+            .workspace()
+            .and_then(|w| f32_of(doc.prop(w, "Gravity")))
+            .unwrap_or(mech::GRAVITY);
+        let controller = KinematicCharacterController {
+            up: rp::Vector::Y,
+            offset: CharacterLength::Absolute(mech::CHARACTER_HOVER),
+            slide: true,
+            autostep: Some(CharacterAutostep {
+                max_height: CharacterLength::Absolute(mech::CHARACTER_STEP_HEIGHT),
+                min_width: CharacterLength::Absolute(0.3),
+                include_dynamic_bodies: true,
+            }),
+            max_slope_climb_angle: mech::MAX_SLOPE_DEG.to_radians(),
+            min_slope_slide_angle: mech::MAX_SLOPE_DEG.to_radians(),
+            snap_to_ground: Some(CharacterLength::Absolute(0.5)),
+            ..Default::default()
+        };
+        let hum_controller = KinematicCharacterController {
+            up: rp::Vector::Y,
+            offset: CharacterLength::Absolute(mech::HUMANOID_BOX_SKIN),
+            slide: true,
+            autostep: None,
+            max_slope_climb_angle: mech::HUMANOID_BOX_CLIMB_DEG.to_radians(),
+            min_slope_slide_angle: 1f32.to_radians(),
+            snap_to_ground: None,
+            ..Default::default()
+        };
+        let mut p = Physics {
+            world: new_world(gravity),
+            root: (!is_workspace).then_some(root),
+            journal: if is_workspace {
+                JournalSource::Readers {
+                    main: doc::Reader::StepPhysics,
+                    joints: doc::Reader::StepPhysicsJoints,
+                }
+            } else {
+                JournalSource::Cursor { main: None, joints: None }
+            },
+            step_filter: filter,
+            hum_controller,
+            anchored_vel: HashMap::default(),
+            pending_vel: HashMap::default(),
+            pending_spin: HashMap::default(),
+            client_over: HashMap::default(),
+            server_moved: HashSet::default(),
+            parts: Default::default(),
+            asms: HashMap::default(),
+            next_asm: 0,
+            by_collider: Default::default(),
+            query_live: true,
+            touch_parts: None,
+            touch_refresh: false,
+            touch_pending: Vec::new(),
+            joints: HashMap::default(),
+            adj: HashMap::default(),
+            collector: Collector::default(),
+            accum: 0.0,
+            skip: HashSet::default(),
+            dead_parts: HashSet::default(),
+            external: HashSet::default(),
+            dyn_version: 0,
+            sj_cache: None,
+            follower_eps: (1e-5, 1e-9),
+            fresh: None,
+            queued: HashSet::default(),
+            held_marks: Vec::new(),
+            rebuild_wakes: HashSet::default(),
+            rebuild_keep_sleep: false,
+            mesh_pending: HashMap::default(),
+            union_offsets: HashMap::default(),
+            mesh_checked: None,
+            controller,
+            gravity,
+            fallen_height: mech::FALLEN_PARTS_HEIGHT,
+            steps: 0,
+            rebuilt: 0,
+            movers: HashMap::default(),
+            ropes: HashSet::default(),
+            joint_cons: HashSet::default(),
+            live_joints: HashMap::default(),
+            ground: None,
+            pushed: HashSet::default(),
+            pushed_last: HashMap::default(),
+            lv_track: HashMap::default(),
+            terrain: None,
+            terrain_colliders: Vec::new(),
+            terrain_tris: 0,
+            voxels: None,
+            groups,
+            groups_seen: 0,
+            char_group: rustudio_core::collision_groups::DEFAULT.to_string(),
+            hums: Default::default(),
+            link: Default::default(),
+            client_owned: HashSet::default(),
+            studio: (crate::solver::kind() != crate::solver::SolverKind::Rapier)
+                .then(|| Box::new(crate::solver::StudioSolver::new(crate::solver::kind()))),
+            census: std::env::var_os("RUSTUDIO_SOLVER_STATS").is_some().then(Default::default),
+            throttle: Default::default(),
+            realtime: false,
+            hurry: Default::default(),
+            progress: Default::default(),
+            tick_full_ms: 0.0,
+            tick_hurried_ms: 0.0,
+            env_owed: 0,
+            env_hurried: false,
+            env_starved: 0,
+        };
+        let _ = p.journal.take_main(doc);
+        let _ = p.journal.take_joints(doc);
+        p.reconcile(doc);
+        p
+    }
+
+    pub(super) fn root_of(&self, doc: &Document) -> Option<Ref> {
+        match self.root {
+            Some(r) => doc.dom.get_by_ref(r).map(|_| r),
+            None => doc.workspace(),
+        }
+    }
+
     fn workspace_of(doc: &Document) -> Option<Ref> {
         doc.workspace()
+    }
+
+    /// Updates the `StepPhysics` part subset filter, queuing only the parts whose
+    /// dynamic/anchored state may have changed.
+    pub fn set_step_filter(&mut self, doc: &Document, filter: Option<HashSet<Ref>>) {
+        if self.step_filter == filter {
+            return;
+        }
+        match (&self.step_filter, &filter) {
+            (Some(old), Some(new)) => {
+                for r in old.symmetric_difference(new) {
+                    if self.parts.contains_key(r) || doc.dom.get_by_ref(*r).is_some() {
+                        self.queued.insert(*r);
+                    }
+                }
+            }
+            _ => {
+                for &r in self.parts.keys() {
+                    if !matches!(doc.prop(r, "Anchored"), Some(Variant::Bool(true))) {
+                        self.queued.insert(r);
+                    }
+                }
+            }
+        }
+        self.step_filter = filter;
+    }
+
+    /// Wakes each listed part's assembly (Studio's `StepPhysics` wake behavior).
+    pub fn wake_parts(&mut self, parts: impl IntoIterator<Item = Ref>) {
+        for r in parts {
+            self.wake_part(r);
+        }
+    }
+
+    /// Advances the simulation by the full requested `dt` for `WorldRoot:StepPhysics`,
+    /// splitting large `dt` into chunks so the cyclic executive's per-frame cap does
+    /// not truncate explicit manual steps.
+    pub fn step_manual(&mut self, doc: &mut Document, dt: f32) -> StepResult {
+        let mut remaining = dt.clamp(0.0, 60.0);
+        if remaining <= 0.0 {
+            return StepResult::default();
+        }
+        let h = 1.0 / step_rate().0;
+        let max_chunk = (self.throttle.max_world_steps() as f32) * h;
+        let mut combined = StepResult::default();
+        while remaining > 0.0 {
+            let chunk = remaining.min(max_chunk);
+            remaining -= chunk;
+            let res = self.step(doc, chunk);
+            combined.moved.extend(res.moved);
+            combined.touches.extend(res.touches);
+            combined.fallen.extend(res.fallen);
+        }
+        combined
     }
 
     /// A part the simulation should hold: a BasePart under Workspace, not skipped.
@@ -1631,7 +1865,7 @@ impl Physics {
         self.terrain = None;
         // The world is new: characters' bodies are built again by their owner.
         self.hums.new_world();
-        let Some(ws) = Self::workspace_of(doc) else {
+        let Some(ws) = self.root_of(doc) else {
             return;
         };
         let mut seeds = HashSet::default();
@@ -1890,7 +2124,11 @@ impl Physics {
         prev_vel: &HashMap<Ref, (Vec3, Vec3)>,
         prev_asleep: &HashSet<Ref>,
     ) {
-        let anchored = group.iter().any(|r| info[r].1.anchored);
+        let filtered_out = self
+            .step_filter
+            .as_ref()
+            .is_some_and(|allowed| !group.iter().any(|r| allowed.contains(r)));
+        let anchored = filtered_out || group.iter().any(|r| info[r].1.anchored);
         if anchored {
             // Anchored assembly: plain fixed colliders, never simulated.
             for r in group {
@@ -2279,16 +2517,41 @@ impl Physics {
     pub fn sync(&mut self, doc: &mut Document) {
         self.server_moved.clear();
         self.reapply_groups(doc);
-        let marks = doc.marks_for(doc::Reader::Physics);
-        let Some(ws) = Self::workspace_of(doc) else {
+        let marks = self.journal.take_main(doc);
+        let Some(ws) = self.root_of(doc) else {
             return;
         };
         let marks = match marks {
             doc::Marks::All => {
                 let _p = rustudio_core::bench::scope("ps_reconcile");
+                // A WorldModel's cursor can fall behind when other readers drain
+                // the journal between frames; preserve dynamic velocities across
+                // the rebuild so repeated StepPhysics calls keep momentum.
+                let saved_vel: Vec<(Ref, Vec3, Vec3)> = if self.root.is_some() {
+                    self.asms
+                        .values()
+                        .filter_map(|a| {
+                            let b = self.world.bodies.get(a.body)?;
+                            let p = *a.parts.first()?;
+                            Some((p, gv(b.linvel()), gv(b.angvel())))
+                        })
+                        .collect()
+                } else {
+                    Vec::new()
+                };
                 self.queued.clear();
                 self.held_marks.clear();
                 self.reconcile(doc);
+                for (r, v, w) in saved_vel {
+                    if let Some(body) = self.body_of(r) {
+                        if let Some(b) = self.world.bodies.get_mut(body) {
+                            if b.is_dynamic() {
+                                b.set_linvel(rv(v), true);
+                                b.set_angvel(rv(w), true);
+                            }
+                        }
+                    }
+                }
                 return;
             }
             doc::Marks::Some(m) if self.held_marks.is_empty() => m,
@@ -2539,7 +2802,11 @@ impl Physics {
     /// (Re)builds Workspace.Terrain's colliders: its non-water surface as fixed
     /// triangle meshes, one per TERRAIN_COLLIDER_CELL cube so each stays small.
     fn build_terrain(&mut self, doc: &Document) {
-        let terrain = Self::workspace_of(doc).and_then(|ws| doc.find_child(ws, "Terrain"));
+        let terrain = if self.root.is_some() {
+            None
+        } else {
+            self.root_of(doc).and_then(|ws| doc.find_child(ws, "Terrain"))
+        };
         let voxels = {
             let _dec = rustudio_core::bench::scope("pt_decode");
             terrain
@@ -3101,13 +3368,20 @@ impl Physics {
         let mut states: HashMap<rp::RigidBodyHandle, BodyState> = HashMap::default();
         let mut lv_axes: HashMap<rp::RigidBodyHandle, Vec<Vec3>> = HashMap::default();
         // RUSTUDIO_SOLVER=studio: every mover class is the solver's (rows, a Solver::Force
-        // item, or a JOINT Open hook): studio_constraints.
+        // item, or a JOINT Open hook): studio_constraints. Still accumulate Force/Torque
+        // movers on Humanoid bodies into `hums.fext` so the Humanoid controller sees
+        // server-created BodyForce/VectorForce (e.g. Gravity Coil) without double-applying
+        // them to `out`.
         let studio = self.studio.is_some();
-        // (A client-owned assembly's movers too: their connectors are built from the
-        // client's document, physics_joints.rs `studio_constraints`.)
-        for m in self.movers.values().filter(|_| !studio).chain(self.hums.foreign.values()) {
+        for (m, apply_to_out) in self
+            .movers
+            .values()
+            .filter(|m| !studio || matches!(m.law, Law::Force { .. } | Law::Torque { .. }))
+            .map(|m| (m, !studio))
+            .chain(self.hums.foreign.values().map(|m| (m, true)))
+        {
             // A character's part rides on its Humanoid body (physics_humanoid.rs).
-            let (body, part) = match self.parts.get(&m.part) {
+            let (body, part, is_hum) = match self.parts.get(&m.part) {
                 Some(pb) => {
                     let Some(body) = pb.asm.and_then(|id| self.asms.get(&id)).map(|a| a.body) else {
                         continue;
@@ -3115,15 +3389,18 @@ impl Physics {
                     let Some(b) = self.world.bodies.get(body) else {
                         continue;
                     };
-                    (body, xform(&(*b.position() * pb.local)))
+                    (body, xform(&(*b.position() * pb.local)), false)
                 }
                 None => {
                     let (Some(body), Some(xf)) = (self.humanoid_body_of(m.part), self.humanoid_part_xform(m.part)) else {
                         continue;
                     };
-                    (body, xf)
+                    (body, xf, true)
                 }
             };
+            if !apply_to_out && !is_hum {
+                continue;
+            }
             let Some(b) = self.world.bodies.get(body) else {
                 continue;
             };
@@ -3141,9 +3418,11 @@ impl Physics {
                         e.0 += f;
                         e.1 += t;
                     }
-                    out.push((body, f, t));
-                    if let Some(axes) = self.unlimited_velocity_axes(doc, m, &part) {
-                        lv_axes.entry(body).or_default().extend(axes);
+                    if apply_to_out {
+                        out.push((body, f, t));
+                        if let Some(axes) = self.unlimited_velocity_axes(doc, m, &part) {
+                            lv_axes.entry(body).or_default().extend(axes);
+                        }
                     }
                 }
             }
@@ -3731,7 +4010,7 @@ impl Physics {
         {
             let _c = rustudio_core::bench::scope("pj_studio_constraints");
             if self.studio.is_some() {
-                let marks = doc.marks_for(doc::Reader::SolverJoints);
+                let marks = self.journal.take_joints(doc);
                 self.studio_constraints(doc, marks);
             }
         }
@@ -3868,7 +4147,7 @@ impl Physics {
         rustudio_core::bench::add("ph_publish_unchanged", 0.0, same);
         // Our own CFrame writes aren't news to us.
         if edits.is_empty() && !out.moved.is_empty() {
-            if let doc::Marks::Some(rest) = doc.marks_for(doc::Reader::Physics) {
+            if let doc::Marks::Some(rest) = self.journal.take_main(doc) {
                 let others: Vec<doc::Mark> = rest
                     .into_iter()
                     .filter(|m| !matches!(m, doc::Mark::Prop(_, n) if *n == cframe))
@@ -4294,7 +4573,13 @@ impl Physics {
     /// Angular impulses scripts asked for (BasePart:ApplyAngularImpulse,
     /// ApplyImpulseAtPosition's turning part): added to the bodies' spin.
     fn take_script_impulses(&mut self, doc_id: u64) {
-        let mut items: Vec<(Ref, Vec3, u8)> = live::take_spins(doc_id).into_iter().map(|(r, dw)| (r, dw, 0)).collect();
+        let raw_spins = if self.root.is_some() {
+            let parts = &self.parts;
+            live::take_spins_of(doc_id, |r| parts.contains_key(&r))
+        } else {
+            live::take_spins(doc_id)
+        };
+        let mut items: Vec<(Ref, Vec3, u8)> = raw_spins.into_iter().map(|(r, dw)| (r, dw, 0)).collect();
         items.extend(std::mem::take(&mut self.pending_spin).into_iter().map(|(r, (dw, n))| (r, dw, n)));
         for (r, dw, n) in items {
             // A part made this frame has no body yet: keep it a while.
@@ -4316,7 +4601,13 @@ impl Physics {
         }
         // AssemblyAngularVelocity writes replace the spin (a part made
         // this frame starts still, so the whole value waits as a delta).
-        for (r, w) in live::take_spin_sets(doc_id) {
+        let raw_sets = if self.root.is_some() {
+            let parts = &self.parts;
+            live::take_spin_sets_of(doc_id, |r| parts.contains_key(&r))
+        } else {
+            live::take_spin_sets(doc_id)
+        };
+        for (r, w) in raw_sets {
             if !w.is_finite() {
                 continue;
             }
@@ -4444,7 +4735,11 @@ impl Physics {
                 st.spin.insert(p.part, (w, com));
             }
         }
-        live::publish(doc_id, st);
+        if self.root.is_some() {
+            live::overlay_spins(doc_id, st.spin);
+        } else {
+            live::publish(doc_id, st);
+        }
     }
 }
 

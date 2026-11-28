@@ -347,14 +347,17 @@ fn prepare_and_run(
     );
     let raw: serde_json::Value = serde_json::from_str(joined.raw.expose())
         .map_err(|_| NetError::Other("Roblox returned invalid join information".into()))?;
-    let target = QuicTarget::from_join(&joined.join).map_err(|error| {
+    let targets = QuicTarget::candidates_from_join(&joined.join).map_err(|error| {
         // The reason names a join-script field, never a secret value.
         log::warn!("Team Create transport for place {place} is unsupported: {error}");
         NetError::Other("Roblox returned unsupported transport information".into())
     })?;
     log::info!(
         "Team Create transport for place {place}: {}",
-        if target.is_direct() { "direct to the server" } else { "through a UDMUX relay" }
+        match targets.first() {
+            Some(t) if t.is_direct() => "direct to the server".to_string(),
+            _ => format!("through a UDMUX relay ({} candidate{})", targets.len(), if targets.len() == 1 { "" } else { "s" }),
+        }
     );
     let (sync, ticket) = templates();
     let opening = vec![
@@ -372,7 +375,7 @@ fn prepare_and_run(
         .build()
         .map_err(|_| NetError::Other("Could not start Team Create network runtime".into()))?;
     runtime
-        .block_on(run(place, target, opening, tx.clone(), cancel, commands, next_id, session.profile.id))
+        .block_on(run(place, targets, opening, tx.clone(), cancel, commands, next_id, session.profile.id))
         .map_err(|_| NetError::Other("The Team Create network session failed".into()))
 }
 
@@ -576,6 +579,32 @@ async fn receive_lane(
                 decoder.errors.truncate(errors);
                 continue;
             }
+            let unknown_value = frame[0] != packet_id::NEW_SCHEMA
+                && decoder
+                    .errors
+                    .get(errors..)
+                    .is_some_and(|es| !es.is_empty() && es.iter().all(|e| e.contains("value type ") || e.contains("content kind ")));
+            if unknown_value {
+                let err_text = decoder.errors.last().cloned().unwrap_or_default();
+                let saved = save_unknown_frame(&schema_frame, &frame, "unknown-value");
+                log::warn!(
+                    "Team Create skipped frame with unsupported value type (place={place}, packet={:#04x}, bytes={}): {err_text}{}",
+                    frame[0],
+                    frame.len(),
+                    saved.as_ref().map(|p| format!(", saved to {}", p.display())).unwrap_or_default()
+                );
+                emit(
+                    &tx,
+                    &cancel,
+                    LiveEvent::Notice(format!(
+                        "skipped a live update with an unsupported property type ({err_text}); the session continues, but a change from a collaborator may be missing"
+                    )),
+                )
+                .await;
+                decoder.errors.truncate(errors);
+                initial.lock().unwrap().delivering = false;
+                continue;
+            }
             if let Some(error) = decoder.errors.last() {
                 eprintln!("Team Create decode error: {error}");
                 log::error!(
@@ -694,7 +723,7 @@ async fn wait_cancelled(cancel: &AtomicBool) {
 
 async fn run(
     place: u64,
-    target: QuicTarget,
+    targets: Vec<QuicTarget>,
     opening: Vec<Vec<u8>>,
     tx: mpsc::SyncSender<LiveEvent>,
     cancel: Arc<AtomicBool>,
@@ -703,13 +732,41 @@ async fn run(
     local_user: u64,
 ) -> Result<()> {
     emit(&tx, &cancel, LiveEvent::Stage(JoinStage::Connecting)).await;
-    let (_endpoint, connection, _socket) = tokio::select! {
-        connected = connect_quic(&target) => connected.map_err(|error| {
-            log::warn!("Team Create connection for place {place} failed: {error}");
-            NetError::Other("Could not connect to the Team Create server".into())
-        })?,
-        _ = wait_cancelled(&cancel) => return Ok(()),
-    };
+    let total = targets.len();
+    let mut connected_pair = None;
+    for (idx, target) in targets.into_iter().enumerate() {
+        if cancel.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        let per_relay = if total > 1 { Duration::from_secs(5) } else { Duration::from_secs(15) };
+        let attempt = tokio::select! {
+            res = tokio::time::timeout(per_relay, connect_quic(&target)) => res,
+            _ = wait_cancelled(&cancel) => return Ok(()),
+        };
+        match attempt {
+            Ok(Ok(pair)) => {
+                connected_pair = Some(pair);
+                break;
+            }
+            Ok(Err(err)) => {
+                log::warn!(
+                    "Team Create relay {}/{total} ({}) failed: {err}",
+                    idx + 1,
+                    target.relay
+                );
+            }
+            Err(_) => {
+                log::warn!(
+                    "Team Create relay {}/{total} ({}) timed out after {}s",
+                    idx + 1,
+                    target.relay,
+                    per_relay.as_secs()
+                );
+            }
+        }
+    }
+    let (_endpoint, connection, _socket) = connected_pair
+        .ok_or_else(|| NetError::Other("Could not connect to the Team Create server".into()))?;
     if cancel.load(Ordering::Acquire) {
         connection.close(0u32.into(), b"cancelled");
         return Ok(());

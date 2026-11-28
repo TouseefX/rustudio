@@ -131,6 +131,10 @@ pub fn keep_play_layout(old: &HashMap<Ref, GuiBox>, new: &mut HashMap<Ref, GuiBo
 struct RegSlot {
     key: &'static str,
     state: String,
+    /// Optional key into `crate::panels::PLACEMENTS` (used by Studio-panel
+    /// modular plugins such as Animation Editor so they dock in Studio's exact
+    /// slot rather than the generic third-party plugin strip).
+    placement_key: Option<&'static str>,
     title: String,
     float: [f32; 2],
 }
@@ -177,13 +181,24 @@ pub fn slot_key(n: u32) -> &'static str {
     reg().slots.get(n as usize).map(|s| s.key).unwrap_or("plugin:")
 }
 
-/// A plugin panel key's static form and InitialDockState name.
-pub fn slot_placement(key: &str) -> Option<(&'static str, String)> {
+/// A plugin panel key's static form, InitialDockState name, and optional
+/// Studio `PLACEMENTS` override key.
+pub fn slot_placement(key: &str) -> Option<(&'static str, String, Option<&'static str>)> {
     if !key.starts_with(KEY_PREFIX) {
         return None;
     }
     let r = reg();
-    r.slots.iter().find(|s| s.key == key).map(|s| (s.key, s.state.clone()))
+    r.slots
+        .iter()
+        .find(|s| s.key == key)
+        .map(|s| (s.key, s.state.clone(), s.placement_key))
+}
+
+/// True when `tab` is a `Tab::Plugin(_)` backed by a Studio `PLACEMENTS` row
+/// (e.g. a modular native/bundled Studio tool like Animation Editor).
+pub fn is_studio_placed_plugin_tab(tab: &Tab) -> bool {
+    let Tab::Plugin(n) = tab else { return false };
+    reg().slots.get(*n as usize).is_some_and(|s| s.placement_key.is_some())
 }
 
 /// A panel window's title when it holds a plugin widget (its key starts
@@ -225,11 +240,35 @@ pub fn float_size(tab: &Tab) -> Option<[f32; 2]> {
     reg()
         .slots
         .get(*n as usize)
-        .filter(|s| s.state == "Float")
+        .filter(|s| s.placement_key.is_none() && s.state == "Float")
         .map(|s| {
             let c = float_client(s.float[0], s.float[1]);
             [c[0] + WINDOW_FRAME[0], c[1] + WINDOW_FRAME[1]]
         })
+}
+
+/// Maps a RusTudio bundled Studio plugin (`rustudio_<Name>`) to its exact row
+/// in `crate::panels::PLACEMENTS` (from `STUDIO-PANELS.md`) so it docks in the
+/// same slot/side as real Roblox Studio rather than the generic third-party
+/// plugin strip. Returns `None` for plugins that should float via their own
+/// `DockWidgetPluginGuiInfo` (e.g. `WindControl`, `PivotEditor`).
+pub(crate) fn studio_plugin_placement_key(plugin_name: &str) -> Option<&'static str> {
+    match plugin_name {
+        "rustudio_TagEditor" => Some("tag_editor"),
+        "rustudio_CollisionGroups" => Some("collision_groups"),
+        "rustudio_StyleEditor" => Some("style_editor"),
+        "rustudio_PathEditor" => Some("path_editor"),
+        "rustudio_EventEmulator" => Some("event_emulator"),
+        "rustudio_AlignmentTool" => Some("align"),
+        "rustudio_FindInPlace" => Some("find_in_place"),
+        "rustudio_LocalizationTools" => Some("localization_tools"),
+        "rustudio_PlayerEmulator" => Some("player_emulator"),
+        "rustudio_MaterialManager" => Some("material_manager"),
+        "rustudio_AudioDiscovery" => Some("audio_discovery"),
+        "rustudio_TextureViewer" => Some("texture_viewer"),
+        "rustudio_ObjectBrowser" => Some("object_browser"),
+        _ => None,
+    }
 }
 
 /// The mouse over widget `r` in its pixels (0, 0 when not over it, as
@@ -312,11 +351,15 @@ pub fn save_layout() {
 
 /// One widget panel (`Tab::Plugin(n)`, n = index).
 struct Slot {
-    /// `edit_<plugin>_<id>` (`PlayServer_…` / `PlayClient_…` for Play's copies).
+    /// `edit_<plugin>_<id>` (`PlayServer_…` / `PlayClient_…` for Play's copies,
+    /// `native_<plugin>_<id>` for modular native Rust plugins).
     key: String,
     /// The DataModel (and VM) the widget lives in.
     at: Where,
     r: Ref,
+    /// Set when this slot is rendered by a modular Rust [`super::native::NativePlugin`]
+    /// rather than a Luau `DockWidgetPluginGui`.
+    native_id: Option<&'static str>,
     plugin: Option<PluginId>,
     state: String,
     gui: Gui,
@@ -643,10 +686,87 @@ impl Editor {
 
     /// The user clicked the panel's ×.
     pub fn plugin_widget_close(&mut self, n: u32) {
-        if let Some(s) = self.plugin_ui.slots.get(n as usize) {
-            if s.r.is_some() {
+        if let Some(s) = self.plugin_ui.slots.get_mut(n as usize) {
+            if let Some(native_id) = s.native_id {
+                s.want = false;
+                s.enabled = false;
+                s.asked = Some(false);
+                self.plugins.native_mut().request_widget_close(native_id);
+                self.ui.panel_requests.push((Tab::Plugin(n), Some(false)));
+            } else if s.r.is_some() {
                 let (r, at) = (s.r, s.at);
                 self.plugin_ui.q(at).push(In::Close(r));
+            }
+        }
+    }
+
+    /// Synchronizes dock widget slots for modular native Rust plugins hosted in
+    /// `self.plugins.native()`. Runs even when no Luau plugins are loaded so
+    /// native plugins never require booting the Luau `EditVm`.
+    pub fn sync_native_plugin_widgets(&mut self) {
+        let views = self.plugins.native().widget_views();
+        let mut seen: HashSet<usize> = HashSet::new();
+        for v in &views {
+            let key = format!("native_{}_{}", v.native_id, v.spec.id);
+            let idx = match self.plugin_ui.slots.iter().position(|s| s.key == key) {
+                Some(i) => i,
+                None => {
+                    let full: &'static str = Box::leak(format!("{KEY_PREFIX}{key}").into_boxed_str());
+                    reg().slots.push(RegSlot {
+                        key: full,
+                        state: v.spec.dock_state.to_string(),
+                        placement_key: v.spec.placement_key,
+                        title: v.spec.title.to_string(),
+                        float: v.spec.float_size,
+                    });
+                    self.plugin_ui.slots.push(Slot {
+                        key: key.clone(),
+                        at: Where::Edit,
+                        r: Ref::none(),
+                        native_id: Some(v.native_id),
+                        plugin: Some(v.plugin_id),
+                        state: v.spec.dock_state.to_string(),
+                        gui: plugin_gui(),
+                        open: false,
+                        want: v.want_open,
+                        enabled: v.want_open,
+                        asked: None,
+                        drawn: 0,
+                        rect: None,
+                        focused: false,
+                        fix_left: 4,
+                        win: None,
+                        last_fix_rect: None,
+                        hover_stale: false,
+                        synced_visible: false,
+                    });
+                    self.plugin_ui.slots.len() - 1
+                }
+            };
+            seen.insert(idx);
+            let s = &mut self.plugin_ui.slots[idx];
+            s.native_id = Some(v.native_id);
+            s.plugin = Some(v.plugin_id);
+            s.enabled = v.want_open;
+            s.want = v.want_open;
+            s.state = v.spec.dock_state.to_string();
+            if let Some(rs) = reg().slots.get_mut(idx) {
+                rs.title = v.spec.title.to_string();
+                rs.state = v.spec.dock_state.to_string();
+                rs.placement_key = v.spec.placement_key;
+                rs.float = v.spec.float_size;
+            }
+        }
+        // Any native plugin that was unloaded closes its dock tab cleanly.
+        for (i, s) in self.plugin_ui.slots.iter_mut().enumerate() {
+            if s.native_id.is_some() && !seen.contains(&i) {
+                s.plugin = None;
+                s.enabled = false;
+                s.want = false;
+            }
+            if s.native_id.is_some() && s.want != s.open && s.asked != Some(s.want) {
+                s.asked = Some(s.want);
+                self.ui.panel_requests.push((Tab::Plugin(i as u32), Some(s.want)));
             }
         }
     }
@@ -756,6 +876,7 @@ impl Editor {
                         reg().slots.push(RegSlot {
                             key: full,
                             state: state.clone(),
+                            placement_key: studio_plugin_placement_key(pname),
                             title: String::new(),
                             float,
                         });
@@ -763,6 +884,7 @@ impl Editor {
                             key: key.clone(),
                             at,
                             r: Ref::none(),
+                            native_id: None,
                             plugin: None,
                             state: state.clone(),
                             gui: plugin_gui(),
@@ -816,7 +938,7 @@ impl Editor {
             let doc = unsafe { &mut *doc };
             let marks = doc.marks_for(rustudio_core::doc::Reader::PluginGui);
             for (i, s) in self.plugin_ui.slots.iter_mut().enumerate() {
-                if s.at != at {
+                if s.native_id.is_some() || s.at != at {
                     continue;
                 }
                 if !seen.contains(&i) {
@@ -847,7 +969,7 @@ impl Editor {
         }
         // Widgets of a DataModel that is gone (a Play session stopped).
         let contexts: Vec<Where> = sets.iter().map(|(a, _)| *a).collect();
-        for s in self.plugin_ui.slots.iter_mut().filter(|s| !contexts.contains(&s.at)) {
+        for s in self.plugin_ui.slots.iter_mut().filter(|s| s.native_id.is_none() && !contexts.contains(&s.at)) {
             if s.r.is_some() {
                 reg().live.remove(&s.r);
             }
@@ -947,21 +1069,43 @@ impl Editor {
 
     /// Which plugin panels the dock holds now (after its requests ran).
     pub fn plugin_ui_note_open(&mut self, is_open: impl Fn(&Tab) -> bool) {
+        let mut native_updates: Vec<(&'static str, bool, bool)> = Vec::new();
         for (i, s) in self.plugin_ui.slots.iter_mut().enumerate() {
             let open = is_open(&Tab::Plugin(i as u32));
+            let was_open = s.open;
             if open != s.open || s.asked == Some(open) {
                 s.asked = None;
             }
             s.open = open;
+            if let Some(nid) = s.native_id {
+                native_updates.push((nid, open, was_open));
+            }
+        }
+        for (nid, open, was_open) in native_updates {
+            self.plugins.native_mut().note_widget_open(nid, open);
+            // If a native plugin tab disappeared externally (e.g., popped OS
+            // window closed or layout reset), keep `want_open` in sync so it
+            // does not unexpectedly reopen on the next frame.
+            if was_open && !open {
+                self.plugins.native_mut().request_widget_close(nid);
+            }
         }
     }
 
     /// A plugin widget's panel content (`Tab::Plugin(n)`).
     pub fn plugin_widget_ui(&mut self, ui: &mut egui::Ui, n: u32) {
+        let idx = n as usize;
+        if let Some(native_id) = self.plugin_ui.slots.get(idx).and_then(|s| s.native_id) {
+            let rect = ui.available_rect_before_wrap();
+            self.plugin_ui.slots[idx].drawn = self.plugin_ui.frame;
+            self.plugin_ui.slots[idx].rect = Some(rect);
+            self.native_plugin_render_widget(native_id, ui);
+            return;
+        }
         let rect = ui.available_rect_before_wrap();
         let resp = ui.allocate_rect(rect, Sense::click_and_drag());
         let ctx = ui.ctx().clone();
-        let n = n as usize;
+        let n = idx;
         let Some(r) = self.plugin_ui.slots.get(n).map(|s| s.r).filter(|r| r.is_some()) else {
             return;
         };
@@ -1472,6 +1616,7 @@ impl Editor {
             cam_sent,
             dt,
             vp_rect,
+            device: self.game.device_input(),
         }
     }
 
@@ -1575,6 +1720,9 @@ pub(super) struct PluginUiFlush {
     pub(super) cam_sent: Option<(rustudio_core::math::Xform, glam::Vec3, f32)>,
     dt: f32,
     vp_rect: Option<Rect>,
+    /// The simulated device: edit-mode scripts and plugins see its input
+    /// flags too (measured: a phone makes TouchEnabled true in edit mode).
+    device: rustudio_engine::runtime::ext::DeviceInput,
 }
 
 pub(super) fn apply_plugin_ui_flush(
@@ -1592,6 +1740,7 @@ pub(super) fn apply_plugin_ui_flush(
         if let Some(rect) = view.rect.or(flush.vp_rect) {
             w.input.view_size = [rect.width(), rect.height()];
         }
+        w.input.device = flush.device;
         let next_xy = view.xy.unwrap_or([-1.0, -1.0]);
         mouse_changed = w.input.mouse_xy != next_xy;
         w.input.mouse_xy = next_xy;
@@ -1621,6 +1770,7 @@ pub(super) fn apply_plugin_ui_flush(
             *cam_sent = Some(now);
         }
     }
+    let _ = rustudio_engine::runtime::ext::fire_device_changes(lua);
     if layout_changed {
         let _ = rustudio_engine::runtime::ext::fire_layout_changes(lua);
     }

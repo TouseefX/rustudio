@@ -1499,6 +1499,7 @@ pub fn call(lua: &Lua, name: &str, this: Ref, class: &str, args: &MultiValue) ->
             world(lua).and_then(|w| one(Value::Boolean(crate::replicate_streaming::enabled(w.d()))))
         }
         "ArePartsTouchingOthers" if doc::is_a(class, "WorldRoot") => touching_others(lua, args),
+        "StepPhysics" if doc::is_a(class, "WorldRoot") => step_physics(lua, this, args),
         "IsRegion3Empty" | "IsRegion3EmptyWithIgnoreList" if doc::is_a(class, "WorldRoot") => (|| {
             let reg = match arg(args, 1) {
                 Value::Nil => return Err(missing(1)),
@@ -1813,6 +1814,86 @@ fn touching_others(lua: &Lua, args: &MultiValue) -> mlua::Result<MultiValue> {
     one(Value::Boolean(hit))
 }
 
+/// WorldRoot:StepPhysics(dt, parts = {}): manually advances the physics
+/// simulation on this WorldRoot (Workspace or WorldModel) by `dt` seconds.
+/// When `parts` is non-empty, only assemblies containing a listed BasePart are
+/// simulated and every other part in the WorldRoot is treated as anchored.
+fn step_physics(lua: &Lua, root: Ref, args: &MultiValue) -> mlua::Result<MultiValue> {
+    let dt = match arg(args, 1) {
+        Value::Nil => return Err(missing(1)),
+        _ => match num_arg(args, 1) {
+            Some(n) => n as f32,
+            None => return Err(rt_err("Unable to cast value to float")),
+        },
+    };
+    if !dt.is_finite() || dt < 0.0 {
+        return Err(rt_err("dt must be a positive number"));
+    }
+    let filter: Option<rustc_hash::FxHashSet<Ref>> = match arg(args, 2) {
+        Value::Nil => None,
+        Value::Table(t) => {
+            let w = world(lua)?;
+            let d = w.d();
+            let mut any = false;
+            let mut set: rustc_hash::FxHashSet<Ref> = Default::default();
+            for v in t.sequence_values::<Value>() {
+                let v = v?;
+                let Some(r) = opt_inst(&v) else {
+                    return Err(rt_err("Unable to cast value to Objects"));
+                };
+                any = true;
+                if is_part(d, r) {
+                    set.insert(r);
+                }
+            }
+            any.then_some(set)
+        }
+        _ => return Err(rt_err("Unable to cast value to Objects")),
+    };
+    if dt == 0.0 {
+        return none();
+    }
+    let mut w = world(lua)?;
+    if w.d().dom.get_by_ref(root).is_none() {
+        return none();
+    }
+    let groups = w.groups.clone();
+    let mut phys = match w.step_physics.remove(&root) {
+        Some(mut p) => {
+            p.set_step_filter(w.d(), filter.clone());
+            p
+        }
+        None => Box::new(rustudio_physics::physics::Physics::new_step_physics(
+            w.dm(),
+            root,
+            groups,
+            filter.clone(),
+        )),
+    };
+    let res = (|| {
+        phys.sync(w.dm());
+        let reqs = std::mem::take(&mut w.velocity_requests);
+        let (mine, other): (Vec<_>, Vec<_>) = {
+            let d = w.d();
+            reqs.into_iter().partition(|(r, _)| d.is_ancestor(root, *r))
+        };
+        w.velocity_requests = other;
+        for (r, v) in mine {
+            phys.set_velocity(r, v);
+        }
+        if let Some(ref parts) = filter {
+            phys.wake_parts(parts.iter().copied());
+        }
+        let _ = phys.step_manual(w.dm(), dt);
+        for (r, v) in phys.velocities() {
+            w.velocities.insert(r, v);
+        }
+        none()
+    })();
+    w.step_physics.insert(root, phys);
+    res
+}
+
 // --------------------------------------------------------------- Workspace
 
 const JOINABLE: &[u32] = &[1, 2, 3, 4, 5, 6]; // Glue, Weld, Studs, Inlet, Universal, Hinge…
@@ -2104,5 +2185,100 @@ mod tests {
             let last: i64 = rt.lua.globals().get("last").unwrap_or(0);
             assert!(diff.is_empty(), "step {i} (kind {last}): {}", diff.join("\n"));
         }
+    }
+
+    #[test]
+    fn step_physics_simulates_subset_and_enforces_plugin_security() {
+        let rt = Runtime::new().unwrap();
+        rt.enter(World::new(Document::new_place(), RunMode::Edit));
+        rt.bind_globals().unwrap();
+        let run_as = |ident: u8, src: &str| -> mlua::Result<()> {
+            let f = rt.lua.load(src).into_function()?;
+            let th = rt.lua.create_thread(f)?;
+            crate::runtime::security::set(&th, ident);
+            th.resume(())
+        };
+
+        // Game scripts (identity 2) lack Plugin capability.
+        let err = run_as(
+            crate::runtime::security::GAME,
+            "workspace:StepPhysics(1/60)",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.contains("lacking capability Plugin"),
+            "expected Plugin capability error, got: {err}"
+        );
+
+        // Plugin (identity 5) can step a targeted subset while keeping other
+        // unanchored parts frozen as obstacles, and welded neighbors move together.
+        run_as(
+            crate::runtime::security::PLUGIN_IDENT,
+            r#"
+            local floor = Instance.new("Part")
+            floor.Anchored = true
+            floor.Size = Vector3.new(40, 2, 40)
+            floor.Position = Vector3.new(0, 0, 0)
+            floor.Parent = workspace
+
+            local a = Instance.new("Part")
+            a.Anchored = false
+            a.Size = Vector3.new(2, 2, 2)
+            a.Position = Vector3.new(0, 20, 0)
+            a.AssemblyLinearVelocity = Vector3.new(10, 0, 0)
+            a.Parent = workspace
+
+            local welded = Instance.new("Part")
+            welded.Anchored = false
+            welded.Size = Vector3.new(2, 2, 2)
+            welded.Position = Vector3.new(0, 22, 0)
+            welded.Parent = workspace
+            local w = Instance.new("WeldConstraint")
+            w.Part0 = a
+            w.Part1 = welded
+            w.Parent = a
+
+            local b = Instance.new("Part")
+            b.Anchored = false
+            b.Size = Vector3.new(2, 2, 2)
+            b.Position = Vector3.new(10, 20, 0)
+            b.Parent = workspace
+
+            -- Step only `a`: `a` and its welded partner move; `b` stays frozen.
+            for _ = 1, 15 do
+                workspace:StepPhysics(1/60, {a})
+            end
+            assert(a.Position.Y < 16, "a should fall: " .. tostring(a.Position.Y))
+            assert(a.Position.X > 1.5, "a should keep horizontal velocity: " .. tostring(a.Position.X))
+            assert(a.AssemblyLinearVelocity.Y < -10, "a velocity should update: " .. tostring(a.AssemblyLinearVelocity.Y))
+            assert(welded.Position.Y < 18, "welded part should move with a: " .. tostring(welded.Position.Y))
+            assert(math.abs(b.Position.Y - 20) < 1e-4, "unlisted part b must stay anchored: " .. tostring(b.Position.Y))
+
+            -- Empty table `{}` steps all unanchored parts (default), including `b`.
+            workspace:StepPhysics(0.25, {})
+            assert(b.Position.Y < 16, "b should fall when parts={} (full 0.25s step): " .. tostring(b.Position.Y))
+
+            -- WorldModel:StepPhysics steps only parts inside that WorldModel.
+            local wm = Instance.new("WorldModel")
+            wm.Parent = game:GetService("ReplicatedStorage")
+            local p = Instance.new("Part")
+            p.Anchored = false
+            p.Size = Vector3.new(2, 2, 2)
+            p.Position = Vector3.new(0, 30, 0)
+            p.Parent = wm
+            local by_before = b.Position.Y
+            wm:StepPhysics(0.25)
+            assert(p.Position.Y < 26, "WorldModel part should fall: " .. tostring(p.Position.Y))
+            assert(math.abs(b.Position.Y - by_before) < 1e-4, "WorldModel step must not move Workspace parts")
+
+            -- Argument validation.
+            assert(not pcall(function() workspace:StepPhysics(-0.1) end))
+            assert(not pcall(function() workspace:StepPhysics(0/0) end))
+            assert(not pcall(function() workspace:StepPhysics(1/60, {123}) end))
+            workspace:StepPhysics(0, {a})
+            "#,
+        )
+        .unwrap();
     }
 }

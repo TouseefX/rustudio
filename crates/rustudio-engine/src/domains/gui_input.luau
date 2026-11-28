@@ -143,7 +143,11 @@ end
 get["GuiService.ReducedMotionEnabled"] = function()
     return (__rs_user_game_settings and __rs_user_game_settings.ReducedMotion) == true
 end
-get["GuiService.ViewportDisplaySize"] = function() return Enum.DisplaySize.Medium end
+-- Medium on a desktop; a simulated device's own size (measured per device).
+get["GuiService.ViewportDisplaySize"] = function()
+    local _, _, _, _, _, _, _, _, _, size = G.device()
+    return Enum.DisplaySize[size]
+end
 get["GuiService.IsWindows"] = function() return true end
 get["GuiService.CoreGuiFolder"] = function() return svc("CoreGui") end
 get["GuiService.CoreEffectFolder"] = function() return svc("CoreGui") end
@@ -357,6 +361,7 @@ end
 
 get["GuiService.TopbarInset"] = G.topbar_inset
 local function step_topbar()
+    if not G.is_client() or G.is_edit() then return end
     local rect = G.topbar_inset()
     if rect == topbar_seen then return end
     local first = topbar_seen == nil
@@ -487,6 +492,12 @@ methods["GuiService.GetInsetArea"] = function(_, insets)
     if insets == Enum.ScreenInsets.TopbarSafeInsets and inset > 0 then
         local bar = G.topbar_inset()
         return Rect.new(bar.Min.X, bar.Min.Y - inset, bar.Max.X, bar.Max.Y - inset)
+    end
+    -- None: the whole screen, under a simulated device's notch too
+    -- (measured, iPhone 14 portrait: (0, -105, 389, 738)).
+    if insets == Enum.ScreenInsets.None and inset > 0 then
+        local _, _, sw, sh, l, t = G.device()
+        return Rect.new(-l, -t - inset, sw - l, sh - t - inset)
     end
     return Rect.new(0, -inset, w, h - inset)
 end
@@ -664,6 +675,9 @@ end
 methods["ContextActionService.GetAllBoundCoreActionInfo"] = function(self)
     return LM.GetAllBoundCoreActionInfo(self)
 end
+methods["ContextActionService.FireActionButtonFoundSignal"] = function(self, name, button)
+    return LM.FireActionButtonFoundSignal(self, name, button)
+end
 local equipped_tool = nil
 methods["ContextActionService.GetCurrentLocalToolIcon"] = function()
     if equipped_tool and equipped_tool.Parent then return equipped_tool.TextureId end
@@ -785,7 +799,13 @@ end
 
 ----------------------------------------------------------------- PlayerGui
 local topbar = {}
-get["PlayerGui.CurrentScreenOrientation"] = function() return Enum.ScreenOrientation.LandscapeLeft end
+-- A simulated device's orientation (measured: Portrait, or LandscapeRight
+-- in landscape); LandscapeLeft with none.
+get["PlayerGui.CurrentScreenOrientation"] = function()
+    local portrait, simulated = G.device()
+    if portrait then return Enum.ScreenOrientation.Portrait end
+    return simulated and Enum.ScreenOrientation.LandscapeRight or Enum.ScreenOrientation.LandscapeLeft
+end
 methods["PlayerGui.GetTopbarTransparency"] = function(self) return topbar[self] or 0.5 end
 methods["PlayerGui.SetTopbarTransparency"] = function(self, v)
     v = tonumber(v)
@@ -2529,7 +2549,9 @@ local frame_dt = 1 / 60
 -- Min is (0, -58) in Studio's Play (GetInsetArea above).
 local function viewport_pos(x, y)
     local inset = (G.is_client() and not G.is_edit()) and 58 or 0
-    return Vector2.new(x, y + inset)
+    -- (a simulated device: from its whole screen's corner, notch included)
+    local _, _, _, _, l, t = G.device()
+    return Vector2.new(x + l, y + inset + t)
 end
 local function analog_input(kind, x, y)
     local key = Enum.KeyCode[kind]
@@ -2767,13 +2789,15 @@ do
             return inner(state, uit, key, x, y, z, dx, dy, gpe)
         end
     end
-    local touch_inner = __rs_touch_event
-    if touch_inner then
-        __rs_touch_event = function(state, id, x, y, dx, dy, gpe, began_on)
+    -- (a touch screen's fingers, library.luau; the simulated device's
+    -- mouse-as-touch has its own section below)
+    local finger_inner = __rs_finger_event
+    if finger_inner then
+        __rs_finger_event = function(state, id, x, y, dx, dy, gpe, began_on)
             local ok, err = pcall(touch_input, state, id, x, y, dx, dy, gpe, began_on)
             if not ok then log("error", "gui_input: " .. tostring(err)) end
             last_device = "Touch"
-            return touch_inner(state, id, x, y, dx, dy, gpe, began_on)
+            return finger_inner(state, id, x, y, dx, dy, gpe, began_on)
         end
     end
     local frame_end = __rs_input_frame_end
@@ -2783,6 +2807,135 @@ do
         if frame_end then return frame_end(dt) end
     end
 end
+-- Fingers (mouse-as-touch on a simulated phone or tablet) for the input
+-- action system's touch KeyCodes, as Roblox's Input Action System player
+-- scripts use them (InputContexts.rbxp): TouchPosition with a UIModifier
+-- follows a finger that began on that GuiObject (the DynamicThumbstick's
+-- ThumbstickAction, a ViewportPosition, (-1, -1) once it lifts; its
+-- context's Sink keeps that finger from lower contexts); TouchPosition with
+-- none follows any free finger (Bool: held); TouchDelta is a free finger's
+-- motion, as MouseDelta's rate (the touch camera); TouchPinch the change of
+-- two free fingers' distance (zoom). Which fingers count as free (not over
+-- a GUI that took them, not sunk by a UIModifier binding) and the pinch's
+-- units are estimates: the docs don't give them.
+do -- (its own scope: the chunk is near Luau's 200 locals)
+local fingers = {}
+local finger_order = {}
+local INACTIVE = Vector2.new(-1, -1)
+local function each_touch_binding(fn)
+    for c in tracked.InputContext do
+        if c.Enabled and c:IsDescendantOf(game) then
+            for _, a in c:GetChildren() do
+                if a:IsA("InputAction") and a.Enabled then
+                    for _, b in a:GetChildren() do
+                        if b:IsA("InputBinding") and b.Type ~= Enum.InputBindingType.Scriptable then
+                            local k = b.KeyCode
+                            if k == Enum.KeyCode.TouchPosition or k == Enum.KeyCode.TouchDelta or k == Enum.KeyCode.TouchPinch then
+                                fn(c, a, b, k)
+                            end
+                        end
+                    end
+                end
+            end
+        end
+    end
+end
+local function free_fingers()
+    local out = {}
+    for _, io in finger_order do
+        local f = fingers[io]
+        if f and not f.gpe and not f.sunk then table.insert(out, io) end
+    end
+    return out
+end
+local function position_value(a, f)
+    if a.Type == Enum.InputActionType.ViewportPosition then return viewport_pos(f.pos.X, f.pos.Y) end
+    if a.Type == Enum.InputActionType.Bool then return true end
+    return nil
+end
+local function touch_actions(kind, io, gpe)
+    if kind == "Began" then
+        fingers[io] = { pos = Vector2.new(io.Position.X, io.Position.Y), gpe = gpe, owns = {} }
+        table.insert(finger_order, io)
+        local f = fingers[io]
+        if not gpe then
+            each_touch_binding(function(_, a, b, k)
+                if k == Enum.KeyCode.TouchPosition and b.UIModifier == nil and not next(f.owns) then
+                    local v = position_value(a, f)
+                    if v ~= nil then f.owns[a] = true; set_state(a, v) end
+                end
+            end)
+        end
+        return
+    end
+    local f = fingers[io]
+    if not f then return end
+    local old = f.pos
+    f.pos = Vector2.new(io.Position.X, io.Position.Y)
+    if kind == "Moved" then
+        for a in f.owns do
+            local v = position_value(a, f)
+            if v ~= nil and a.Type ~= Enum.InputActionType.Bool then set_state(a, v) end
+        end
+        local free = free_fingers()
+        local d = f.pos - old
+        each_touch_binding(function(_, a, b, k)
+            if k == Enum.KeyCode.TouchDelta and #free == 1 and free[1] == io and a.Type == Enum.InputActionType.Direction2D then
+                analog[a] = (analog[a] or Vector2.zero) + d * b.Vector2Scale * b.Scale / frame_dt
+                set_state(a, keys_value(a) + analog[a])
+            elseif k == Enum.KeyCode.TouchPinch and #free == 2 and (free[1] == io or free[2] == io) and a.Type == Enum.InputActionType.Direction1D then
+                local other = fingers[free[1] == io and free[2] or free[1]]
+                local change = (f.pos - other.pos).Magnitude - (old - other.pos).Magnitude
+                analog[a] = (analog[a] or 0) + change * b.Scale / frame_dt
+                set_state(a, keys_value(a) + analog[a])
+            end
+        end)
+    elseif kind == "Ended" then
+        for a in f.owns do
+            if a.Parent ~= nil then set_state(a, a.Type == Enum.InputActionType.ViewportPosition and INACTIVE or zero_of(a.Type)) end
+        end
+        fingers[io] = nil
+        for i, o in finger_order do
+            if o == io then table.remove(finger_order, i) break end
+        end
+    end
+end
+-- A finger's InputBegan on a GuiObject (the GUI's own Touch event): the
+-- TouchPosition bindings whose UIModifier it is take that finger.
+local function touch_ui(obj, io)
+    local f = fingers[io]
+    if not f then return end
+    each_touch_binding(function(c, a, b, k)
+        if k == Enum.KeyCode.TouchPosition and b.UIModifier == obj and not f.owns[a] then
+            local v = position_value(a, f)
+            if v ~= nil then
+                f.owns[a] = true
+                if c.Sink then f.sunk = true end
+                set_state(a, v)
+            end
+        end
+    end)
+end
+do
+    local inner = __rs_touch_event
+    if inner then
+        __rs_touch_event = function(kind, id, x, y, dx, dy, gpe, ...)
+            local r = inner(kind, id, x, y, dx, dy, gpe, ...)
+            if kind == "Began" or kind == "Moved" or kind == "Ended" then
+                local io = __rs_touch_object(id)
+                local ok, err = pcall(touch_actions, kind, io, gpe or false)
+                if not ok then log("error", "gui_input touch: " .. tostring(err)) end
+            end
+            return r
+        end
+    end
+    __rs_touch_ui = function(obj, io)
+        local ok, err = pcall(touch_ui, obj, io)
+        if not ok then log("error", "gui_input touch: " .. tostring(err)) end
+    end
+end
+end
+
 local function step_mouse()
     local mouse = G.mouse()
     if mouse and not mouse_moved then fire(mouse, "Idle") end
@@ -3382,6 +3535,14 @@ end
 -- events (a press elsewhere ends typing first: a TextBox's FocusLost comes
 -- before the pressed button's Activated, as Studio; Argon reads its port box
 -- on FocusLost and connects on Activated).
+-- GuiService.TopbarInset's change, right after Camera.ViewportSize's
+-- (runtime_ext.rs fire_layout_changes).
+function M.step_topbar()
+    refresh_game()
+    local ok, err = pcall(step_topbar)
+    if not ok then log("error", "gui_input topbar: " .. tostring(err)) end
+end
+
 function M.focus_now()
     if not G.is_client() then return end
     local ok, err = xpcall(step_focus, debug.traceback)

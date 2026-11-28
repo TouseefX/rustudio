@@ -33,7 +33,7 @@ impl Physics {
     /// the frame's world steps.
     pub(super) fn prune_ropes(&mut self, doc: &Document) {
         if self.ropes.is_empty() { return; }
-        let Some(ws) = doc.workspace() else { return; };
+        let Some(ws) = self.root_of(doc) else { return; };
         self.ropes.retain(|&r| {
             let Some(i) = doc.dom.get_by_ref(r) else { return false };
             if i.class != "RopeConstraint" && i.class != "RodConstraint" { return false; }

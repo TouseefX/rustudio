@@ -53,7 +53,7 @@ const CELL_PAD: f32 = 6.0;
 const LABEL_MAX: f32 = 76.0;
 const GROUP_LEFT: f32 = 7.0;
 const GROUP_RIGHT: f32 = 4.0;
-const STRIP_H: f32 = 54.0;
+const STRIP_H: f32 = 50.0;
 const FAILED_BOX: Color32 = Color32::from_rgb(47, 48, 57);
 const ACTIVE_BOX: Color32 = Color32::from_rgb(64, 66, 74);
 const TIP_BG: Color32 = Color32::from_rgb(52, 54, 62);
@@ -299,13 +299,14 @@ mod elide_tests {
     }
 }
 
-/// True when a plugin ribbon group belongs to one of Roblox Studio's built-in
-/// plugins (`builtin_*.rbxm`). Real Studio 0.748 routes all built-in toolbars
-/// into Home, Model, Avatar, UI, Script, or top menus (File/View/Test/Window)
-/// via `Ribbon.rbxm` and `PluginUIRelayGuard`; only user/third-party plugins
-/// belong on the Plugins ribbon tab and Plugins menu.
+/// True when a plugin ribbon group belongs to a built-in plugin (Roblox
+/// Studio's `builtin_*.rbxm` or RusTudio's own bundled `rustudio_*` suite).
+/// Real Studio 0.748 routes all built-in toolbars into Home, Model, Avatar,
+/// UI, Script, or top menus (File/View/Test/Window) via `Ribbon.rbxm` and
+/// `PluginUIRelayGuard`; only user/third-party plugins belong on the Plugins
+/// ribbon tab and Plugins menu.
 pub fn is_builtin_plugin_group(plugin_name: &str) -> bool {
-    plugin_name.starts_with("builtin_")
+    plugin_name.starts_with("builtin_") || plugin_name.starts_with("rustudio_")
 }
 
 /// If a plugin ribbon group belongs to a Roblox built-in plugin that is
@@ -358,6 +359,63 @@ impl Editor {
                 (usable, Some(b.active))
             }
             None => (false, Some(false)),
+        }
+    }
+
+    /// Looks up a ribbon button belonging to a RusTudio bundled Luau plugin
+    /// (`rustudio_<stem>`) matching capability `cap` (by button id or toolbar name).
+    pub fn bundled_capability_button(&self, cap: &str) -> Option<&RibbonButton> {
+        let want_plugin = match cap {
+            "clip_editor" => Some("rustudio_AnimationEditor"),
+            "tag_editor" => Some("rustudio_TagEditor"),
+            "align" => Some("rustudio_AlignmentTool"),
+            "wind_direction" => Some("rustudio_WindControl"),
+            "collision_groups" => Some("rustudio_CollisionGroups"),
+            "audio_discovery" => Some("rustudio_AudioDiscovery"),
+            "material_manager" => Some("rustudio_MaterialManager"),
+            "pivot" | "pivot_reset" => Some("rustudio_PivotEditor"),
+            "style_editor" => Some("rustudio_StyleEditor"),
+            "nine_slice_editor" => Some("rustudio_9SliceEditor"),
+            "path_editor" => Some("rustudio_PathEditor"),
+            "texture_viewer" => Some("rustudio_TextureViewer"),
+            "player_emulator" => Some("rustudio_PlayerEmulator"),
+            "event_emulator" => Some("rustudio_EventEmulator"),
+            "force_visualization" => Some("rustudio_ForceVisualizationControl"),
+            "localization_tools" => Some("rustudio_LocalizationTools"),
+            "find_in_place" => Some("rustudio_FindInPlace"),
+            "object_browser" => Some("rustudio_ObjectBrowser"),
+            _ => None,
+        };
+        let groups: Vec<&RibbonGroup> = self
+            .plugin_bar
+            .model
+            .groups
+            .iter()
+            .filter(|g| g.plugin_name.starts_with("rustudio_"))
+            .filter(|g| {
+                want_plugin.is_some_and(|w| g.plugin_name.eq_ignore_ascii_case(w))
+                    || g.name.eq_ignore_ascii_case(cap)
+            })
+            .collect();
+        groups
+            .iter()
+            .flat_map(|g| g.buttons.iter())
+            .find(|b| b.id.eq_ignore_ascii_case(cap))
+            .or_else(|| want_plugin.and_then(|_| groups.iter().flat_map(|g| g.buttons.iter()).next()))
+    }
+
+    pub fn bundled_capability_state(&self, cap: &str) -> Option<(bool, Option<bool>)> {
+        let b = self.bundled_capability_button(cap)?;
+        let usable = b.enabled && (!self.viewport_hidden() || b.clickable_when_viewport_hidden);
+        Some((usable, Some(b.active)))
+    }
+
+    pub fn trigger_bundled_capability(&mut self, cap: &str) -> bool {
+        if let Some(r) = self.bundled_capability_button(cap).map(|b| b.r) {
+            self.plugin_fire(r, "Click");
+            true
+        } else {
+            false
         }
     }
 
@@ -438,7 +496,7 @@ impl Editor {
         if self.builtin_tools.use_roblox(rustudio_core::rustudio_settings::BuiltinTool::Draggers) {
             self.tool = Tool::None;
             self.trigger_promoted_plugin_button(stem);
-        } else {
+        } else if self.native_tool_loaded(super::builtin_suite::DRAGGERS_ID) {
             self.tool = self.tool.toggle(tool);
         }
     }
@@ -537,9 +595,7 @@ impl Editor {
                 }
                 None => {
                     if let Some(t) = self.plugin_bar.saved_tool.take() {
-                        let native_ok = !self
-                            .builtin_tools
-                            .use_roblox(rustudio_core::rustudio_settings::BuiltinTool::Draggers)
+                        let native_ok = self.native_tool_loaded(super::builtin_suite::DRAGGERS_ID)
                             || !matches!(t, Tool::Select | Tool::Move | Tool::Scale | Tool::Rotate);
                         if self.tool == Tool::None && native_ok {
                             self.tool = t;
@@ -724,7 +780,7 @@ impl Editor {
             let usable = b.enabled && (!hidden || b.clickable_when_viewport_hidden);
             let id = egui::Id::new(("plugin_button", b.r));
             let resp = ui.interact(cell.intersect(strip), id, Sense::click());
-            let boxr = Rect::from_center_size(egui::pos2(cell.center().x, strip.min.y + 2.0 + BOX / 2.0), Vec2::splat(BOX));
+            let boxr = Rect::from_center_size(egui::pos2(cell.center().x, strip.min.y + 1.0 + BOX / 2.0), Vec2::splat(BOX));
             if b.active {
                 painter.rect_filled(boxr, 4.0, ACTIVE_BOX);
             } else if usable && resp.hovered() {
@@ -733,7 +789,7 @@ impl Editor {
             let dim = |c: Color32| if usable { c } else { c.gamma_multiply(0.45) };
             self.paint_plugin_icon(&ctx, &painter, boxr, &b.icon, dim(Color32::WHITE), dim(theme::TEXT));
             painter.text(
-                egui::pos2(cell.center().x, strip.min.y + 2.0 + BOX + 11.0),
+                egui::pos2(cell.center().x, strip.min.y + 1.0 + BOX + 9.0),
                 egui::Align2::CENTER_CENTER,
                 label,
                 font.clone(),

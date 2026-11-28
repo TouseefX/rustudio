@@ -1980,34 +1980,60 @@ fn anim_editor_sync_selection_switches_rigs_and_loads_latest_clip() {
     );
     app.ed.game.doc = doc_a;
     let ed = &mut app.ed;
-    ed.ui.panels_open.insert("Animation Editor");
+    ed.plugins
+        .native_mut()
+        .note_widget_open(crate::anim_editor::host::PLUGIN_ID, true);
 
     // 1. Select Rig A -> attaches Rig A and loads RigA_Clip.
     ed.select(vec![rig_a]);
-    ed.anim_editor_sync_selection();
-    assert_eq!(ed.anim_editor.rig_cache.root_ref, Some(rig_a));
-    assert_eq!(
-        ed.anim_editor.animation_data.as_ref().map(|d| d.metadata.name.as_str()),
-        Some("RigA_Clip")
-    );
+    ed.native_plugins_tick();
+    {
+        let p = ed
+            .plugins
+            .native_plugin::<crate::anim_editor::host::AnimationEditorPlugin>(
+                crate::anim_editor::host::PLUGIN_ID,
+            )
+            .expect("AnimationEditorPlugin loaded");
+        assert_eq!(p.state.rig_cache.root_ref, Some(rig_a));
+        assert_eq!(
+            p.state.animation_data.as_ref().map(|d| d.metadata.name.as_str()),
+            Some("RigA_Clip")
+        );
+    }
 
     // 2. Select Rig B -> must switch even though Rig A already had an active animation,
     //    discover Rig B's ServerStorage.RBX_ANIMSAVES saves, and load RigB_Latest!
     ed.select(vec![rig_b]);
-    ed.anim_editor_sync_selection();
-    assert_eq!(ed.anim_editor.rig_cache.root_ref, Some(rig_b));
-    assert_eq!(
-        ed.anim_editor.animation_data.as_ref().map(|d| d.metadata.name.as_str()),
-        Some("RigB_Latest")
-    );
-
-    // 3. Selecting a child part of Rig B keeps Rig B attached without resetting animation_data.
-    let head_b = *ed.anim_editor.rig_cache.part_refs.get("Head").unwrap();
-    ed.anim_editor.playback.playhead = 1200;
+    ed.native_plugins_tick();
+    let head_b = {
+        let p = ed
+            .plugins
+            .native_plugin_mut::<crate::anim_editor::host::AnimationEditorPlugin>(
+                crate::anim_editor::host::PLUGIN_ID,
+            )
+            .expect("AnimationEditorPlugin loaded");
+        assert_eq!(p.state.rig_cache.root_ref, Some(rig_b));
+        assert_eq!(
+            p.state.animation_data.as_ref().map(|d| d.metadata.name.as_str()),
+            Some("RigB_Latest")
+        );
+        // 3. Selecting a child part of Rig B keeps Rig B attached without resetting animation_data.
+        let head_b = *p.state.rig_cache.part_refs.get("Head").unwrap();
+        p.state.playback.playhead = 1200;
+        head_b
+    };
     ed.select(vec![head_b]);
-    ed.anim_editor_sync_selection();
-    assert_eq!(ed.anim_editor.rig_cache.root_ref, Some(rig_b));
-    assert_eq!(ed.anim_editor.playback.playhead, 1200);
+    ed.native_plugins_tick();
+    {
+        let p = ed
+            .plugins
+            .native_plugin::<crate::anim_editor::host::AnimationEditorPlugin>(
+                crate::anim_editor::host::PLUGIN_ID,
+            )
+            .expect("AnimationEditorPlugin loaded");
+        assert_eq!(p.state.rig_cache.root_ref, Some(rig_b));
+        assert_eq!(p.state.playback.playhead, 1200);
+    }
 }
 
 #[test]

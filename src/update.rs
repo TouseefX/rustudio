@@ -437,7 +437,12 @@ fn remove_leftovers() {
     } else if let Ok(dir) = std::fs::read_dir(&root) {
         for e in dir.flatten() {
             if e.file_name().to_string_lossy().ends_with(".update-old") {
-                let _ = std::fs::remove_file(e.path());
+                let path = e.path();
+                if path.is_dir() {
+                    let _ = std::fs::remove_dir_all(path);
+                } else {
+                    let _ = std::fs::remove_file(path);
+                }
             }
         }
     }
@@ -525,7 +530,43 @@ fn unpack_and_swap(data: &[u8], name: &str, stage: &Path, root: &Path) -> Result
         }
         std::fs::rename(&tmp, &dst).map_err(|e| format!("can't put {} in place: {e}", dst.display()))?;
     }
+    let src_plugins = folder.join("plugins");
+    if src_plugins.is_dir() {
+        let dst = root.join("plugins");
+        let tmp = root.join("plugins.update-new");
+        let old = root.join("plugins.update-old");
+        let _ = std::fs::remove_dir_all(&tmp);
+        copy_dir_all(&src_plugins, &tmp)
+            .map_err(|e| format!("can't copy plugins to {}: {e}", tmp.display()))?;
+        let had_old = dst.exists();
+        if had_old {
+            let _ = std::fs::remove_dir_all(&old);
+            std::fs::rename(&dst, &old)
+                .map_err(|e| format!("can't move {}: {e}", dst.display()))?;
+        }
+        if let Err(e) = std::fs::rename(&tmp, &dst) {
+            if had_old {
+                let _ = std::fs::rename(&old, &dst);
+            }
+            return Err(format!("can't put {} in place: {e}", dst.display()));
+        }
+    }
     Ok(root.join(exe_name))
+}
+
+fn copy_dir_all(src: &Path, dst: &Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(dst)?;
+    for entry in std::fs::read_dir(src)? {
+        let entry = entry?;
+        let from = entry.path();
+        let to = dst.join(entry.file_name());
+        if from.is_dir() {
+            copy_dir_all(&from, &to)?;
+        } else {
+            std::fs::copy(&from, &to)?;
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]

@@ -325,6 +325,13 @@ pub struct CloudUi {
     play_when_loaded: Option<rustudio_engine::runtime::RunMode>,
     /// The live session that ended while its document stays open.
     ended_live: Option<live_status::EndedLive>,
+    /// Team Create account-risk confirmation pending before joining a live session.
+    tc_confirm: Option<CloudOrigin>,
+    /// User acknowledged the unofficial Team Create protocol warning this session
+    /// (or permanently via "Don't show this again").
+    tc_risk_accepted: bool,
+    /// Checkbox state inside the Team Create warning modal.
+    tc_dont_show_again: bool,
 }
 
 // The MCP server's view of the live session (src/mcp).
@@ -342,6 +349,25 @@ fn live_source_text(value:&rustudio_net::replicator::PropValue)->Option<String> 
 
 /// How long after an edit is sent a disconnect still leaves it in doubt.
 const UNCONFIRMED_WINDOW: std::time::Duration = std::time::Duration::from_secs(10);
+
+fn tc_warning_marker_path() -> std::path::PathBuf {
+    dirs::config_dir()
+        .unwrap_or_else(|| std::path::PathBuf::from("."))
+        .join("rustudio")
+        .join("tc-warning-accepted")
+}
+
+fn tc_warning_persisted() -> bool {
+    tc_warning_marker_path().is_file()
+}
+
+fn persist_tc_warning_accepted() {
+    let path = tc_warning_marker_path();
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let _ = std::fs::write(&path, "accepted\n");
+}
 
 /// The server's reason, when the stream reset carries a Roblox disconnect
 /// code (QUIC application error `0x100_0000_0000 | code`; the texts are
@@ -418,6 +444,10 @@ impl CloudUi {
             opening: 0,
             play_when_loaded: None,
             ended_live: None,
+            tc_confirm: None,
+            tc_risk_accepted: std::env::var_os("RUSTUDIO_TC_SKIP_WARNING").is_some()
+                || tc_warning_persisted(),
+            tc_dont_show_again: false,
         }
     }
 
@@ -427,7 +457,7 @@ impl CloudUi {
 
     /// The API for a job: the session's (a downloader copy, so the account
     /// lock isn't held), or the self-test's mock.
-    fn factory(&self, client: Option<rustudio_core::assets::SharedClient>) -> ApiFactory {
+    pub(crate) fn factory(&self, client: Option<rustudio_core::assets::SharedClient>) -> ApiFactory {
         if let Some(f) = &self.api_override {
             return f.clone();
         }
@@ -817,19 +847,13 @@ impl Editor {
                     self.cloud.join = None;
                 }
                 Msg::TeamCreateOn(o) => {
-                    // As in Studio: a Team Create place opens by joining
-                    // its live session, without asking.
                     self.cloud.opening = self.cloud.opening.saturating_sub(1);
-                    let j = self.cloud.join.get_or_insert_with(|| crate::join_ui::JoinProgress::new(o.place_id));
-                    j.found(o.universe_id, &o.name, &o.experience);
-                    let api = self.cloud.factory(self.game.account.shared_client());
-                    self.cloud.request_icons(api, vec![o.universe_id]);
-                    self.info(format!(
-                        "Team Create is on for {} (universe {}): joining the live session",
-                        o.experience, o.universe_id
-                    ));
-                    self.cloud.live_origin = Some((*o).clone());
-                    self.open_team_create(o.universe_id, o.place_id);
+                    if !self.cloud.tc_risk_accepted {
+                        self.cloud.join = None;
+                        self.cloud.tc_confirm = Some(*o);
+                    } else {
+                        self.begin_team_create_join(*o);
+                    }
                 }
                 Msg::OpenFailed(e) => {
                     self.cloud.opening = self.cloud.opening.saturating_sub(1);
@@ -2088,8 +2112,88 @@ impl Editor {
         self.place_info_window(ctx);
         self.conflict_modal(ctx);
         self.copy_save_modal(ctx);
+        self.tc_confirm_modal(ctx);
         self.save_error_modal(ctx);
         self.join_modal(ctx);
+    }
+
+    fn begin_team_create_join(&mut self, o: CloudOrigin) {
+        let j = self.cloud.join.get_or_insert_with(|| crate::join_ui::JoinProgress::new(o.place_id));
+        j.found(o.universe_id, &o.name, &o.experience);
+        let api = self.cloud.factory(self.game.account.shared_client());
+        self.cloud.request_icons(api, vec![o.universe_id]);
+        self.info(format!(
+            "Team Create is on for {} (universe {}): joining the live session",
+            o.experience, o.universe_id
+        ));
+        self.cloud.live_origin = Some(o.clone());
+        self.open_team_create(o.universe_id, o.place_id);
+    }
+
+    fn tc_confirm_modal(&mut self, ctx: &egui::Context) {
+        let Some(origin) = self.cloud.tc_confirm.clone() else { return; };
+        let mut choice: Option<&str> = None;
+        egui::Window::new("Team Create Warning")
+            .id(egui::Id::new("tc_confirm_modal"))
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .fixed_size([440.0, 0.0])
+            .show(ctx, |ui| {
+                ui.label(
+                    egui::RichText::new(format!(
+                        "\"{}\" has Team Create enabled.",
+                        origin.experience
+                    ))
+                    .strong(),
+                );
+                ui.add_space(6.0);
+                ui.label(
+                    "Joining a live Team Create session from RusTudio uses an unofficial implementation \
+                     of Roblox's live replication protocol. Using it may risk account moderation or \
+                     unexpected sync issues compared to opening a local copy.",
+                );
+                ui.add_space(8.0);
+                ui.checkbox(&mut self.cloud.tc_dont_show_again, "Don't show this warning again");
+                ui.add_space(10.0);
+                ui.horizontal(|ui| {
+                    if ui.button("Open Local Copy (Safe)").clicked() {
+                        choice = Some("copy");
+                    }
+                    if ui
+                        .add(
+                            egui::Button::new(
+                                egui::RichText::new("Join Live Session Anyway")
+                                    .color(egui::Color32::from_rgb(255, 200, 140)),
+                            ),
+                        )
+                        .clicked()
+                    {
+                        choice = Some("join");
+                    }
+                    if ui.button("Cancel").clicked() {
+                        choice = Some("cancel");
+                    }
+                });
+            });
+        match choice {
+            Some("join") => {
+                self.cloud.tc_confirm = None;
+                self.cloud.tc_risk_accepted = true;
+                if self.cloud.tc_dont_show_again {
+                    persist_tc_warning_accepted();
+                }
+                self.begin_team_create_join(origin);
+            }
+            Some("copy") => {
+                self.cloud.tc_confirm = None;
+                self.perform_open_cloud(origin.place_id, None, true);
+            }
+            Some("cancel") => {
+                self.cloud.tc_confirm = None;
+            }
+            _ => {}
+        }
     }
 
     fn live_collaborators_window(&mut self,ctx:&egui::Context) {
@@ -2243,97 +2347,9 @@ impl Editor {
         }
     }
 
-    /// File > Experience Settings: what the open place is on Roblox.
+    /// File > Experience Settings: Studio's full Game Settings dialog (`src/game_settings_ui.rs`).
     fn place_info_window(&mut self, ctx: &egui::Context) {
-        if !self.cloud.settings_open {
-            return;
-        }
-        let mut open = true;
-        let origin = self.game.doc.cloud.clone();
-        let mut refresh = false;
-        egui::Window::new("Experience Settings")
-            .open(&mut open)
-            .default_width(420.0)
-            .resizable(true)
-            .show(ctx, |ui| {
-                let Some(o) = origin else {
-                    ui.label("This place isn't on Roblox: it was opened from a file or made here.");
-                    ui.label(
-                        RichText::new("Open one with File > Open from Roblox to see its experience, creator and version here.")
-                            .color(theme::TEXT_DIM),
-                    );
-                    return;
-                };
-                ui.label(RichText::new("Basic Info").strong());
-                egui::Grid::new("place_info").num_columns(2).spacing([16.0, 4.0]).show(ui, |ui| {
-                    let mut row = |k: &str, v: String| {
-                        ui.label(RichText::new(k).color(theme::TEXT_DIM));
-                        ui.label(v);
-                        ui.end_row();
-                    };
-                    row("Place", o.name.clone());
-                    row("Experience", o.experience.clone());
-                    row("Creator", format!("{} ({} {})", o.creator_label(), o.creator_type.as_str(), o.creator_id));
-                    row("Place ID", o.place_id.to_string());
-                    row("Universe ID", o.universe_id.to_string());
-                    row(
-                        "Start place",
-                        if o.root_place_id == o.place_id { "this place".into() } else { o.root_place_id.to_string() },
-                    );
-                    row(
-                        "Opened as",
-                        if o.local_copy {
-                            "a local copy of the last saved version (Team Create is on)".into()
-                        } else {
-                            "the saved version on Roblox".into()
-                        },
-                    );
-                    row("Version", format!("{}{}", o.version, if self.game.doc.dirty() { " (unsaved changes)" } else { "" }));
-                    row("Cached at", self.cloud.cache.dir(o.place_id).display().to_string());
-                });
-                ui.separator();
-                ui.label(RichText::new("Team Create").strong());
-                match self.cloud.status.as_ref().filter(|(u, _)| *u == o.universe_id) {
-                    Some((_, st)) => {
-                        ui.label(st.describe());
-                        let yn = |b: Option<bool>| match b {
-                            Some(true) => "yes",
-                            Some(false) => "no",
-                            None => "unknown",
-                        };
-                        ui.label(
-                            RichText::new(format!(
-                                "Can collaborate: {}{} · can manage: {} · can edit in the cloud: {}",
-                                yn(st.can_collaborate),
-                                st.reason.as_ref().map(|r| format!(" ({r})")).unwrap_or_default(),
-                                yn(st.can_manage),
-                                yn(st.can_cloud_edit)
-                            ))
-                            .small()
-                            .color(theme::TEXT_DIM),
-                        );
-                    }
-                    None => {
-                        ui.label(RichText::new("Not checked yet.").color(theme::TEXT_DIM));
-                    }
-                }
-                if ui.add_enabled(!self.cloud.busy(), egui::Button::new("Check again")).clicked() {
-                    refresh = true;
-                }
-            });
-        if refresh {
-            if let Some(u) = self.game.doc.cloud.as_ref().map(|o| o.universe_id) {
-                let api = self.cloud.factory(self.game.account.shared_client());
-                self.cloud.spawn(api, move |a, tx| {
-                    if let Some(a) = a {
-                        let _ = tx.send(Msg::Status(u, a.team_create(u)));
-                    }
-                });
-            }
-        }
-        if !open {
-            self.cloud.settings_open = false;
-        }
+        self.game_settings_window(ctx);
     }
 
     fn picker_window(&mut self, ctx: &egui::Context) {

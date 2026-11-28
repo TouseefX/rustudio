@@ -59,14 +59,15 @@ pub enum Tab {
     AvatarSettings,
     /// Studio's Terrain Editor (Home / View > Terrain Editor).
     TerrainEditor,
-    /// Studio's Animation Editor (Avatar > Clip Editor): src/anim_editor.
-    AnimationEditor,
     /// Studio's Toolbox (Home / View > Toolbox): src/toolbox.
     Toolbox,
     /// Studio's Asset Manager (Home > Assets, Window > Asset Manager): src/asset_manager.
     AssetManager,
     /// File Sync (src/file_sync): the project attached to the place.
     FileSync,
+    /// The Device Simulator's Controller Emulator (src/device_sim/controller.rs):
+    /// open, the virtual controller is on.
+    ControllerEmulator,
     /// View > MicroProfiler (Ctrl+F6): the profiler window
     /// (crates/rustudio-profiler-ui), its own OS window by default.
     Profiler,
@@ -86,10 +87,10 @@ impl Tab {
             Tab::Output => "Output",
             Tab::AvatarSettings => "Avatar Settings",
             Tab::TerrainEditor => "Terrain Editor",
-            Tab::AnimationEditor => "Animation Editor",
             Tab::Toolbox => "Toolbox",
             Tab::AssetManager => "Asset Manager",
             Tab::FileSync => "File Sync",
+            Tab::ControllerEmulator => "Controller Emulator",
             Tab::Profiler => "MicroProfiler",
             Tab::Script(_) => "Script",
             Tab::Plugin(_) => "Plugin",
@@ -133,6 +134,9 @@ pub struct Harness {
     pub plugin_dirs: Vec<PathBuf>,
     pub no_plugins: bool,
     pub plugins_started: bool,
+    /// `--device ID [--portrait]`: the Device Simulator shows that device
+    /// (this run only).
+    pub device: Option<(String, bool)>,
 }
 
 #[cfg(test)]
@@ -146,6 +150,7 @@ impl Harness {
                     actions: Vec::new(),
                     pointer: None,
                     shift: false,
+                    mods: egui::Modifiers::NONE,
                 },
                 started: rustudio_core::sim_clock::now(),
                 held: 0.0,
@@ -189,6 +194,7 @@ impl Harness {
             plugin_dirs: Vec::new(),
             no_plugins: true,
             plugins_started: false,
+            device: None,
         }
     }
 }
@@ -252,6 +258,7 @@ impl Harness {
             plugin_dirs: Vec::new(),
             no_plugins: false,
             plugins_started: false,
+            device: None,
         }
     }
 }
@@ -326,8 +333,6 @@ pub struct Editor {
     pub file_sync: crate::file_sync::FileSync,
     /// The Terrain Editor's tools and settings.
     pub terrain_ed: crate::terrain_editor::TerrainEditor,
-    /// The Animation Editor's state (src/anim_editor).
-    pub anim_editor: crate::anim_editor::AnimationEditor,
     /// The Toolbox panel's state (src/toolbox), kept while it is hidden.
     pub toolbox: crate::toolbox::Toolbox,
     /// The Asset Manager panel's state (src/asset_manager), kept while hidden.
@@ -345,6 +350,8 @@ pub struct Editor {
     pub last_zoom: Option<(Vec3, Option<f32>)>,
     pub hud: HudStats,
     pub ui_rects: HashMap<&'static str, egui::Rect>,
+    /// Test > Device Simulator: the simulated device and how it is shown.
+    pub device_sim: crate::device_sim::DeviceSim,
     /// Screen positions of gizmo handles last frame (axis, sign) -> point.
     pub gizmo_points: Vec<(crate::viewport::Handle, egui::Pos2)>,
     /// Selection / hover outlines kept while nothing they depend on changes.
@@ -405,8 +412,13 @@ pub struct Editor {
     pub pending_user_shot: Option<PathBuf>,
     /// The Start Page (src/start_page.rs): shown when nothing is open.
     pub start: crate::start_page::StartPage,
+    /// File > Experience Settings (src/game_settings_ui.rs).
+    pub game_settings: crate::game_settings_ui::GameSettingsState,
     /// Requests switching to the main viewport tab.
     pub switch_to_viewport: bool,
+    /// In-flight yielding Command Bar evaluations `(play_side, eval_id)`.
+    pub(crate) command_evals: Vec<(Option<rustudio_engine::runtime::Side>, u64)>,
+    pub(crate) command_eval_seq: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -499,12 +511,12 @@ pub fn default_dock_for(choices: rustudio_core::rustudio_settings::BuiltinToolCh
     dock
 }
 
-fn native_tab_enabled(tab: Tab, choices: rustudio_core::rustudio_settings::BuiltinToolChoices) -> bool {
-    use rustudio_core::rustudio_settings::BuiltinTool;
+fn native_tab_enabled(tab: Tab, ed: &Editor) -> bool {
+    use crate::plugin_host::builtin_suite;
     match tab {
-        Tab::Toolbox => choices.use_native(BuiltinTool::Toolbox),
-        Tab::TerrainEditor => choices.use_native(BuiltinTool::TerrainEditor),
-        Tab::AnimationEditor => choices.use_native(BuiltinTool::AnimationEditor),
+        Tab::Toolbox => ed.native_tool_loaded(builtin_suite::TOOLBOX_ID),
+        Tab::TerrainEditor => ed.native_tool_loaded(builtin_suite::TERRAIN_EDITOR_ID),
+        Tab::AssetManager => ed.native_tool_loaded(builtin_suite::ASSET_MANAGER_ID),
         _ => true,
     }
 }
@@ -512,10 +524,10 @@ fn native_tab_enabled(tab: Tab, choices: rustudio_core::rustudio_settings::Built
 fn strip_disabled_native_tabs(
     dock: &mut DockState<Tab>,
     panels: &mut crate::panels::Panels,
-    choices: rustudio_core::rustudio_settings::BuiltinToolChoices,
+    ed: &Editor,
 ) {
-    for tab in [Tab::Toolbox, Tab::TerrainEditor, Tab::AnimationEditor] {
-        if !native_tab_enabled(tab, choices) {
+    for tab in [Tab::Toolbox, Tab::TerrainEditor, Tab::AssetManager] {
+        if !native_tab_enabled(tab, ed) {
             panels.take(dock, &tab);
         }
     }
@@ -598,7 +610,6 @@ impl RustudioApp {
             mcp: Default::default(),
             file_sync: Default::default(),
             terrain_ed: Default::default(),
-            anim_editor: Default::default(),
             toolbox: Default::default(),
             asset_manager: Default::default(),
             profiler: None,
@@ -608,6 +619,7 @@ impl RustudioApp {
             last_zoom: None,
             hud: HudStats::default(),
             ui_rects: HashMap::new(),
+            device_sim: crate::device_sim::DeviceSim::load(),
             gizmo_points: Vec::new(),
             outline_cache: Default::default(),
             hover_outline_refs: (None, Vec::new()),
@@ -636,8 +648,12 @@ impl RustudioApp {
             ui: crate::studio_ui::UiState::default(),
             pending_user_shot: None,
             start: Default::default(),
+            game_settings: Default::default(),
             switch_to_viewport: false,
+            command_evals: Vec::new(),
+            command_eval_seq: 0,
         };
+        ed.init_native_plugin_suite();
         ed.info(format!(
             "rustudio {} ready. Reflection database has {} classes.",
             env!("CARGO_PKG_VERSION"),
@@ -696,6 +712,20 @@ impl RustudioApp {
         // unless --overlays keeps the editor's overlays.
         if ed.harness.run.no_ui && !ed.harness.overlays {
             ed.clean_view = true;
+        }
+        // Custom devices (Manage devices) are a person's own: read only in
+        // runs a person drives.
+        if crate::layout_store::enabled(&ed.harness) {
+            ed.device_sim.load_custom();
+        }
+        if let Some((id, portrait)) = ed.harness.device.clone() {
+            ed.device_sim.shown = true;
+            ed.device_sim.select(Some(&id));
+            ed.device_sim.orientation = if portrait {
+                rustudio_core::devices::Orientation::Portrait
+            } else {
+                rustudio_core::devices::Orientation::Landscape
+            };
         }
         ed.ui.show_core_gui = ed.harness.run.show_core_gui;
         ed.game.show_core_gui = ed.harness.run.show_core_gui;
@@ -784,7 +814,7 @@ impl RustudioApp {
             crate::plugin_host::widgets_ui::set_persist_dir(Some(rustudio_core::paths::config().join("rustudio")));
         }
         ed.game.show_core_gui = ed.ui.show_core_gui;
-        strip_disabled_native_tabs(&mut dock, &mut panels, ed.builtin_tools);
+        strip_disabled_native_tabs(&mut dock, &mut panels, &ed);
         // (a GPU validation error is a logcat line, not the end of the
         // process: src/android/mod.rs install_gpu_error_handler. Set after
         // Game::new, so it replaces gpu_health::watch's handlers — the
@@ -1025,7 +1055,18 @@ impl Editor {
     /// Manage Plugins, permission prompts, Publish as Plugin.
     pub fn plugins_ui(&mut self, ctx: &egui::Context) {
         let client = self.game.account.shared_client();
-        crate::plugin_store::ui::show(ctx, &mut self.plugin_store, client);
+        let suite_dir = crate::plugin_host::source::rustudio_suite_plugins_dir();
+        let suite = self.suite_items();
+        let actions = crate::plugin_store::ui::show_with_suite(
+            ctx,
+            &mut self.plugin_store,
+            client,
+            suite_dir.as_deref(),
+            &suite,
+        );
+        if !actions.is_empty() {
+            self.apply_suite_actions(actions);
+        }
         // Plugin menus (ShowAsync), Customize Shortcuts, bound plugin keys.
         self.plugin_popups(ctx);
         self.customize_shortcuts_window(ctx);
@@ -1054,6 +1095,7 @@ impl Editor {
 
     pub fn set_document(&mut self, doc: Document) {
         self.reset_cloud_save_dialogs();
+        self.game_settings.reset_for_new_place();
         // Another document closes the open project (open_project sets it again).
         self.project = None;
         crate::project_config::set_active(None);
@@ -1094,18 +1136,10 @@ impl Editor {
         // old place's go, the new place gets them all.
         self.plugin_store.on_place_opened();
         self.builtin_tools = rustudio_core::rustudio_settings::BuiltinToolChoices::from_settings();
-        if self.builtin_tools.use_roblox(rustudio_core::rustudio_settings::BuiltinTool::Draggers) {
-            if matches!(self.tool, Tool::Select | Tool::Move | Tool::Scale | Tool::Rotate) {
-                self.tool = Tool::None;
-            }
-        } else if self.tool == Tool::None {
+        self.native_plugins_on_place_changed();
+        self.sync_native_builtins();
+        if self.native_tool_loaded(crate::plugin_host::builtin_suite::DRAGGERS_ID) && self.tool == Tool::None {
             self.tool = Tool::Select;
-        }
-        if !self.builtin_tools.use_native(rustudio_core::rustudio_settings::BuiltinTool::RigBuilder) {
-            self.chars.open = false;
-        }
-        if !self.builtin_tools.use_native(rustudio_core::rustudio_settings::BuiltinTool::TerrainEditor) {
-            self.terrain_ed.tool = None;
         }
         if self.harness.plugins_started && !self.harness.no_plugins {
             self.plugins.replace_builtins(self.builtin_tools);
@@ -1306,8 +1340,8 @@ impl Editor {
                 self.save_local_plugin_to(path);
             }
             Purpose::TerrainImage { height } => self.load_import_image(path, height),
-            Purpose::AnimImportFbx | Purpose::AnimImportRbxm | Purpose::AnimExportRbxm => {
-                self.anim_editor_handle_file(&purpose, path)
+            Purpose::NativePlugin { plugin_id, tag } => {
+                self.native_plugin_handle_file(&plugin_id, &tag, path)
             }
             Purpose::FileSyncProject => self.file_sync.pick = path.display().to_string(),
             Purpose::ProjectParent => {
@@ -1317,6 +1351,8 @@ impl Editor {
             }
             Purpose::AssetManagerImport => self.asset_manager_import_files(vec![path]),
             Purpose::TemplateAdd | Purpose::TemplateThumb(_) | Purpose::TemplateReplace(_) => self.start_template_file(&purpose, path),
+            Purpose::GameSettingsIcon => self.game_settings_picked_image(true, path),
+            Purpose::GameSettingsThumbnail => self.game_settings_picked_image(false, path),
         }
     }
 
@@ -1809,7 +1845,7 @@ impl Editor {
     pub fn build_demo(&mut self) {
         let last = build_demo_parts(&mut self.game.doc);
         self.game.doc.selection = vec![last];
-        if self.builtin_tools.use_native(rustudio_core::rustudio_settings::BuiltinTool::Draggers) {
+        if self.native_tool_loaded(crate::plugin_host::builtin_suite::DRAGGERS_ID) {
             self.tool = Tool::Move;
         }
         self.game.cam = Camera::default();
@@ -1937,7 +1973,7 @@ impl Editor {
     /// Puts a line on the system clipboard after a copy: egui-winit only
     /// delivers Ctrl+V when the system clipboard holds text.
     pub fn note_os_clipboard(&self, ctx: &egui::Context) {
-        if self.builtin_tools.use_native(rustudio_core::rustudio_settings::BuiltinTool::TerrainEditor)
+        if self.native_tool_loaded(crate::plugin_host::builtin_suite::TERRAIN_EDITOR_ID)
             && self.terrain_ed.tool.is_some_and(crate::terrain_editor::Tool::is_region)
         {
             if self.terrain_ed.clipboard.is_some() && self.harness.selftest.is_none() {
@@ -1952,7 +1988,7 @@ impl Editor {
 
     pub fn run_action(&mut self, a: &str) {
         // A Terrain Editor Region tool has Copy, Cut, Paste, Duplicate and Delete.
-        if self.builtin_tools.use_native(rustudio_core::rustudio_settings::BuiltinTool::TerrainEditor)
+        if self.native_tool_loaded(crate::plugin_host::builtin_suite::TERRAIN_EDITOR_ID)
             && self.terrain_ed.tool.is_some_and(crate::terrain_editor::Tool::is_region)
             && matches!(a, "copy" | "cut" | "paste" | "duplicate" | "delete")
             && self.terrain_region_action(a)
@@ -1962,6 +1998,7 @@ impl Editor {
         match a {
             "undo" => self.undo(),
             "redo" => self.redo(),
+            a if (a.starts_with("device") || a == "device_simulator") && self.device_sim_action(a) => {}
             "copy" => {
                 self.copy();
             }
@@ -2274,11 +2311,11 @@ impl TabViewer for Viewer<'_> {
             Tab::Output => self.ed.output_ui(ui),
             Tab::AvatarSettings => self.ed.avatar_settings_ui(ui),
             Tab::TerrainEditor => self.ed.terrain_editor_ui(ui),
-            Tab::AnimationEditor => self.ed.anim_editor_ui(ui),
             Tab::Plugin(n) => self.ed.plugin_widget_ui(ui, *n),
             Tab::Toolbox => self.ed.toolbox_ui(ui),
             Tab::AssetManager => self.ed.asset_manager_ui(ui),
             Tab::FileSync => self.ed.file_sync_panel_ui(ui),
+            Tab::ControllerEmulator => self.ed.controller_emulator_ui(ui),
             Tab::Profiler => {
                 let rect = ui.available_rect_before_wrap();
                 let mut c = ui.new_child(egui::UiBuilder::new().max_rect(rect));
@@ -2402,7 +2439,7 @@ impl RustudioApp {
     fn reset_document_tabs(&mut self) {
         if std::mem::take(&mut self.ed.document_tabs_reset) {
             crate::panels::close_document_tabs(&mut self.dock, &mut self.panels);
-            strip_disabled_native_tabs(&mut self.dock, &mut self.panels, self.ed.builtin_tools);
+            strip_disabled_native_tabs(&mut self.dock, &mut self.panels, &self.ed);
             self.ed.ui.popped.clear();
             self.ed.ui.viewport_group.clear();
         }
@@ -2577,8 +2614,8 @@ impl eframe::App for RustudioApp {
             // layer is for the editor's chrome and 3D view, once a place
             // is open.
             let start_page = self.ed.start.visible && self.ed.game.doc.id == self.ed.start.doc_id;
-            self.ed.game.touch.set_enabled(!start_page, raw);
-            self.ed.game.touch.filter(ctx, raw, self.ed.game.frame_no);
+            self.ed.game.fingers.set_enabled(!start_page, raw);
+            self.ed.game.fingers.filter(ctx, raw, self.ed.game.frame_no);
             // (the clipboard first: it swaps egui-winit's pastes, Ctrl+V,
             // for the system clipboard's text; the menu's and the bar's
             // pastes come with their text)
@@ -2985,11 +3022,13 @@ impl RustudioApp {
         ed.file_sync_tick();
         ed.template_preview_tick();
         ed.plugins_tick();
-        if ed.builtin_tools.use_native(rustudio_core::rustudio_settings::BuiltinTool::Toolbox) {
+        if ed.native_tool_loaded(crate::plugin_host::builtin_suite::TOOLBOX_ID) {
             ed.toolbox_tick(&ctx);
         }
-        ed.asset_manager_tick(&ctx);
-        if ed.builtin_tools.use_native(rustudio_core::rustudio_settings::BuiltinTool::Toolbox) {
+        if ed.native_tool_loaded(crate::plugin_host::builtin_suite::ASSET_MANAGER_ID) {
+            ed.asset_manager_tick(&ctx);
+        }
+        if ed.native_tool_loaded(crate::plugin_host::builtin_suite::TOOLBOX_ID) {
             ed.toolbox_harness_tick();
         }
         if self.ed.harness.run.no_ui {
@@ -3051,10 +3090,11 @@ impl RustudioApp {
             let popped: Vec<Tab> = self.panels.popped_tabs().collect();
             self.panels = crate::panels::Panels::default();
             self.dock = default_dock_for(self.ed.builtin_tools);
+            strip_disabled_native_tabs(&mut self.dock, &mut self.panels, &self.ed);
             for t in popped {
                 if self.dock.find_tab(&t).is_none()
-                    && native_tab_enabled(t, self.ed.builtin_tools)
-                    && !matches!(t, Tab::AvatarSettings | Tab::TerrainEditor | Tab::Toolbox | Tab::AssetManager | Tab::FileSync)
+                    && native_tab_enabled(t, &self.ed)
+                    && !matches!(t, Tab::AvatarSettings | Tab::TerrainEditor | Tab::Toolbox | Tab::AssetManager | Tab::FileSync | Tab::ControllerEmulator)
                 {
                     crate::panels::place(&mut self.dock, t, &self.panels.homes);
                 }
@@ -3155,6 +3195,7 @@ impl RustudioApp {
                     )
                     .show(ui, |ui| ed.status_bar(ui));
             }
+            ed.native_plugins_bottom_bars(ui);
         }
 
         // Editor::start_run requests this when a playtest begins.
@@ -3219,7 +3260,8 @@ impl RustudioApp {
             self.ed.ui.panel_requests.push((Tab::Profiler, Some(on)));
         }
         for (tab, want) in std::mem::take(&mut self.ed.ui.panel_requests) {
-            if !native_tab_enabled(tab, self.ed.builtin_tools) {
+            if !native_tab_enabled(tab, &self.ed) {
+                self.panels.take(&mut self.dock, &tab);
                 continue;
             }
             let found = self.panels.locate(&self.dock, &tab);
@@ -3286,22 +3328,24 @@ impl RustudioApp {
             (Tab::Output, "Output"),
             (Tab::AvatarSettings, "Avatar Settings"),
             (Tab::TerrainEditor, "Terrain Editor"),
-            (Tab::AnimationEditor, "Animation Editor"),
             (Tab::Toolbox, "Toolbox"),
             (Tab::AssetManager, "Asset Manager"),
             (Tab::FileSync, "File Sync"),
+            (Tab::ControllerEmulator, "Controller Emulator"),
             (Tab::Profiler, "MicroProfiler"),
         ]
         .into_iter()
         .filter(|(t, _)| self.panels.locate(&self.dock, t).is_some())
         .map(|(_, n)| n)
         .collect();
+        // The Controller Emulator's panel is the controller's switch (its
+        // tab's close button turns it off).
+        self.ed.device_sim.controller = self.ed.ui.panels_open.contains("Controller Emulator");
         // Closing the MicroProfiler stops recording.
         if self.ed.profiler.is_some() && !self.ed.ui.panels_open.contains("MicroProfiler") {
             self.ed.profiler = None;
         }
-        self.ed.anim_editor_check_closed();
-        self.ed.anim_editor_sync_selection();
+        self.ed.native_plugins_tick();
         let ed = &mut self.ed;
         ed.open_script_tabs(&mut self.dock, &mut self.panels);
         crate::panels::record_homes(&self.dock, &mut self.panels.homes);
@@ -3329,7 +3373,7 @@ impl RustudioApp {
         rustudio_engine::runtime::domains::assets_cloud::capture::frame_tick(&ctx, ed.game.viewport_rect);
         ed.confirm_ui(&ctx);
         ed.account_window(&ctx);
-        if ed.builtin_tools.use_native(rustudio_core::rustudio_settings::BuiltinTool::RigBuilder) {
+        if ed.native_tool_loaded(crate::plugin_host::builtin_suite::RIG_BUILDER_ID) {
             ed.character_builder_window(&ctx);
         }
         ed.cloud_windows(&ctx);
@@ -3551,6 +3595,9 @@ impl RustudioApp {
             // The Toolbox's deep links work without the panel (headless checks).
             if a.starts_with("toolbox:") {
                 ed.toolbox_action(&a);
+            } else if a.starts_with("device") {
+                // (the Device Simulator lives in the view: no panel needed)
+                ed.run_action(&a);
             } else {
                 eprintln!("--action {a}: no editor in --no-ui");
             }
@@ -3671,7 +3718,7 @@ impl Editor {
         let y = rect.min.y + TOP_MARGIN + (BAR_H - TOP_MARGIN - BUTTON) * 0.5;
         let x = rect.max.x - SIDE - BUTTON - slot as f32 * (BUTTON + GAP);
         let r = Rect::from_min_size(Pos2::new(x, y), egui::vec2(BUTTON, BUTTON));
-        self.game.touch.zones.ui.push(r);
+        self.game.fingers.zones.ui.push(r);
         let resp = ui.interact(r, ui.id().with(id), egui::Sense::click()).on_hover_text(tip);
         let painter = ui.painter_at(rect);
         // (iconBase.png: black at 0.5, corners 8 of its 32)
@@ -3762,7 +3809,7 @@ impl Editor {
 impl Editor {
     pub fn harness_inject(&mut self, raw: &mut egui::RawInput) {
         let mut input = std::mem::take(&mut self.harness.run.input);
-        input.inject(self.game.viewport_rect, self.game.lock_center_held(), self.harness.run.now(), raw, |name, raw| {
+        input.inject(self.game.viewport_rect, self.game.device.as_ref().map_or(1.0, |v| v.k), self.game.lock_center_held(), self.harness.run.now(), raw, |name, raw| {
             if let Some(f) = name.strip_prefix("finger:") {
                 // finger:ID:start|move|end:X,Y (view coordinates): a finger
                 // of the game's (--finger, --tap; touch_input::harness_finger).
@@ -3779,7 +3826,7 @@ impl Editor {
                 let xy = xy.and_then(|s| s.split_once(',')).and_then(|(x, y)| Some((x.parse::<f32>().ok()?, y.parse::<f32>().ok()?)));
                 if let (Some(id), Some(phase), Some((x, y))) = (id, phase, xy) {
                     let pos = self.game.viewport_rect.min + egui::vec2(x, y);
-                    self.game.touch.harness_finger(id, phase, pos);
+                    self.game.fingers.harness_finger(id, phase, pos);
                 } else {
                     eprintln!("harness: bad finger action {name:?}");
                 }

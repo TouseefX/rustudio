@@ -1000,6 +1000,8 @@ fn put_on_r15_part(
         "TextureID",
         "TextureContent",
         "InitialSize",
+        "DoubleSided",
+        "RenderFidelity",
     ]
     .iter()
     .map(|k| (*k, s.properties.get(&ustr(k)).cloned()))
@@ -1079,6 +1081,44 @@ fn put_on_r15_part(
                     doc.dom.destroy(o);
                 }
                 pkg.transfer(k, &mut doc.dom, dst);
+            }
+            // PBR material maps (e.g. dynamic head facial textures).
+            "SurfaceAppearance" => {
+                let old: Vec<Ref> = doc
+                    .dom
+                    .get_by_ref(dst)
+                    .map(|i| i.children().to_vec())
+                    .unwrap_or_default()
+                    .into_iter()
+                    .filter(|c| doc.dom.get_by_ref(*c).is_some_and(|i| i.class == "SurfaceAppearance"))
+                    .collect();
+                for o in old {
+                    doc.dom.destroy(o);
+                }
+                pkg.transfer(k, &mut doc.dom, dst);
+            }
+            // Skinned mesh rig bones (e.g. dynamic head facial rig).
+            "Bone" => {
+                if let Some(old) = child_named(doc, dst, &ki.name)
+                    .filter(|c| doc.dom.get_by_ref(*c).is_some_and(|i| i.class == "Bone"))
+                {
+                    doc.dom.destroy(old);
+                }
+                pkg.transfer(k, &mut doc.dom, dst);
+                let bone_refs: Vec<Ref> = doc
+                    .dom
+                    .descendants_of(k)
+                    .filter(|i| i.class == "Bone")
+                    .map(|i| i.referent())
+                    .collect();
+                for br in bone_refs {
+                    if let Some(bi) = doc.dom.get_by_ref_mut(br) {
+                        if let Some(Variant::CFrame(mut cf)) = bi.properties.get(&ustr("CFrame")).cloned() {
+                            cf.position = scale(cf.position);
+                            bi.properties.insert(ustr("CFrame"), Variant::CFrame(cf));
+                        }
+                    }
+                }
             }
             _ => {}
         }

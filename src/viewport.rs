@@ -553,7 +553,54 @@ impl Editor {
     }
 
     pub fn viewport_ui(&mut self, ui: &mut egui::Ui) {
-        let rect = ui.available_rect_before_wrap();
+        let full = ui.available_rect_before_wrap();
+        // Test > Device Simulator: its bar over the view; the 3D view, its
+        // tools and picking live in the simulated device's screen; the rest
+        // of the panel is letterbox (presses there do nothing).
+        let mut sim_actions = Vec::new();
+        let panel = if self.device_sim.shown {
+            let bar = Rect::from_min_size(full.min, egui::vec2(full.width(), mech::DEVICE_BAR_HEIGHT));
+            let playing = self.game.is_playing();
+            sim_actions = crate::device_sim::toolbar::toolbar(ui, bar, &self.device_sim, playing, &mut self.ui_rects);
+            Rect::from_min_max(egui::pos2(full.min.x, bar.max.y), full.max)
+        } else {
+            full
+        };
+        self.game.view_panel = panel;
+        let view_area = Rect::from_min_max(panel.min, egui::pos2(panel.max.x - mech::DEVICE_SCROLLBAR, panel.max.y));
+        self.game.device = self.device_sim.view(view_area, ui.ctx().pixels_per_point());
+        self.game.controller_on = self.device_sim.controller;
+        let frame_art = self.game.device.as_ref().and_then(|v| rustudio_core::devices::frame_art(&v.device.id));
+        let rect = match &self.game.device {
+            Some(v) => {
+                // (a device bigger than the panel: its scroll bar and the
+                // wheel over the letterbox scroll it)
+                let over = self.device_sim.overflow(v, view_area);
+                let track = crate::device_sim::frames::scrollbar_track(panel);
+                let bar = ui.interact(track, egui::Id::new("devsim_scroll"), Sense::drag());
+                let mut scroll = self.device_sim.scroll;
+                if bar.dragged() && over.y > 0.0 {
+                    scroll.y += bar.drag_delta().y * (track.height() + over.y) / track.height();
+                }
+                let wheel = ui.input(|i| i.smooth_scroll_delta);
+                let on_letterbox = ui.input(|i| i.pointer.hover_pos()).is_some_and(|p| panel.contains(p) && !v.screen_win.contains(p));
+                if on_letterbox && over != Vec2::ZERO {
+                    scroll -= wheel;
+                }
+                scroll = scroll.clamp(Vec2::ZERO, over);
+                if scroll != self.device_sim.scroll {
+                    self.device_sim.scroll = scroll;
+                    ui.ctx().request_repaint();
+                }
+                let p = ui.painter_at(panel);
+                crate::device_sim::frames::paint_letterbox(&p, panel, scroll.y, over.y);
+                if let Some(art) = &frame_art {
+                    crate::device_sim::frames::paint_body(&p, v, art);
+                }
+                v.screen_win
+            }
+            None => panel,
+        };
         // (a game TextBox typed into under the soft keyboard: the view slides up to show it)
         let rect = self.keyboard_pan(ui.ctx(), rect);
         // The part of the view on the panel (a slide takes the rest above it).
@@ -561,12 +608,11 @@ impl Editor {
         self.game.viewport_rect = rect;
         rustudio_render::grass_temporal::tick(&mut self.game.cam, ui.ctx());
         let selector = Self::view_selector_rect(rect);
-        let native_view_selector = self
-            .builtin_tools
-            .use_native(rustudio_core::rustudio_settings::BuiltinTool::ViewSelector)
+        let native_view_selector = self.native_tool_loaded(crate::plugin_host::builtin_suite::VIEW_SELECTOR_ID)
             && self.ui.show_view_selector;
+        let driving_play = self.game.play_game_input();
         let over_selector = native_view_selector
-            && !self.game.is_playing()
+            && !driving_play
             && ui.input(|i| i.pointer.hover_pos().is_some_and(|p| selector.contains(p)));
         let resp = ui.allocate_rect(rect, if over_selector { Sense::hover() } else { Sense::click_and_drag() });
         let ctx = ui.ctx().clone();
@@ -574,7 +620,7 @@ impl Editor {
         let dt = ctx.input(|i| i.stable_dt).min(0.1);
         let vp_input = rustudio_core::bench::scope("vp_input");
 
-        if !self.game.is_playing() && self.game.cam.advance_view(dt) { ctx.request_repaint(); }
+        if !driving_play && self.game.cam.advance_view(dt) { ctx.request_repaint(); }
 
         // ---------------------------------------------------------- camera
         let (scroll, alt, ctrl, shift, delta) = ctx.input(|i| {
@@ -704,10 +750,7 @@ impl Editor {
             // The parts of the ViewportFrames the GUI drew last frame
             // (plus Toolbox detail previews, plugin widgets, and pending
             // ViewportFrame:CaptureSnapshotAsync requests).
-            self.toolbox_vf = if self
-                .builtin_tools
-                .use_native(rustudio_core::rustudio_settings::BuiltinTool::Toolbox)
-            {
+            self.toolbox_vf = if self.native_tool_loaded(crate::plugin_host::builtin_suite::TOOLBOX_ID) {
                 self.toolbox.preview.frames(&mut self.game.doc)
             } else {
                 Default::default()
@@ -723,8 +766,8 @@ impl Editor {
         }
         let vp_pick = rustudio_core::bench::scope("vp_pick");
         let pointer = resp.hover_pos();
-        let anim_owns_viewport = self.anim_editor_owns_viewport();
-        let handles = if !anim_owns_viewport && (pointer.is_some() || resp.drag_started_by(PointerButton::Primary)) {
+        let plugin_owns_viewport = self.native_plugins_own_viewport();
+        let handles = if !plugin_owns_viewport && (pointer.is_some() || resp.drag_started_by(PointerButton::Primary)) {
             self.handles(rect)
         } else {
             Vec::new()
@@ -755,7 +798,7 @@ impl Editor {
             // fingers. (Carrying the last frame's list over kept every frame's
             // rects for the whole session: a few more each frame, never dropped.)
             let ui = Vec::with_capacity(if game { 8 } else { 0 });
-            self.game.touch.zones = rustudio_engine::touch_input::Zones {
+            self.game.fingers.zones = rustudio_engine::touch_input::Zones {
                 viewport: if menu_open { egui::Rect::NOTHING } else { visible },
                 playing: driving,
                 game,
@@ -766,14 +809,10 @@ impl Editor {
                 frame: self.game.frame_no,
             };
         }
-        // (No hover outline while playing the game, as in Studio.)
-        let in_play = self.game
-            .play
-            .as_ref()
-            .is_some_and(|p| p.mode == rustudio_engine::runtime::RunMode::Play);
-        let roblox_dragger_idle = self
-            .builtin_tools
-            .use_roblox(rustudio_core::rustudio_settings::BuiltinTool::Draggers)
+        // (No hover outline while driving the live client game view, as in Studio;
+        // Server view and Run mode keep full 3D selection/hover.)
+        let in_play = driving;
+        let roblox_dragger_idle = !self.native_tool_loaded(crate::plugin_host::builtin_suite::DRAGGERS_ID)
             && self.tool == Tool::None;
         self.hover = if hover_handle.is_none()
             && self.drag.is_none()
@@ -781,7 +820,7 @@ impl Editor {
             && !in_play
             && !self.clean_view
             && !roblox_dragger_idle
-            && !anim_owns_viewport
+            && !plugin_owns_viewport
         {
             pointer
                 .filter(|p| self.screen_gui_at(*p).is_none())
@@ -809,14 +848,14 @@ impl Editor {
         // (RUSTUDIO_NO_GRID hides it for lighting comparisons with Studio;
         // Studio's Play view has none, tools/fidelity demo shots.)
         if self.show_grid
-            && !self.game.is_playing()
+            && !driving
             && self.game.doc.kind == rustudio_core::doc::DocKind::Place
             && std::env::var_os("RUSTUDIO_NO_GRID").is_none()
             && !self.clean_view
         {
             scene::grid_lines(&mut lines, self.ui.grid_size);
         }
-        self.anim_editor_floor_grid_lines(&mut lines);
+        self.native_plugins_viewport_lines(&mut lines);
         drop(vp_prepare);
         let painter = ui.painter_at(rect);
         self.game.draw_world(&ctx, &painter, rect, lines, &overlay, self.harness.run.started);
@@ -828,7 +867,7 @@ impl Editor {
         // The game's fingers (touch identity, touch_input.rs): the GUI has
         // them first; what it leaves goes to the game's input (play_game.rs
         // `game_viewport`, play.rs).
-        let fingers = self.game.touch.take_game_events();
+        let fingers = self.game.fingers.take_game_events();
         let gui_took = self.game.draw_view_gui(&ctx, &painter, rect, &resp, show_gui, &fingers);
         // What plugins put in CoreGui, over the edit view, and the edit-mode
         // input plugins hear (src/plugin_host/widgets_ui.rs); a press a
@@ -871,6 +910,11 @@ impl Editor {
             }
         }
         self.game.finish_view_gui(&ctx, rect, dt);
+        // The frame's rounded screen corners and cut-out, over the picture.
+        if let (Some(v), Some(art)) = (&self.game.device, &frame_art) {
+            crate::device_sim::frames::paint_over(&ui.painter_at(panel), v, art);
+        }
+        self.device_sim_windows(&ctx, panel, sim_actions);
 
         // Team Create collaborator camera name labels (Studio 0.748        // CloudEditAdornable): projected sphere center,
         // zero offset, centered X/Y, 14px, white text with black outline, no
@@ -906,20 +950,33 @@ impl Editor {
         if !held && !pressed {
             self.plugin_ui.press_taken = false;
         }
-        let in_game = self.game.game_viewport(ui, rect, &resp, gui_took) || plugin_took;
+        // Gizmo handles on a part selected in Explorer stay usable even in
+        // Client Play view, without sending a game click underneath them.
+        let over_handle = self.drag.is_some()
+            || (self.tool != Tool::None
+                && !alt
+                && pointer.is_some_and(|p| self.handle_at(&handles, p).is_some()));
+        let in_game = self.game.game_viewport(ui, rect, &resp, gui_took || over_handle) || plugin_took;
+        let picking_ref = self.props.ref_pick.is_some();
+        if picking_ref && ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+            self.props.ref_pick = None;
+        }
+        let picking_ref = self.props.ref_pick.is_some();
+        if picking_ref && resp.hovered() && !in_game {
+            ctx.set_cursor_icon(egui::CursorIcon::Crosshair);
+        }
 
-        // The Animation Editor's dragger/joint-picker owns the left button while open,
-        // so normal Select/Move/Rotate/Scale clicks and drags never highlight the whole rig.
-        let anim_dragging = !in_game && !alt && self.anim_editor_viewport_ui(&ctx, &painter, rect, &resp);
-        let anim_blocked = anim_dragging || (!in_game && !alt && anim_owns_viewport);
+        // Modular native plugins that own viewport picking/draggers (such as
+        // the Animation Editor) get the left button before normal Studio tools.
+        let native_plugin_dragging = !in_game && !alt && !picking_ref && self.native_plugins_viewport_ui(&ctx, &painter, rect, &resp);
+        let native_plugin_blocked = native_plugin_dragging || (!in_game && !alt && plugin_owns_viewport);
 
         // The Terrain Editor's brush has the left button while one is picked.
-        let brushing = anim_blocked
+        let brushing = native_plugin_blocked
             || (!in_game
                 && !alt
-                && self
-                    .builtin_tools
-                    .use_native(rustudio_core::rustudio_settings::BuiltinTool::TerrainEditor)
+                && !picking_ref
+                && self.native_tool_loaded(crate::plugin_host::builtin_suite::TERRAIN_EDITOR_ID)
                 && self.terrain_brush_ui(&ctx, rect, &resp, pointer, &painter));
 
         if self.part_drag.is_some() {
@@ -933,14 +990,19 @@ impl Editor {
             }
         }
         // -------------------------------------------------- select & gizmo
-        let primary_drag = resp.dragged_by(PointerButton::Primary) && (!alt || self.drag.is_some() || self.part_drag.is_some()) && !in_game && !brushing;
-        if resp.drag_started_by(PointerButton::Primary) && self.tool != Tool::None && !in_game && !press_taken && !brushing {
+        let primary_drag = resp.dragged_by(PointerButton::Primary)
+            && (!alt || self.drag.is_some() || self.part_drag.is_some())
+            && (!in_game || self.drag.is_some())
+            && !brushing
+            && !picking_ref;
+        if resp.drag_started_by(PointerButton::Primary) && self.tool != Tool::None && !press_taken && !brushing && !picking_ref {
             let start = ctx.input(|i| i.pointer.press_origin()).or(pointer);
             if let Some(p) = start {
-                // A handle takes the press even with Alt held (Alt = scale all axes).
+                // A handle takes the press even with Alt held (Alt = scale all axes),
+                // and even during Client Play view when a part is selected.
                 if let Some(h) = self.handle_at(&handles, p) {
                     self.start_drag(rect, h, p);
-                } else if alt {
+                } else if in_game || alt {
                 } else if self.screen_gui_at(p).is_some() {
                     // A ScreenGui object under the pointer blocks 3D part drag /
                     // 3D marquee (UIEditor handles GUI dragging when active).
@@ -991,7 +1053,24 @@ impl Editor {
                 }
             }
         }
-        if resp.clicked_by(PointerButton::Primary) && self.tool != Tool::None && !in_game && !press_taken && !brushing {
+        if resp.clicked_by(PointerButton::Primary) && !in_game && !press_taken && !brushing && picking_ref {
+            if let Some(p) = pointer {
+                let raw = self.pick(rect, p, true);
+                let top = self.pick(rect, p, false);
+                let chosen = match (raw, top) {
+                    (Some(r), _) if self.ref_pick_accepts(r) => Some(r),
+                    (_, Some(t)) if self.ref_pick_accepts(t) => Some(t),
+                    _ => None,
+                };
+                if let Some(r) = chosen {
+                    self.commit_ref_pick(r);
+                } else if raw.is_none() {
+                    self.props.ref_pick = None;
+                } else if let Some(pk) = self.props.ref_pick.as_ref() {
+                    self.warn(format!("Cannot assign to {}: expected {}", pk.prop, pk.expected_class));
+                }
+            }
+        } else if resp.clicked_by(PointerButton::Primary) && self.tool != Tool::None && !in_game && !press_taken && !brushing {
             if let Some(p) = pointer {
                 // A GUI object under the cursor is picked first, as in Studio.
                 let hit = self
@@ -1021,19 +1100,34 @@ impl Editor {
         self.game.scene.sync(&mut self.game.doc);
         let _overlays = rustudio_core::bench::scope("viewport_overlays");
         // Comparison captures show the scene alone (clean_view).
-        // When the Animation Editor has an attached rig, only the Animation Editor's
-        // per-joint SelectionBox and gizmo should draw (never a whole-body rig outline).
-        let suppress_studio_selection = anim_owns_viewport && self.anim_editor.active;
+        // When a hosted native plugin draws its own per-part/joint selection
+        // adornments (e.g. Animation Editor), suppress Studio's whole-model outline.
+        let suppress_studio_selection = self.native_plugins_suppress_selection();
         if !self.clean_view && !suppress_studio_selection {
             let _s = rustudio_core::bench::scope("vp_selection_outline");
             self.draw_selection(&painter, rect);
+        }
+        if let Some(pick) = self.props.ref_pick.as_ref() {
+            let msg = format!(
+                "Pick {} for {} — click in Explorer or Viewport (Esc to cancel)",
+                pick.expected_class, pick.prop
+            );
+            let font = egui::FontId::proportional(12.0);
+            let gal = painter.layout_no_wrap(msg, font, Color32::WHITE);
+            let pill = Rect::from_center_size(
+                egui::pos2(rect.center().x, rect.min.y + 20.0),
+                gal.size() + egui::vec2(20.0, 10.0),
+            );
+            painter.rect_filled(pill, 6.0, Color32::from_rgba_unmultiplied(24, 52, 110, 230));
+            painter.rect_stroke(pill, 6.0, egui::Stroke::new(1.0, Color32::from_rgb(90, 155, 255)), egui::StrokeKind::Inside);
+            painter.galley(pill.center() - gal.size() * 0.5, gal, Color32::WHITE);
         }
         // Studio's hover outline (DraggerService.HoverThickness); none while
         // dragging (only the Ready state renders hover).
         // Studio Settings > Selection: Show Hover Over, Hover Over Color,
         // Hover Line Thickness.
         let show_hover = crate::studio_settings::flag("Studio", "Show Hover Over", true);
-        if let Some(h) = self.hover.filter(|_| show_hover && !self.clean_view && !anim_owns_viewport && self.part_drag.is_none() && self.drag.is_none()) {
+        if let Some(h) = self.hover.filter(|_| show_hover && !self.clean_view && !plugin_owns_viewport && self.part_drag.is_none() && self.drag.is_none()) {
             let _s = rustudio_core::bench::scope("vp_hover_outline");
             self.sync_hover_refs(h);
             let refs = std::mem::take(&mut self.hover_outline_refs.1);
@@ -1042,7 +1136,7 @@ impl Editor {
             self.hover_outline_refs.1 = refs;
         }
         // A free drag hides the handles (Studio draws only the pivot then).
-        let handles = if self.part_drag.is_some() || anim_owns_viewport { Vec::new() } else { self.handles(rect) };
+        let handles = if self.part_drag.is_some() || plugin_owns_viewport { Vec::new() } else { self.handles(rect) };
         // A grab point per handle: arrow/handle tips, and 45° along each ring
         // (where no other ring crosses it).
         self.gizmo_points = handles
@@ -1133,18 +1227,16 @@ impl Editor {
                 );
             }
         }
-        // Studio's Play view shows the game alone: no tool readout, axis
-        // compass or border (tools/fidelity side-by-side shots).
-        if !self.game.is_playing() && !self.clean_view {
+        // Studio's Client Play view shows the game alone: no tool readout, axis
+        // compass or border; Server view and Run mode keep editing overlays.
+        if !driving && !self.clean_view {
             let _s = rustudio_core::bench::scope("vp_view_selector");
             self.draw_viewport_hud(ui, rect);
             self.draw_drag_hotkeys(&painter, rect);
         }
         // A Toolbox card dragged here: preview and drop (src/toolbox/glue.rs).
-        if !self.game.is_playing()
-            && self
-                .builtin_tools
-                .use_native(rustudio_core::rustudio_settings::BuiltinTool::Toolbox)
+        if !driving
+            && self.native_tool_loaded(crate::plugin_host::builtin_suite::TOOLBOX_ID)
         {
             self.toolbox_viewport_drop(ui, rect, &resp);
         }
@@ -1451,9 +1543,7 @@ impl Editor {
                 format!("{}: {:+.2}{unit}", drag.handle.tool.label(), drag.amount),
                 egui::FontId::proportional(13.0), theme::TEXT);
         }
-        if !self
-            .builtin_tools
-            .use_native(rustudio_core::rustudio_settings::BuiltinTool::ViewSelector)
+        if !self.native_tool_loaded(crate::plugin_host::builtin_suite::VIEW_SELECTOR_ID)
             || !self.ui.show_view_selector
         {
             return;

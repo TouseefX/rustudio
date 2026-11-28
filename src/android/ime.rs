@@ -270,7 +270,7 @@ unsafe extern "system" fn native_op<'l>(
                 _ => What::Enter,
             };
             log::info!(
-                "ime: op {seq} {}",
+                "ime: op {seq} {}{}",
                 match &what {
                     What::Replace { a, b, text } => format!("replace {a}..{b} with {} chars, selection {}..{}", text.chars().count(), sel.0, sel.1),
                     What::Select => format!("select {}..{}", sel.0, sel.1),

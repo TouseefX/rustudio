@@ -26,7 +26,7 @@
 //!   part, C0 / C1 at the moved face's centre);
 //! - one undo step per drag (joints included).
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use egui::{Pos2, Rect};
 use glam::{Mat3, Vec3};
@@ -60,6 +60,8 @@ pub struct PartDrag {
     pub moved: bool,
     /// Physical mode (DraggerMovementMode.Physical): the camera-plane drag.
     physical: Option<PhysDrag>,
+    /// Per-chunk cached solid terrain triangles for exact surface raycasts during the drag.
+    terrain_tris: HashMap<[i32; 3], Vec<[Vec3; 3]>>,
 }
 
 /// FreeformDragger._updatePhysical: the grab point and the translation last
@@ -226,7 +228,7 @@ fn closest_basis(n: Vec3) -> (Vec3, Vec3) {
         z = if n.x.abs() > 0.9 { Vec3::Y } else { Vec3::X };
     }
     let z = z.normalize();
-    (-best.0.cross(z), z)
+    (n.cross(z), z)
 }
 
 /// DragHelper.getSurfaceMatrixForPrimitiveMesh: the surface frame of the
@@ -477,6 +479,14 @@ pub(crate) struct FreeDrag {
     pub use_bbox: bool,
 }
 
+/// What a free-drag raycast hit: either a BasePart `Solid` or a generic surface
+/// (such as Workspace `Terrain`) with world point and unit normal.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum DragHit {
+    Solid(Vec3, Vec3, Solid),
+    Surface(Vec3, Vec3),
+}
+
 impl FreeDrag {
     /// `click` is where the press hit the clicked part, `clicked` that part's
     /// surface frame there (rounded on it when grid snap is on). With Use
@@ -504,9 +514,25 @@ impl FreeDrag {
     /// The surface under `ray`: the nearest hit (point, normal, solid), else
     /// the last surface's plane extended. None: nothing to drag onto.
     pub fn surface(&self, ray: &Ray, hit: Option<(Vec3, Vec3, Solid)>) -> Option<Surf> {
-        if let Some((p, n, s)) = hit {
-            let (hit, m) = if self.use_bbox { surface_matrix_box(&s, p, n) } else { (p, surface_matrix(&s.geometry(), p, n)) };
-            return Some(Surf { hit, m, tsize: Some(size_in_surface(&s, &m)) });
+        self.surface_hit(ray, hit.map(|(p, n, s)| DragHit::Solid(p, n, s)))
+    }
+
+    /// Generalized surface under `ray`: either a BasePart `Solid` or a generic
+    /// surface (Terrain), falling back to the last surface's plane extended.
+    pub fn surface_hit(&self, ray: &Ray, hit: Option<DragHit>) -> Option<Surf> {
+        match hit {
+            Some(DragHit::Solid(p, n, s)) => {
+                let (hit, m) = if self.use_bbox { surface_matrix_box(&s, p, n) } else { (p, surface_matrix(&s.geometry(), p, n)) };
+                return Some(Surf { hit, m, tsize: Some(size_in_surface(&s, &m)) });
+            }
+            Some(DragHit::Surface(p, n)) => {
+                let n = n.normalize_or_zero();
+                let n = if n.length_squared() > 1e-6 { n } else { Vec3::Y };
+                let (x, z) = closest_basis(n);
+                let m = Xform { pos: p, rot: Mat3::from_cols(x, n, z) };
+                return Some(Surf { hit: p, m, tsize: None });
+            }
+            None => {}
         }
         let m = self.last_target?;
         let up = m.rot.col(1);
@@ -688,15 +714,257 @@ impl XformMul for Xform {
 
 // ------------------------------------------------------------- editor
 
+/// Smooth trilinear solid-terrain density at world point `p`, matching the
+/// `0.5 + 0.5 * o` solid field that `rustudio_core::terrain` meshes at ISO = 0.5.
+fn terrain_solid_density(v: &rustudio_core::terrain::Voxels, p: Vec3) -> f32 {
+    let f = p / rustudio_core::terrain::VOXEL - Vec3::splat(0.5);
+    let base = f.floor();
+    let t = f - base;
+    let (ix, iy, iz) = (base.x as i32, base.y as i32, base.z as i32);
+    let mut sum = 0.0f32;
+    for dz in 0..=1 {
+        let wz = if dz == 0 { 1.0 - t.z } else { t.z };
+        for dy in 0..=1 {
+            let wy = if dy == 0 { 1.0 - t.y } else { t.y };
+            for dx in 0..=1 {
+                let wx = if dx == 0 { 1.0 - t.x } else { t.x };
+                let (m, o) = v.get(ix + dx, iy + dy, iz + dz);
+                let d = if m != 0 && m != rustudio_core::terrain::WATER {
+                    0.5 + 0.5 * o
+                } else {
+                    0.0
+                };
+                sum += wx * wy * wz * d;
+            }
+        }
+    }
+    sum
+}
+
+/// Front-facing ray-triangle intersection (CCW outward winding from `terrain::chunk_triangles`).
+fn ray_terrain_tri(o: Vec3, d: Vec3, t: &[Vec3; 3]) -> Option<(f32, Vec3)> {
+    let e1 = t[1] - t[0];
+    let e2 = t[2] - t[0];
+    let p = d.cross(e2);
+    let det = e1.dot(p);
+    if det < 1e-8 {
+        return None;
+    }
+    let inv = 1.0 / det;
+    let s = o - t[0];
+    let u = s.dot(p) * inv;
+    if !(0.0..=1.0).contains(&u) {
+        return None;
+    }
+    let q = s.cross(e1);
+    let w = d.dot(q) * inv;
+    if w < 0.0 || u + w > 1.0 {
+        return None;
+    }
+    let dist = e2.dot(q) * inv;
+    if dist < 0.0 {
+        return None;
+    }
+    let n = e1.cross(e2).normalize_or_zero();
+    (n.length_squared() > 1e-6).then_some((dist, n))
+}
+
+/// Chunk keys whose terrain mesh can overlap world AABB `[lo, hi]`.
+fn terrain_chunk_keys_for_aabb(lo: Vec3, hi: Vec3) -> impl Iterator<Item = [i32; 3]> {
+    let chunk = rustudio_core::terrain::VOXEL * 32.0;
+    let pad = rustudio_core::terrain::VOXEL * 2.0;
+    let c0 = ((lo - Vec3::splat(pad)) / chunk).floor().as_ivec3();
+    let c1 = ((hi + Vec3::splat(pad)) / chunk).floor().as_ivec3();
+    (c0.z..=c1.z).flat_map(move |z| {
+        (c0.y..=c1.y).flat_map(move |y| (c0.x..=c1.x).map(move |x| [x, y, z]))
+    })
+}
+
+/// Exact raycast against the rendered solid terrain triangles (skipping water),
+/// meshing each touched chunk at most once into `cache`.
+fn ray_terrain_tris(
+    v: &rustudio_core::terrain::Voxels,
+    cache: &mut HashMap<[i32; 3], Vec<[Vec3; 3]>>,
+    ray: &Ray,
+    max_t: f32,
+) -> Option<(f32, Vec3, Vec3)> {
+    let dir = ray.dir.normalize_or_zero();
+    if dir.length_squared() < 1e-6 || max_t <= 0.0 {
+        return None;
+    }
+    let (vlo, vhi) = v.bounds()?;
+    let vox = rustudio_core::terrain::VOXEL;
+    let pad = vox * 2.0;
+    let lo = Vec3::new(vlo[0] as f32, vlo[1] as f32, vlo[2] as f32) * vox - Vec3::splat(pad);
+    let hi = Vec3::new((vhi[0] + 1) as f32, (vhi[1] + 1) as f32, (vhi[2] + 1) as f32) * vox + Vec3::splat(pad);
+
+    let (mut t0, mut t1) = (0.0f32, max_t);
+    for k in 0..3 {
+        if dir[k].abs() < 1e-9 {
+            if ray.origin[k] < lo[k] || ray.origin[k] > hi[k] {
+                return None;
+            }
+            continue;
+        }
+        let (a, b) = ((lo[k] - ray.origin[k]) / dir[k], (hi[k] - ray.origin[k]) / dir[k]);
+        t0 = t0.max(a.min(b));
+        t1 = t1.min(a.max(b));
+    }
+    if t0 > t1 {
+        return None;
+    }
+
+    let mut best: Option<(f32, Vec3)> = None;
+    let step = vox * 16.0;
+    let mut seen: HashSet<[i32; 3]> = HashSet::new();
+    let mut t = t0;
+    loop {
+        let seg_end = (t + step).min(t1);
+        let a = ray.origin + dir * t;
+        let b = ray.origin + dir * seg_end;
+        for key in terrain_chunk_keys_for_aabb(a.min(b), a.max(b)) {
+            if !seen.insert(key) || !v.chunk_near(key) {
+                continue;
+            }
+            let tris = cache.entry(key).or_insert_with(|| {
+                let verts = rustudio_core::terrain::chunk_triangles(v, key, &|_| false);
+                verts
+                    .chunks_exact(3)
+                    .map(|tri| [Vec3::from(tri[0].pos), Vec3::from(tri[1].pos), Vec3::from(tri[2].pos)])
+                    .collect()
+            });
+            for tri in tris.iter() {
+                if let Some((d, n)) = ray_terrain_tri(ray.origin, dir, tri) {
+                    if d >= t0 && d <= t1 && best.is_none_or(|(bt, _)| d < bt) {
+                        best = Some((d, n));
+                    }
+                }
+            }
+        }
+        if best.is_some_and(|(bt, _)| bt <= seg_end) || seg_end >= t1 {
+            break;
+        }
+        t = seg_end;
+    }
+    best.map(|(d, n)| (d, ray.origin + dir * d, n))
+}
+
+/// Raycast solid (non-water) terrain triangles up to `max_t`.
+pub(crate) fn ray_terrain_surface(
+    v: &rustudio_core::terrain::Voxels,
+    ray: &Ray,
+    max_t: f32,
+) -> Option<(f32, Vec3, Vec3)> {
+    let mut cache = HashMap::new();
+    ray_terrain_tris(v, &mut cache, ray, max_t)
+}
+
+/// Additional lift along outward terrain normal `n` so no bottom corner or edge
+/// midpoint of the dragged selection OBB sinks below curved/sloped terrain.
+fn terrain_surface_lift(
+    v: &rustudio_core::terrain::Voxels,
+    cache: &mut HashMap<[i32; 3], Vec<[Vec3; 3]>>,
+    moved_basis: &Xform,
+    offset: Vec3,
+    size: Vec3,
+    n: Vec3,
+) -> f32 {
+    let n = n.normalize_or_zero();
+    if n.length_squared() < 1e-6 {
+        return 0.0;
+    }
+    let center = moved_basis.apply(offset);
+    let half = size * 0.5;
+    let r = moved_basis.rot;
+    // Projected height of the selection OBB along `n`.
+    let proj_half = (r.col(0).dot(n)).abs() * half.x
+        + (r.col(1).dot(n)).abs() * half.y
+        + (r.col(2).dot(n)).abs() * half.z;
+    let probe_span = (proj_half * 2.0 + 0.5).max(1.0);
+    // Find the lowest local face along `-n` and probe its 4 corners, 4 edge midpoints, and center.
+    let (x_ax, z_ax) = closest_basis(n);
+    let rx = (r.col(0).dot(x_ax)).abs() * half.x
+        + (r.col(1).dot(x_ax)).abs() * half.y
+        + (r.col(2).dot(x_ax)).abs() * half.z;
+    let rz = (r.col(0).dot(z_ax)).abs() * half.x
+        + (r.col(1).dot(z_ax)).abs() * half.y
+        + (r.col(2).dot(z_ax)).abs() * half.z;
+
+    let mut max_lift = 0.0f32;
+    for sx in [-1.0f32, 0.0, 1.0] {
+        for sz in [-1.0f32, 0.0, 1.0] {
+            // Lowest point of the OBB at this footprint offset.
+            let bot = center - n * proj_half + x_ax * (sx * rx) + z_ax * (sz * rz);
+            let probe_ray = Ray { origin: bot + n * probe_span, dir: -n };
+            if let Some((d, _, _)) = ray_terrain_tris(v, cache, &probe_ray, probe_span) {
+                let pen = probe_span - d;
+                if pen > max_lift {
+                    max_lift = pen;
+                }
+            }
+        }
+    }
+    max_lift
+}
+
+/// Whether an OBB (`xf`, `size`) penetrates solid terrain (solid field >= 0.5)
+/// by more than `tol`.
+fn obb_overlaps_terrain(v: &rustudio_core::terrain::Voxels, xf: &Xform, size: Vec3, tol: f32) -> bool {
+    let half = (size * 0.5 - Vec3::splat(tol)).max(Vec3::ZERO);
+    let r = xf.rot;
+    let world_half = r.col(0).abs() * half.x + r.col(1).abs() * half.y + r.col(2).abs() * half.z;
+    let lo = ((xf.pos - world_half) / rustudio_core::terrain::VOXEL).floor() - Vec3::ONE;
+    let hi = ((xf.pos + world_half) / rustudio_core::terrain::VOXEL).ceil() + Vec3::ONE;
+    // Cap scan volume for huge parts to keep interactive dragging fast.
+    let span = hi - lo;
+    if span.x * span.y * span.z > 8_000.0 {
+        for sx in [-1.0f32, 0.0, 1.0] {
+            for sy in [-1.0f32, 0.0, 1.0] {
+                for sz in [-1.0f32, 0.0, 1.0] {
+                    let p = xf.apply(Vec3::new(sx * half.x, sy * half.y, sz * half.z));
+                    if terrain_solid_density(v, p) > 0.52 {
+                        return true;
+                    }
+                }
+            }
+        }
+        return false;
+    }
+    let inv = r.transpose();
+    for iz in lo.z as i32..=hi.z as i32 {
+        for iy in lo.y as i32..=hi.y as i32 {
+            for ix in lo.x as i32..=hi.x as i32 {
+                let (m, o) = v.get(ix, iy, iz);
+                if m == 0 || m == rustudio_core::terrain::WATER || o <= 0.0 {
+                    continue;
+                }
+                let wp = Vec3::new(ix as f32 + 0.5, iy as f32 + 0.5, iz as f32 + 0.5) * rustudio_core::terrain::VOXEL;
+                let local = inv * (wp - xf.pos);
+                let closest = local.clamp(-half, half);
+                let world_pt = xf.apply(closest);
+                if terrain_solid_density(v, world_pt) > 0.52 {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
 impl Editor {
     pub(crate) fn solid_of(&self, sp: &rustudio_render::scene::ScenePart) -> Solid {
         Solid { xf: sp.xf, size: sp.size, kind: sp.draw.mesh }
     }
 
-    /// The nearest part under `ray` that the drag doesn't carry (the
-    /// dragger's raycast: transparent parts count, CanQuery off doesn't).
-    fn drag_hit(&self, ray: &Ray, carried: &HashSet<Ref>) -> Option<(Vec3, Vec3, Solid)> {
-        let mut best: Option<(f32, Vec3, Solid)> = None;
+    /// The nearest part or terrain surface under `ray` that the drag doesn't
+    /// carry (transparent parts count, CanQuery off doesn't).
+    fn drag_hit(
+        &self,
+        ray: &Ray,
+        carried: &HashSet<Ref>,
+        terrain_cache: &mut HashMap<[i32; 3], Vec<[Vec3; 3]>>,
+    ) -> Option<DragHit> {
+        let mut best: Option<(f32, DragHit)> = None;
         for (sp, b) in self.game.scene.parts.iter().zip(&self.game.scene.bounds) {
             let oc = b.truncate() - ray.origin;
             let along = oc.dot(ray.dir);
@@ -708,15 +976,23 @@ impl Editor {
             }
             let solid = self.solid_of(sp);
             let Some((t, n)) = solid.raycast(ray) else { continue };
-            if best.as_ref().is_some_and(|(bt, _, _)| t >= *bt) {
+            if best.as_ref().is_some_and(|(bt, _)| t >= *bt) {
                 continue;
             }
             if matches!(self.game.doc.prop(sp.r, "CanQuery"), Some(Variant::Bool(false))) {
                 continue;
             }
-            best = Some((t, n, solid));
+            best = Some((t, DragHit::Solid(ray.at(t), n, solid)));
         }
-        best.map(|(t, n, s)| (ray.at(t), n, s))
+        if let Some((_, tr, vox)) = self.game.terrain_drawn.as_ref() {
+            if !matches!(self.game.doc.prop(*tr, "CanQuery"), Some(Variant::Bool(false))) {
+                let max_t = best.as_ref().map_or(2000.0, |(bt, _)| *bt);
+                if let Some((t, hit, n)) = ray_terrain_tris(vox, terrain_cache, ray, max_t) {
+                    best = Some((t, DragHit::Surface(hit, n)));
+                }
+            }
+        }
+        best.map(|(_, h)| h)
     }
 
     fn drag_grid(&self) -> Option<f32> {
@@ -819,6 +1095,7 @@ impl Editor {
             alt: false,
             moved: false,
             physical,
+            terrain_tris: HashMap::new(),
         });
         true
     }
@@ -836,16 +1113,46 @@ impl Editor {
             }
             return;
         }
-        let hit = self.drag_hit(&ray, &d.carried);
-        let opts = self.drag_opts(d.shift, d.alt);
+        let carried = d.carried.clone();
         let mut free = d.free.clone();
-        let Some(surface) = free.surface(&ray, hit) else {
+        let mut terrain_cache = self
+            .part_drag
+            .as_mut()
+            .map(|d| std::mem::take(&mut d.terrain_tris))
+            .unwrap_or_default();
+        let hit = self.drag_hit(&ray, &carried, &mut terrain_cache);
+        let opts = self.drag_opts(
+            self.part_drag.as_ref().is_some_and(|d| d.shift),
+            self.part_drag.as_ref().is_some_and(|d| d.alt),
+        );
+        let Some(surface) = free.surface_hit(&ray, hit) else {
             if let Some(d) = self.part_drag.as_mut() {
+                d.terrain_tris = terrain_cache;
                 d.last = Some((rect, p));
             }
             return;
         };
-        let t = free.target(surface, opts);
+        let surf_n = surface.m.rot.col(1);
+        let mut t = free.target(surface, opts);
+        if matches!(hit, Some(DragHit::Surface(_, _))) {
+            if let Some((_, _, vox)) = self.game.terrain_drawn.as_ref() {
+                let moved_basis = t.mul(&free.bbox.basis);
+                let lift = terrain_surface_lift(
+                    vox,
+                    &mut terrain_cache,
+                    &moved_basis,
+                    free.bbox.offset,
+                    free.bbox.size,
+                    surf_n,
+                );
+                if lift > 1e-4 {
+                    t.pos += surf_n * lift;
+                }
+            }
+        }
+        let Some(d) = self.part_drag.as_ref() else {
+            return;
+        };
         let moves: Vec<(Ref, Xform)> = d
             .parts
             .iter()
@@ -863,6 +1170,7 @@ impl Editor {
         }
         if let Some(d) = self.part_drag.as_mut() {
             d.free = free;
+            d.terrain_tris = terrain_cache;
             d.last = Some((rect, p));
             d.moved |= moved;
         }
@@ -878,12 +1186,26 @@ impl Editor {
             return;
         }
         let Some((rect, p)) = d.last else { return };
+        let (shift, alt) = (d.shift, d.alt);
+        let carried = d.carried.clone();
+        let mut terrain_cache = self
+            .part_drag
+            .as_mut()
+            .map(|d| std::mem::take(&mut d.terrain_tris))
+            .unwrap_or_default();
         let ray = self.game.cam.ray(rect, p);
-        let hit = self.drag_hit(&ray, &d.carried);
-        let m = d.free.surface(&ray, hit).map(|s| s.m);
+        let hit = self.drag_hit(&ray, &carried, &mut terrain_cache);
+        let m = self
+            .part_drag
+            .as_ref()
+            .and_then(|d| d.free.surface_hit(&ray, hit))
+            .map(|s| s.m);
+        if let Some(d) = self.part_drag.as_mut() {
+            d.terrain_tris = terrain_cache;
+        }
         let axis = if tilt { Some(self.game.cam.right()) } else { m.map(|m| m.rot.col(1)) };
         let Some(axis) = axis else { return };
-        let align = self.drag_opts(d.shift, d.alt).align;
+        let align = self.drag_opts(shift, alt).align;
         if let Some(d) = self.part_drag.as_mut() {
             d.free.turn(axis, m, align);
             d.moved = true;
@@ -1061,9 +1383,18 @@ impl Editor {
     /// touching is allowed).
     fn phys_overlaps(&self, ph: &PhysDrag, delta: Vec3) -> bool {
         let skip: HashSet<Ref> = ph.parts.iter().map(|p| p.0).collect();
+        let terrain = self.game.terrain_drawn.as_ref().filter(|(_, tr, _)| {
+            !matches!(self.game.doc.prop(*tr, "CanCollide"), Some(Variant::Bool(false)))
+        });
         ph.parts.iter().any(|(_, xf, size, kind, _)| {
-            let a = Solid { xf: Xform { pos: xf.pos + delta, rot: xf.rot }, size: *size, kind: *kind };
+            let moved_xf = Xform { pos: xf.pos + delta, rot: xf.rot };
+            let a = Solid { xf: moved_xf, size: *size, kind: *kind };
             let ra = size.length() * 0.5;
+            if terrain.is_some_and(|(_, _, vox)| {
+                obb_overlaps_terrain(vox, &moved_xf, *size, rustudio_core::mech::COLLISION_OVERLAP)
+            }) {
+                return true;
+            }
             self.game.scene.parts.iter().zip(&self.game.scene.bounds).any(|(sp, bd)| {
                 !skip.contains(&sp.r)
                     && (bd.truncate() - a.xf.pos).length() <= ra + bd.w
@@ -1211,7 +1542,15 @@ impl Editor {
     /// part that isn't among them by more than COLLISION_OVERLAP.
     pub(crate) fn overlaps_others(&self, moved: &[(Ref, Xform, Vec3)]) -> bool {
         let skip: HashSet<Ref> = moved.iter().map(|(r, _, _)| *r).collect();
+        let terrain = self.game.terrain_drawn.as_ref().filter(|(_, tr, _)| {
+            !matches!(self.game.doc.prop(*tr, "CanCollide"), Some(Variant::Bool(false)))
+        });
         moved.iter().any(|(r, xf, size)| {
+            if terrain.is_some_and(|(_, _, vox)| {
+                obb_overlaps_terrain(vox, xf, *size, rustudio_core::mech::COLLISION_OVERLAP)
+            }) {
+                return true;
+            }
             let kind = self.game.scene.get(*r).map(|sp| sp.draw.mesh).unwrap_or(MeshKind::Block);
             let a = Solid { xf: *xf, size: *size, kind };
             let ra = size.length() * 0.5;
@@ -2143,5 +2482,37 @@ mod mode_tests {
         assert!(m.abs_diff_eq(Mat3::IDENTITY, 1e-6), "{m:?}");
         let m = snap_rotation_to_primary(studio_cases::ang(0.0, 80.0, 0.0));
         assert!(m.abs_diff_eq(Mat3::from_rotation_y(std::f32::consts::FRAC_PI_2), 1e-6), "{m:?}");
+    }
+
+    #[test]
+    fn terrain_surface_drag_places_part_on_voxels() {
+        let mut vox = rustudio_core::terrain::Voxels::empty();
+        for x in -4..=4 {
+            for z in -4..=4 {
+                vox.set([x, 0, z], 2, 1.0); // Full grass slab at y=0 -> rendered top surface at y ≈ 6.0
+                vox.set([x, 1, z], rustudio_core::terrain::WATER, 1.0); // Water above is ignored
+            }
+        }
+        let ray = Ray { origin: Vec3::new(0.0, 20.0, 0.0), dir: -Vec3::Y };
+        let (t, hit, n) = ray_terrain_surface(&vox, &ray, 100.0).expect("ray hits solid terrain through water");
+        assert!(t > 12.0 && t < 16.0, "expected hit on rendered top mesh near y=6, got t={t} hit={hit:?}");
+        assert!(hit.y >= 5.5 && hit.y <= 6.5, "hit should sit on actual rendered top (~6.0), got {hit:?}");
+        assert!(n.y > 0.9, "expected upward normal, got {n:?}");
+
+        let part_xf = Xform { pos: Vec3::new(0.0, 10.0, 0.0), rot: Mat3::IDENTITY };
+        let part_size = Vec3::new(4.0, 2.0, 4.0);
+        let mut d = FreeDrag::begin(
+            DragBox::new(part_xf, &[(part_xf, part_size)], 1),
+            part_xf.pos,
+            None,
+            None,
+            false,
+        );
+        let surf = d.surface_hit(&ray, Some(DragHit::Surface(hit, n))).expect("surface on terrain");
+        let moved = d.target(surf, DragOpts { grid: None, align: true, soft: None }).mul(&part_xf);
+        // Bottom of the 2-stud-tall part rests directly on the rendered terrain mesh (never sunk under it).
+        assert!((moved.pos.y - (hit.y + 1.0)).abs() < 0.05, "part should sit flush on terrain: {moved:?} vs hit {hit:?}");
+        assert!(obb_overlaps_terrain(&vox, &Xform { pos: Vec3::new(0.0, 4.0, 0.0), rot: Mat3::IDENTITY }, part_size, 0.02));
+        assert!(!obb_overlaps_terrain(&vox, &Xform { pos: Vec3::new(0.0, 10.0, 0.0), rot: Mat3::IDENTITY }, part_size, 0.02));
     }
 }

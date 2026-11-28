@@ -148,6 +148,8 @@ pub struct GameState {
     pub(crate) input_active: bool,
     /// Mouse buttons for UserInputService: (button, down, gameProcessedEvent).
     pub uis_mouse: Vec<(u8, bool, bool)>,
+    /// Mouse-as-touch events (Device Simulator) and their gameProcessedEvent.
+    pub touch_input: Vec<(crate::touch::TouchEvent, bool)>,
     /// The game's fingers since the last client tick (touch identity:
     /// src/touch_input.rs `Zones::game`; the GUI had them first,
     /// gui_input.rs `touch_input`), for UserInputService, the bound
@@ -350,6 +352,15 @@ pub fn fire_gui_events(rt: &Runtime, events: Vec<rustudio_engine::gui::GuiEvent>
                         }
                     })
                     .collect();
+                // A finger landing on a GuiObject: the input action system's
+                // TouchPosition bindings with that UIModifier take it (the
+                // Device Simulator's mouse-as-finger; a touch screen's fingers
+                // reach it through `began_on`, library.luau __rs_finger_event).
+                if name == "InputBegan" && args.iter().any(|a| matches!(a, GuiArg::Touch { .. })) {
+                    if let (Some(io), Ok(f)) = (vals.first().cloned(), lua.globals().get::<mlua::Function>("__rs_touch_ui")) {
+                        let _ = f.call::<()>((rt.inst(r), io));
+                    }
+                }
                 let input = args.iter().any(|a| matches!(a, GuiArg::Input { .. } | GuiArg::InputMove { .. } | GuiArg::Touch { .. }));
                 rt.fire(r, name, vals);
                 if matches!(name, "MouseButton1Down" | "MouseButton1Up") {
@@ -1058,15 +1069,18 @@ impl Game {
     /// mouse ever moves over it.
     pub(super) fn sync_view_size(&mut self) {
         let r = self.viewport_rect;
-        if r.is_positive() {
-            if let Some(w) = self
-                .play
-                .as_mut()
-                .and_then(|s| s.client.as_mut())
-                .and_then(|c| c.world.as_mut())
-            {
-                w.input.view_size = [r.width(), r.height()];
+        let view = self.script_view_size();
+        let device = self.device_input();
+        if let Some(w) = self
+            .play
+            .as_mut()
+            .and_then(|s| s.client.as_mut())
+            .and_then(|c| c.world.as_mut())
+        {
+            if r.is_positive() {
+                w.input.view_size = view;
             }
+            w.input.device = device;
         }
     }
 
@@ -1089,7 +1103,6 @@ impl Game {
         };
         w.input.mouse_ray = (p.origin, p.dir);
         w.input.mouse_xy = p.xy;
-        w.input.view_size = p.view;
         w.input.mouse_target = hit.map(|h| h.0);
         w.input.mouse_hit = Some(Xform {
             pos: hit.map(|h| h.1).unwrap_or(p.origin + p.dir * 1000.0),
@@ -1112,16 +1125,11 @@ impl Game {
             return;
         };
         let Some(s) = self.play.as_mut() else { return };
-        let mouse = s
-            .client
-            .as_ref()
-            .and_then(|c| c.world.as_ref())
-            .and_then(|w| w.input.mouse);
         if let Some(e) = s.game.equipped.as_mut() {
             e.client_told = true;
         }
         self.with_side(Side::Client, |rt, _, _| {
-            let m = mouse.map(|m| rt.inst(m)).unwrap_or(Value::Nil);
+            let m = rt.ensure_mouse();
             rt.fire(ct, "Equipped", vec![m]);
         });
     }
@@ -1232,17 +1240,10 @@ impl Game {
                 Some(t) => {
                     self.equip_tool(t);
                     // A client script's EquipTool: its tool hears Equipped
-                    // now (Studio fires it right after the call), pointer or
-                    // not.
+                    // now (Studio fires it right after the call) with the
+                    // client's PlayerMouse.
                     if side == Side::Client {
-                        let ct = self.client_of(t);
-                        let told = self.play.as_mut().and_then(|s| s.game.equipped.as_mut()).filter(|e| e.tool == t);
-                        if let (Some(ct), Some(e)) = (ct, told) {
-                            if !e.client_told {
-                                e.client_told = true;
-                                self.with_side(Side::Client, |rt, _, _| rt.fire(ct, "Equipped", vec![Value::Nil]));
-                            }
-                        }
+                        self.tell_client_equipped();
                     }
                 }
                 None => self.unequip_tool(),
@@ -1386,7 +1387,6 @@ impl Game {
         let in_hand = cd.dom.get_by_ref(tool).map(|i| i.parent()) == Some(model);
         s.client_sim.hold(&parts, true);
         s.game.client_tool = Some(Equipped { tool, offsets, client_told: true });
-        let mouse = s.client.as_ref().and_then(|c| c.world.as_ref()).and_then(|w| w.input.mouse);
         // In the hand before Equipped fires: Roblox has the grip made by then, so a script
         // that reads Handle.CFrame there (a hanging lantern's, building on it) gets the hand.
         self.place_client_tool_now();
@@ -1394,7 +1394,7 @@ impl Game {
             if !in_hand {
                 rt.apply_parent(tool, model);
             }
-            let m = mouse.map(|m| rt.inst(m)).unwrap_or(Value::Nil);
+            let m = rt.ensure_mouse();
             rt.fire(tool, "Equipped", vec![m]);
         });
     }
@@ -2424,10 +2424,12 @@ impl Game {
         resp: &egui::Response,
         gui_took: bool,
     ) -> bool {
+        // Only Client view owns the viewport as a live game; Server view
+        // behaves like Run/Edit so users can select, drag, and transform parts.
         let Some(side) = self
             .play
             .as_ref()
-            .filter(|p| p.mode == RunMode::Play)
+            .filter(|p| p.mode == RunMode::Play && p.showing == Side::Client)
             .map(|p| p.showing)
         else {
             return false;
@@ -2443,8 +2445,8 @@ impl Game {
                 dir: ray.dir,
                 hit: None,
                 click: None,
-                xy: [p.x - rect.min.x, p.y - rect.min.y],
-                view: [rect.width(), rect.height()],
+                xy: self.view_xy(p),
+                view: self.script_view_size(),
                 side,
             }
         });
@@ -2568,7 +2570,10 @@ impl Game {
                 }
             });
         }
-        // Number keys pick hotbar slots; "." toggles the emote wheel.
+        let core_scripts = self.play.as_ref().is_some_and(|s| s.game.core_scripts_active);
+        // Number keys pick hotbar slots (only when CoreScripts aren't running
+        // Roblox's own Backpack script, to avoid double-toggling tools); "."
+        // toggles the emote wheel.
         // (Chat focus hotkey is handled natively on the CoreGui TextBox path
         // by players_chat_ui.luau via UserInputService + KeyboardKeyCode.)
         let mut slots = Vec::new();
@@ -2579,12 +2584,14 @@ impl Game {
             .unwrap_or_default();
         if !ctx.egui_wants_keyboard_input() && self.gui.focus.is_none() {
             use egui::Key::*;
-            for (n, k) in [Num1, Num2, Num3, Num4, Num5, Num6, Num7, Num8, Num9]
-                .iter()
-                .enumerate()
-            {
-                if taps.contains(k) {
-                    slots.push(n);
+            if !core_scripts {
+                for (n, k) in [Num1, Num2, Num3, Num4, Num5, Num6, Num7, Num8, Num9]
+                    .iter()
+                    .enumerate()
+                {
+                    if taps.contains(k) {
+                        slots.push(n);
+                    }
                 }
             }
             // "." opens the emote wheel (Roblox's Emotes menu key).
@@ -2634,7 +2641,7 @@ impl Game {
         // Touch screens: the movement stick and the jump button
         // (src/touch_input.rs holds the keys they stand for).
         if ctx.input(|i| i.has_touch_screen()) {
-            self.touch.paint(&painter);
+            self.fingers.paint(&painter);
         }
 
         // Explosion flashes.
@@ -2670,8 +2677,6 @@ impl Game {
             }
         }
 
-        let core_scripts = self.play.as_ref().is_some_and(|s| s.game.core_scripts_active);
-
         // Hotbar (native fallback only when CoreScripts aren't running).
         let info = self.play_hotbar();
         if !core_scripts && self.show_core_gui && backpack_on && !info.is_empty() {
@@ -2679,7 +2684,7 @@ impl Game {
             let rects = self.gui.draw_hotbar(&ctx, &painter, &mut self.assets, doc_dir.as_deref(), rect, &info);
             for (n, r) in rects.into_iter().enumerate() {
                 // (fingers landing on a slot stay egui's: src/touch_input.rs)
-                self.touch.zones.ui.push(r);
+                self.fingers.zones.ui.push(r);
                 let click = ui.interact(r, ui.id().with(("slot", n)), egui::Sense::click());
                 if click.clicked() {
                     slots.push(n);
@@ -2695,7 +2700,7 @@ impl Game {
             // phone has no Stop button or Shift+F5 over a game filling the
             // screen); a finger landing on it stays egui's (Zones::ui).
             let leave = draw_kicked(&painter, rect, &s);
-            self.touch.zones.ui.push(leave);
+            self.fingers.zones.ui.push(leave);
             let resp = ui.interact(leave, ui.id().with("kicked_leave"), egui::Sense::click());
             if let Some(c) = state_overlay(&resp) {
                 painter.rect_filled(leave, 4.0, c);
@@ -2712,7 +2717,60 @@ impl Game {
                 self.emote_wheel(ui, rect, &mut slots);
             }
         }
+        // Mouse-as-touch on a simulated phone or tablet: the left button is
+        // a finger (UserInputService's Touch events and gestures), the Mouse
+        // object still hears Button1Down / Up (measured), and there is no
+        // right button, wheel or MouseButton input.
+        let mut touch_events = Vec::new();
+        if self.touch_mode() {
+            if let Some((centre, screen)) = self.touch_frame() {
+                let (alt, shift, down, t) = ctx.input(|i| (i.modifiers.alt, i.modifiers.shift, i.pointer.primary_down(), i.time));
+                let pos = ctx
+                    .input(|i| i.pointer.latest_pos())
+                    .filter(|p| rect.contains(*p) || !self.touch.fingers().is_empty())
+                    .map(|p| {
+                        let xy = self.view_xy(p);
+                        egui::pos2(xy[0], xy[1] - mech::GUI_TOP_INSET)
+                    });
+                // (a press and release in one frame is still a tap)
+                let (pressed, released) = ctx.input(|i| (i.pointer.primary_pressed(), i.pointer.primary_released()));
+                let mut samples = Vec::new();
+                if pressed && released && !down && !menu {
+                    samples.push(crate::touch::PointerSample { t, pos, down: true, alt, shift, centre, screen });
+                }
+                samples.push(crate::touch::PointerSample { t, pos, down: down && !menu, alt, shift, centre, screen });
+                let pointer_id = self.touch.pointer_id(alt);
+                let stepped: Vec<_> = samples.into_iter().flat_map(|s| self.touch.step(s)).collect();
+                for e in stepped {
+                    use crate::touch::TouchEvent as T;
+                    let gpe = match &e {
+                        T::Began { id, .. } => {
+                            *self.touch_gpe.entry(*id).or_default() = over_gui;
+                            self.input_flip = crate::game::InputFlip::None;
+                            over_gui
+                        }
+                        T::Moved { id, .. } => self.touch_gpe.get(id).copied().unwrap_or(false),
+                        T::Ended { id, .. } => self.touch_gpe.remove(id).unwrap_or(false),
+                        _ => self.touch_gpe.get(&pointer_id).copied().unwrap_or(over_gui),
+                    };
+                    touch_events.push((e, gpe));
+                }
+            }
+            uis.clear();
+            buttons.retain(|(b, _)| *b == 1);
+        } else if !self.touch.fingers().is_empty() {
+            self.touch = Default::default();
+            self.touch_gpe.clear();
+        }
+        // A click on a console gives it a keyboard and mouse (measured; a
+        // key on a phone: game_keys).
+        if let Some(f) = self.device.as_ref().map(|v| v.device.flags()) {
+            if !f.mouse && !f.touch && self.input_flip == crate::game::InputFlip::None && resp.hovered() && ctx.input(|i| i.pointer.any_pressed()) {
+                self.input_flip = crate::game::InputFlip::Mouse;
+            }
+        }
         if let Some(s) = self.play.as_mut() {
+            s.game.touch_input.extend(touch_events);
             let unfocused = self.gui.focus.is_none();
             s.game.chat_open = !unfocused;
             if chat_on && unfocused {

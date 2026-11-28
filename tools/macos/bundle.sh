@@ -48,6 +48,7 @@ fi
 
 # Data files read at run time (platform::resource).
 cp api-dump.json "$APP/Contents/Resources/"
+[ ! -d plugins ] || cp -R plugins "$APP/Contents/Resources/plugins"
 
 # Icon: an .iconset from the PNGs in assets/icons.
 ICONSET="$OUT/rustudio.iconset"

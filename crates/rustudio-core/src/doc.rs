@@ -129,9 +129,13 @@ pub enum Reader {
     /// Edit-mode Sound preview playback and on-demand Sound loading
     /// (crates/rustudio-player/src/edit_audio.rs).
     EditAudio = 24,
+    /// Manual WorldRoot:StepPhysics simulation (crates/rustudio-engine/src/domains/world_part.rs).
+    StepPhysics = 25,
+    /// Solver joint marks for WorldRoot:StepPhysics.
+    StepPhysicsJoints = 26,
     /// The Modal GuiButtons that free the game's mouse lock
     /// (crates/rustudio-engine/src/gui_modal.rs ModalIndex).
-    Modal = 25,
+    Modal = 27,
 }
 
 const JOURNAL_READERS: usize = Reader::Modal as usize + 1;
@@ -385,6 +389,13 @@ pub fn constructor_default(class: &str, name: &str) -> Option<Variant> {
         ("ScrollingFrame", "MidImage") => id("rbxasset://textures/ui/Scroll/scroll-middle.png"),
         ("ScrollingFrame", "BottomImage") => id("rbxasset://textures/ui/Scroll/scroll-bottom.png"),
         ("SurfaceAppearance", "SurfaceSlot") => Some(Variant::Int32(-1)),
+        // WeldConstraint serializes `State` (bit 0 = Enabled) rather than `Enabled`,
+        // and BaseScript serializes `Disabled`; both default to Enabled = true in Studio.
+        ("WeldConstraint", "Enabled") => Some(Variant::Bool(true)),
+        ("WeldConstraint", "State") => Some(Variant::Int32(3)),
+        ("Script" | "LocalScript" | "BaseScript", "Enabled") => Some(Variant::Bool(true)),
+        ("Player", "CanLoadCharacterAppearance") => Some(Variant::Bool(true)),
+        ("BubbleChatMessageProperties", "TailVisible") => Some(Variant::Bool(true)),
         _ => None,
     }
 }
@@ -543,6 +554,20 @@ fn prop_plan(class: Ustr, key: Ustr) -> Option<std::rc::Rc<PropPlan>> {
                 });
                 (twin.is_some() && content)
                     .then(|| Variant::ContentId(rbx_dom_weak::types::ContentId::from(String::new())))
+            })
+            .or_else(|| {
+                // Any creatable class with a bool `Enabled` property missing from
+                // the reflection database defaults to `true` in Studio (joints,
+                // constraints, effects, UI modifiers, prompts, detectors, etc.),
+                // except AudioSpeechToText which defaults to `false`.
+                if name == "Enabled" && class.as_str() != "AudioSpeechToText" {
+                    let is_bool = db.superclasses_iter(c).find_map(|c| c.properties.get(name)).is_some_and(|p| {
+                        matches!(p.data_type, rbx_reflection::DataType::Value(rbx_dom_weak::types::VariantType::Bool))
+                    });
+                    is_bool.then_some(Variant::Bool(true))
+                } else {
+                    None
+                }
             });
         let xml = format!("{name}_XML");
         let xml_default = db.find_default_property(c, &xml).cloned();
@@ -1561,6 +1586,15 @@ impl Document {
         let inst = self.dom.get_by_ref(r)?;
         if inst.class == "ScreenGui" && matches!(name, "IgnoreGuiInset" | "ScreenInsets") {
             return Some(screen_insets_read(inst, name));
+        }
+        if inst.class == "WeldConstraint" && name == "Enabled" {
+            return Some(Variant::Bool(crate::body::joint_enabled(self, r)));
+        }
+        if is_a(&inst.class, "BaseScript") && name == "Enabled" {
+            return Some(Variant::Bool(
+                !matches!(inst.properties.get(&ustr("Disabled")), Some(Variant::Bool(true)))
+                    && !matches!(inst.properties.get(&ustr("Enabled")), Some(Variant::Bool(false))),
+            ));
         }
         if let Some(v) = inst.properties.get(&key) {
             return Some(v.clone());
@@ -3239,6 +3273,89 @@ mod studio_defaults_tests {
         assert!(d.exists(btn));
         assert_eq!(d.dom.get_by_ref(btn).unwrap().parent(), sg1);
         assert_eq!(d.prop(btn, "Position"), Some(Variant::UDim2(pos1)));
+    }
+
+    #[test]
+    fn enabled_defaults_true_for_welds_and_similar_classes() {
+        let mut d = Document::new_place();
+        let ws = d.workspace().unwrap();
+        for class in [
+            "WeldConstraint",
+            "Weld",
+            "ManualWeld",
+            "Motor6D",
+            "Motor",
+            "Snap",
+            "Glue",
+            "HingeConstraint",
+            "SpringConstraint",
+            "RopeConstraint",
+            "RodConstraint",
+            "RigidConstraint",
+            "NoCollisionConstraint",
+            "AlignPosition",
+            "AlignOrientation",
+            "LinearVelocity",
+            "AngularVelocity",
+            "VectorForce",
+            "Torque",
+            "LineForce",
+            "BallSocketConstraint",
+            "PrismaticConstraint",
+            "CylindricalConstraint",
+            "UniversalConstraint",
+            "PlaneConstraint",
+            "TorsionSpringConstraint",
+            "Script",
+            "LocalScript",
+            "PointLight",
+            "SpotLight",
+            "SurfaceLight",
+            "ParticleEmitter",
+            "Fire",
+            "Smoke",
+            "Sparkles",
+            "Beam",
+            "Trail",
+            "Highlight",
+            "BloomEffect",
+            "BlurEffect",
+            "ProximityPrompt",
+            "ScreenGui",
+            "BillboardGui",
+            "SurfaceGui",
+            "Tool",
+            "SpawnLocation",
+            "UIStroke",
+            "UIGradient",
+            "DragDetector",
+            "UIDragDetector",
+            "Clouds",
+            "IKControl",
+        ] {
+            let r = d.insert(ws, InstanceBuilder::new(class));
+            assert_eq!(
+                d.prop(r, "Enabled"),
+                Some(Variant::Bool(true)),
+                "{class}.Enabled should default to true"
+            );
+            assert_eq!(
+                class_default(class, "Enabled"),
+                Some(Variant::Bool(true)),
+                "class_default({class}, Enabled) should be true"
+            );
+        }
+        // WeldConstraint respects serialized State bit 0 when Enabled isn't stored.
+        let disabled_weld = d.insert(
+            ws,
+            InstanceBuilder::new("WeldConstraint").with_property("State", Variant::Int32(0)),
+        );
+        assert_eq!(d.prop(disabled_weld, "Enabled"), Some(Variant::Bool(false)));
+        let enabled_weld = d.insert(
+            ws,
+            InstanceBuilder::new("WeldConstraint").with_property("State", Variant::Int32(3)),
+        );
+        assert_eq!(d.prop(enabled_weld, "Enabled"), Some(Variant::Bool(true)));
     }
 }
 

@@ -651,6 +651,29 @@ pub const GUI_TOPBAR_LEFT_CHAT: f32 = 128.0; // ... with the chat button (TopBar
 pub fn gui_topbar_left(chat: bool) -> f32 {
     if chat { GUI_TOPBAR_LEFT_CHAT } else { GUI_TOPBAR_LEFT }
 }
+// Device Simulator (devices.rs, crates/rustudio-player/src/device_view.rs)
+pub const DEVICE_FIT_PADDING_PX: f32 = 17.0; // Fit to window: free space round a device's frame (body and side buttons), measured on Studio's iPhone 14: 17 px in a 718 px panel upright, the landscape frame's buttons 17-19 px from the panel's edge; a frameless device fills the panel (Xbox One is 1080 high in 718 px)
+pub const DEVICE_BAR_HEIGHT: f32 = 27.0; // the simulator bar over the view (Studio 0.748, measured 1:1)
+pub const DEVICE_PILL_HEIGHT: f32 = 22.0; // the device / LAN / Q pills (measured), fully rounded
+pub const DEVICE_BAR_ICON: f32 = 13.0; // bar icons (measured: 12-14 px glyphs)
+pub const DEVICE_BAR_STEP: f32 = 20.0; // from one bar button to the next (measured: 19-20 px)
+pub const DEVICE_BAR_TEXT: f32 = 12.5; // the pills' text size (measured cap height; estimate)
+pub const DEVICE_SCROLLBAR: f32 = 8.0; // the view's scroll bar track while a device shows (measured: 12 screen px at 1.5x)
+pub const DEVICE_MENU_WIDTH: f32 = 168.0; // the device dropdown's width (measured: 250 screen px at 1.5x); names past it end in an ellipsis
+pub const DEVICE_NAME_MAX: usize = 200; // Manage devices: a custom device's name length (measured: Studio's device service refuses longer)
+pub const DEVICE_WIDTH_RANGE: (u32, u32) = (1, 7680); // custom device width in points (measured, Studio's device service limits)
+pub const DEVICE_HEIGHT_RANGE: (u32, u32) = (1, 4320); // ... height (measured)
+pub const DEVICE_DENSITY_RANGE: (u32, u32) = (72, 10000); // ... pixel density, PPI (measured)
+pub const DEVICE_KEYBOARD_RANGE: (u32, u32) = (0, 4320); // ... on-screen keyboard heights (measured)
+pub const DEVICE_MEMORY_MIN_GB: f32 = 0.5; // ... memory: a smaller Custom value is raised to this when the field loses focus, with no message (measured)
+pub const DEVICE_CALIBRATE_DPI: (f32, f32, f32) = (80.0, 250.0, 96.0); // Calibrate physical scaling: the slider's range and default, in screen DPI (measured: 80 at the left end, 96 at 9.4 % of the track; the right end from the slider's position, +-5)
+pub const DEVICE_CARD_INCHES: [f32; 2] = [3.37, 2.125]; // Calibrate's card: an ID card, 85.6 x 54 mm (Studio's text: "8.56 cm or 3.37 in wide")
+pub const TOUCH_LONG_PRESS_S: f64 = 0.5; // mouse-as-touch: a still press this long is TouchLongPress (measured in Studio's simulator: Begin after 0.5 s)
+pub const TOUCH_ROTATE_START_RAD: f32 = 0.1; // LeftAlt + drag: TouchRotate begins once the turn passes this (measured, about 0.1 rad)
+pub const TOUCH_TAP_SLOP: f32 = 8.0; // a press that moves less than this (GUI points) is still a tap, and pans only past it (estimate)
+pub const TOUCH_SWIPE_MIN_SPEED: f32 = 400.0; // a drag let go at this speed or faster (points/s) is a TouchSwipe (estimate)
+pub const TOUCH_MARKER_SIZE: f32 = 46.0; // the disc drawn per finger while LeftAlt is held (measured: about 46 points across)
+pub const DEVICE_MENU_ROW: f32 = 17.5; // a dropdown row (measured: 26 screen px at 1.5x)
 pub const GUI_FONT_EM_PER_TEXT_SIZE: f32 = 1.04; // font em = TextSize × this / (line height per em): a line is TextSize tall; the 1.04 matches TextService widths ("START GAME" in Oswald 14/18/24/32 → 46/58/78/104 px in Studio)
 pub const GUI_LEGACY_TEXT_SCALE: f32 = 1.5; // Font.Legacy (Arimo) is drawn at TextSize x this: a default TextLabel (Legacy 8) in Studio 0.747 draws "row 1" 26 px wide, 8 px tall (checks/plugins/widgets/captures/studio-wleft.png), Arimo at TextSize 12; other sizes not measured
 pub const GUI_MESSAGE_FILL: [f32; 4] = [0.5, 0.5, 0.5, 0.5]; // a Message's full-screen box, RGBA (Studio 0.747 Message::renderFullScreen: Adorn::rect2d over the whole view in Color4 (0.5, 0.5, 0.5, 0.5); a black sky reads 64,64,64 under it in the Roblox client)

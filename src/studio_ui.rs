@@ -334,6 +334,8 @@ pub const TEST: &[M] = &[
     I("Device Simulator", "", "device_simulator"),
     I("Controller Emulator", "", "controller_emulator"),
     I("Player Emulator", "", "player_emulator"),
+    I("Event Emulator", "", "event_emulator"),
+    I("Force Visualization", "", "force_visualization"),
     S,
     Sub("Debug Error", &[
         I("Never", "", "break_never"),
@@ -374,6 +376,12 @@ pub const WINDOW: &[M] = &[
     ]),
     Sub("Avatar", &[I("Clip Editor", "", "clip_editor"), I("Accessory", "", "accessory_editor"), I("Setup", "", "avatar_setup")]),
     Sub("Audio", &[I("View Sounds", "", "audio_discovery")]),
+    Sub("UI & 2D", &[
+        I("Style Editor", "", "style_editor"),
+        I("9-Slice Editor", "", "nine_slice_editor"),
+        I("Path2D Editor", "", "path_editor"),
+        I("Texture Viewer", "", "texture_viewer"),
+    ]),
     Sub("Collaboration", &[I("Live Collaborators", "", "live_collaborators"), I("Invite Collaborators", "", "invite_collaborators")]),
     Sub("Debug", &[I("Breakpoints", "", "breakpoints"), I("Call Stack", "", "call_stack"), I("Watch", "", "watch")]),
     Sub("Localization", &[I("Localization Tools", "", "localization_tools")]),

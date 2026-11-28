@@ -15,6 +15,7 @@ assert 'Icon=rustudio' in desktop.read_text()
 for size in [16,24,32,48,64,128,256,512]: assert (prefix/f'share/icons/hicolor/{size}x{size}/apps/rustudio.png').is_file()
 assert (prefix/'share/icons/hicolor/scalable/apps/rustudio.svg').is_file()
 assert (prefix/'lib/rustudio/api-dump.json').read_bytes()==(bundle/'api-dump.json').read_bytes()
+assert (prefix/'lib/rustudio/plugins/9SliceEditor/init.server.luau').is_file()
 result=subprocess.run([str(prefix/'bin/rustudio'),'--api-coverage',str(root/'coverage.json')],env=env,cwd='/tmp',capture_output=True,text=True,timeout=60)
 print('API coverage exit:',result.returncode, result.stderr[-1000:]); assert result.returncode==0
 assert (root/'coverage.json').stat().st_size>0
@@ -22,7 +23,7 @@ sentinels=[home/'.config/rustudio/settings',prefix/'share/rustudio/project.rbxl'
 for p in sentinels: p.parent.mkdir(parents=True,exist_ok=True); p.write_text('keep')
 install(); install('--uninstall'); install('--uninstall')
 for p in sentinels: assert p.read_text()=='keep'
-assert not desktop.exists(); assert not (prefix/'bin/rustudio').exists(); assert not (prefix/'lib/rustudio/api-dump.json').exists()
+assert not desktop.exists(); assert not (prefix/'bin/rustudio').exists(); assert not (prefix/'lib/rustudio/api-dump.json').exists(); assert not (prefix/'lib/rustudio/plugins').exists()
 print('PASS: archive, launcher, icons, API coverage, reinstall, repeated uninstall, data preservation',root)
 
 temporary.cleanup()

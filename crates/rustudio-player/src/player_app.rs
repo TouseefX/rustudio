@@ -205,7 +205,7 @@ impl eframe::App for PlayerApp {
 
     fn raw_input_hook(&mut self, ctx: &egui::Context, raw: &mut egui::RawInput) {
         let now = self.run.now();
-        self.run.input.inject(self.game.viewport_rect, self.game.lock_center_held(), now, raw, |_, _| {});
+        self.run.input.inject(self.game.viewport_rect, self.game.device.as_ref().map_or(1.0, |v| v.k), self.game.lock_center_held(), now, raw, |_, _| {});
         if self.game.play_game_input() && ctx.memory(|m| m.focused().is_none()) {
             crate::keys::PhysicalKeys::keep_tab_for_game(raw);
         }
@@ -446,7 +446,7 @@ pub fn run() -> eframe::Result<()> {
     let run = RunHarness {
             shot_after,
             log_out,
-            input: HarnessInput { actions, pointer: None, shift: false },
+            input: HarnessInput { actions, pointer: None, shift: false, mods: egui::Modifiers::NONE },
             started: rustudio_core::sim_clock::now(),
             held: 0.0,
             screenshot,

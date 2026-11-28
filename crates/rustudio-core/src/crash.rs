@@ -64,7 +64,9 @@ fn header(kind: &str) -> String {
     format!(
         "rustudio {} ({}) crashed: {kind}\npid {}\nargs: {}\n\n",
         env!("CARGO_PKG_VERSION"),
-        option_env!("RUSTUDIO_GIT").unwrap_or("unknown commit"),
+        option_env!("RUSTUDIO_GIT_SHA")
+            .or(option_env!("RUSTUDIO_GIT"))
+            .unwrap_or("unknown commit"),
         std::process::id(),
         args_line()
     )

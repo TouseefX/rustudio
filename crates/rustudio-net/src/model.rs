@@ -732,8 +732,8 @@ pub fn typed_value(v: &Variant) -> Option<PropValue> {
         }
         Variant::Content(c) => match c.value() {
             rbx_types::ContentType::Uri(u) => Some(PropValue::String(u.clone())),
-            rbx_types::ContentType::Object(_) => None,
-            _ => Some(PropValue::String(String::new())),
+            rbx_types::ContentType::None => Some(PropValue::String(String::new())),
+            _ => None,
         },
         Variant::ContentId(c) => Some(PropValue::String(c.as_str().to_string())),
         Variant::Tags(t) => Some(PropValue::SharedString(t.encode())),

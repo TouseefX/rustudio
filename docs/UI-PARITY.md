@@ -41,7 +41,7 @@ Folder… (round 15's project folders).
 | Edit | Undo, Redo, Cut, Copy, Paste, Paste Into (Ctrl+Shift+V), Paste at Original Location and Paste into at Original Location (rustudio's paste keeps positions, so they equal Paste / Paste Into), Duplicate, Delete, Group as Model (Ctrl+G), Group as Folder (Ctrl+Alt+G), Ungroup, Lock Selection (Alt+L), Unlock All, Anchor Selection (Alt+A), Select All (Workspace's children) | Lock Tool, Anchor Tool, Convert to Package, Get Latest Package, Save as Default Instance, Format Document / Selection, Indent, Unindent | done |
 | View | Zoom In / Out (UI zoom), Full Screen (F11), Show Grid (Alt+G) and 2 / 4 / 16 studs, Show UI, Screenshot (to ~/Pictures), Mute | Show View Selector, Show Wind Direction, Show Grid Material, Show Wireframe Rendering, Show Welds, Show Constraint Details, Expand / Collapse Script Folds, Toggle Comment | done |
 | Plugins | — | Manage Plugins, Plugins Folder, Save as Local Plugin, Publish as Plugin (rustudio runs no Studio plugins; the person's own Dervex Tools / Place B Weathering entries are not listed) | done (disabled) |
-| Test | Start Test Session > Test (F5), Test Here, Run (F8); Toggle Client/Server View; Stop (Shift+F5) | Server and Clients (F7), Team Test, Device Simulator, Controller / Player Emulator, Debug Error (Never shown checked), Reload Script, Show Client / Server Viewport, Add Clients, Pause, Pause Client/Server, End Session, Exit Client | done |
+| Test | Start Test Session > Test (F5), Test Here, Run (F8); Toggle Client/Server View; Stop (Shift+F5); Device Simulator (greyed with its check during Play, as Studio); Controller Emulator (checked while its panel is open) | Server and Clients (F7), Team Test, Player Emulator, Debug Error (Never shown checked), Reload Script, Show Client / Server Viewport, Add Clients, Pause, Pause Client/Server, End Session, Exit Client | done |
 | Window | Properties, Explorer (Alt+X), Output toggles with checkmarks, Insert Object, Reset Layout | Toolbox, Activity History, Asset Manager, every 3D / Avatar / Collaboration / Debug / Localization / Performance Summary / Script entry (captured order) | done |
 | Help | Documentation, Tutorials, Developer Forum (open in the browser) | Start Studio Tour, Open Logs Folder | done |
 | Menu look | 233-px File menu; check column; shortcuts left-aligned in a column after the longest label | the same metrics (studio_actions.rs `menu_metrics`) | done |
@@ -164,3 +164,34 @@ pair in `checks/ui/side-output.png`.
 | Context bar | green (0, 204, 103) for server lines (Run included), blue (52, 154, 213) for client lines; none on stack lines | the same | done |
 | Toolbar | All Messages, All Contexts, Filter…, clear, ⋯ | the same; ⋯ holds Show Timestamp / Show Context / Show Source | done |
 | Line pitch | 15 px | 15 px | done |
+
+## Device Simulator
+
+Captured: Studio 0.748's simulator bar, its dropdowns for every form,
+the frames of all 30 framed devices, the scaling, network, performance
+and touch popovers, Calibrate and Manage devices (local captures; the
+numbers are in docs/MECHANICS.md). Studio's frame images and icons are
+Roblox's art: Rustudio draws its own frames from measurements and uses
+Tabler icons (one drawn icon: the virtual controller).
+
+| Item | Studio | rustudio | Status |
+|---|---|---|---|
+| Turning it on | Test > Device Simulator (greyed with its check during Play) | the same; the top row's phone button too | done |
+| Bar | over the view in edit and Play, 27 px, #131215; the four form buttons, the current one replaced in place by the device pill; right: Rotate, Mock Android back button (Android), Touch controls, Virtual controller, Display scaling, LAN, Q## (Auto with no device) | the same layout, order and tooltips | done |
+| Device dropdown | the form's devices under Flagship / Mid-range / Entry level / Other (Desktop computer, Console, Headset), A to Z, the size in a chip, a tick on the current one, names cut with "…", then Manage devices; the pill turns light while open | the same | done |
+| Dropdown wheel cycling | behind a Studio flag (DeviceSimulatorWheelCycleDevice), not on by default | — | not in this Studio by default (flagged) |
+| Form buttons | switch to that form's last device | the same; first time: iPhone 14, Current device, Xbox One, Meta Quest 3 (estimate) | done |
+| Frames | per-device art: home-button iPhones, notch, Dynamic Island, teardrop and punch-hole Androids, tablets; none for the TV, desktops, consoles, headsets | Rustudio's own frames drawn from each device's measured bezel, corners, cut-out, side buttons and bezel features; the same devices without one | done |
+| Letterbox | #202227 round the device, a scroll bar track at the right | the same | done |
+| Display scaling | Physical size, Actual resolution, Fit to window (default), Calibrate physical scaling; a device bigger than the view scrolls | the same (vertical scroll bar, wheel over the letterbox) | done |
+| Calibrate physical scaling | a separate dialog: Studio's text, a card between dashed guides, a slider (80–250 DPI), Accept / Cancel | an in-window dialog with the same text, card and range; Rustudio's own card picture | partial: in-window dialog, as Studio Settings |
+| Manage devices | a separate window titled "RobloxStudio": tabs Mobile / Desktop / Console / Headset; Custom (+) and Standard (+) lists; Name, Platform, Display, Performance (Memory options per form + Custom), Keyboard settings; Apply / Cancel / Duplicate; Studio's validation messages | an in-window dialog with the same parts, names and messages; custom devices are kept in ~/.config/rustudio/devices.json | partial: in-window dialog, as Studio Settings |
+| LAN and Q## popovers | network and performance simulation | the same popovers, every control greyed (Rustudio simulates neither) | done (greyed) |
+| Mouse as a finger | on a phone or tablet in Play the left button is a finger (Touch input, taps, pans, swipes, long presses), hover does nothing, no right button or wheel, the cursor is never locked | the same; Mouse.Button1Down / Up still fire (measured) | done |
+| Pinch, rotate, two-finger pan | LeftAlt + drag: a second finger mirrored about the screen's centre; LeftAlt + LeftShift + drag: two fingers move together; a disc per finger while Alt is held | the same rules and numbers; Rustudio's own disc | done |
+| Touch controls popover | "While playtesting:", "Pinch + rotate: LeftAlt + Drag", "Two-finger pan: LeftAlt + LeftShift + Drag" | the same | done |
+| Mock Android back button | dim while editing; in Play opens Roblox's in-game menu (MenuOpened, no key event) | the same (SettingsHub with Roblox's CoreScripts) | done |
+| A key or a click on a device without them | turns its keyboard and mouse on until the next touch (Changed for Mouse / KeyboardEnabled only the first time); LeftAlt for a pinch counts, so PreferredInput is KeyboardAndMouse until the fingers come down | the same | done |
+| Virtual controller | the bar button opens the Controller Emulator panel (Test > Controller Emulator too); open, keys drive Gamepad1 | the bar button opens and closes the panel; closing its tab turns it off | done |
+| Controller Emulator panel | a layout dropdown (Generic Gamepad, Xbox; Xbox on consoles), Edit mappings, a gamepad drawing with each key by the part it drives | the same dropdown, Edit mappings greyed (the map is fixed), Rustudio's own drawing with Studio's key placement (no maker's logo on the Xbox layout) | partial: Edit mappings greyed |
+| VR controllers (headsets) | a Quest3 layout with VR controller options (Move and rotate, Headset / Left / Right Controller, Translation sensitivity) | the options shown greyed (Rustudio has no VR); the gamepad map still works | greyed |
